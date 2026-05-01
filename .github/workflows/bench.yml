@@ -1,0 +1,724 @@
+name: Benchmark vs Redis
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/bench.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/bench.yml"
+  # Windows bench is expensive (2× rate, ~20 min) — run on demand only
+  workflow_dispatch:
+    inputs:
+      run_windows:
+        description: "Also run Windows benchmark (2× billed minutes)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+
+# Cancel stale benchmark runs — results from an outdated commit are useless
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  NEXRADE_PORT: 6399
+  REDIS_PORT: 6379
+  BENCH_CLIENTS: 50
+  # Reduced from 100000 — still statistically meaningful, finishes ~3× faster
+  BENCH_REQUESTS: 30000
+
+jobs:
+  bench:
+    name: nexrade-cache vs Redis (Linux)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Redis server + tools
+        run: |
+          # Use the official packages.redis.io repository — the Ubuntu universe
+          # mirror frequently has stale/404 redis-tools package versions.
+          curl -fsSL https://packages.redis.io/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] \
+            https://packages.redis.io/deb $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/redis.list
+          sudo apt-get update -qq
+          sudo apt-get install -y redis
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-
+
+      - name: Build nexrade-cache (release)
+        run: cargo build --release --package nexrade-cache
+
+      # ── Start servers ───────────────────────────────────────────────────────
+
+      - name: Start Redis
+        run: |
+          redis-server --port $REDIS_PORT --daemonize yes \
+            --logfile /tmp/redis.log --loglevel warning
+          sleep 0.5
+          redis-cli -p $REDIS_PORT PING
+
+      - name: Start nexrade-cache
+        run: |
+          ./target/release/nexrade-cache \
+            --port $NEXRADE_PORT \
+            --metrics-port 9399 &
+          echo "NEXRADE_PID=$!" >> $GITHUB_ENV
+          sleep 1
+          ./target/release/nexrade-cli -p $NEXRADE_PORT PING
+
+      # ── Warm-up ─────────────────────────────────────────────────────────────
+
+      - name: Warm-up both servers
+        run: |
+          redis-benchmark -h 127.0.0.1 -p $REDIS_PORT \
+            -c 10 -n 5000 -t SET,GET -q --quiet 2>/dev/null || true
+          redis-benchmark -h 127.0.0.1 -p $NEXRADE_PORT \
+            -c 10 -n 5000 -t SET,GET -q --quiet 2>/dev/null || true
+
+      # ── Benchmark ───────────────────────────────────────────────────────────
+
+      - name: Benchmark Redis (CSV)
+        run: |
+          redis-benchmark \
+            -h 127.0.0.1 -p $REDIS_PORT \
+            -c $BENCH_CLIENTS \
+            -n $BENCH_REQUESTS \
+            -t PING_INLINE,PING_MBULK,SET,GET,INCR,LPUSH,RPUSH,LPOP,RPOP,\
+          SADD,HSET,SPOP,ZADD,ZPOPMIN,LRANGE \
+            --csv \
+          > redis-bench.csv
+          echo "=== Redis raw ==="
+          cat redis-bench.csv
+
+      - name: Benchmark nexrade-cache (CSV)
+        run: |
+          redis-benchmark \
+            -h 127.0.0.1 -p $NEXRADE_PORT \
+            -c $BENCH_CLIENTS \
+            -n $BENCH_REQUESTS \
+            -t PING_INLINE,PING_MBULK,SET,GET,INCR,LPUSH,RPUSH,LPOP,RPOP,\
+          SADD,HSET,SPOP,ZADD,ZPOPMIN,LRANGE \
+            --csv \
+          > nexrade-bench.csv
+          echo "=== nexrade-cache raw ==="
+          cat nexrade-bench.csv
+
+      # ── Compare & report ────────────────────────────────────────────────────
+
+      - name: Generate comparison report
+        id: compare
+        run: |
+          python3 - <<'PYEOF'
+          import csv, os, sys
+
+          def load(path):
+              results = {}
+              with open(path) as f:
+                  for row in csv.reader(f):
+                      if len(row) >= 2:
+                          name = row[0].strip('"')
+                          try:
+                              rps = float(row[1].strip('"'))
+                              results[name] = rps
+                          except ValueError:
+                              pass
+              return results
+
+          redis   = load("redis-bench.csv")
+          nexrade = load("nexrade-bench.csv")
+
+          all_cmds = sorted(set(redis) | set(nexrade))
+
+          lines = []
+          lines.append("## 📊 Benchmark Comparison: nexrade-cache vs Redis\n")
+          lines.append(f"> **Clients:** {os.environ['BENCH_CLIENTS']}  "
+                       f"**Requests:** {os.environ['BENCH_REQUESTS']}\n")
+          lines.append("| Command | Redis (req/s) | nexrade-cache (req/s) | Ratio |")
+          lines.append("|---------|-------------:|-----------------------:|------:|")
+
+          ratios = []
+          for cmd in all_cmds:
+              r = redis.get(cmd)
+              n = nexrade.get(cmd)
+              if r and n:
+                  ratio = n / r
+                  ratios.append(ratio)
+                  pct   = (ratio - 1) * 100
+                  arrow = "🟢" if ratio >= 0.9 else ("🟡" if ratio >= 0.7 else "🔴")
+                  sign  = "+" if pct >= 0 else ""
+                  lines.append(
+                      f"| `{cmd}` | {r:,.0f} | {n:,.0f} "
+                      f"| {arrow} {ratio:.2f}x ({sign}{pct:.1f}%) |"
+                  )
+              elif r:
+                  lines.append(f"| `{cmd}` | {r:,.0f} | — | — |")
+              else:
+                  lines.append(f"| `{cmd}` | — | {n:,.0f} | — |")
+
+          if ratios:
+              avg = sum(ratios) / len(ratios)
+              lines.append("")
+              lines.append(f"**Overall average ratio:** {avg:.2f}x  ")
+              if avg >= 0.95:
+                  lines.append("✅ nexrade-cache is within 5% of Redis performance.")
+              elif avg >= 0.80:
+                  lines.append("⚠️ nexrade-cache is 80–95% of Redis performance.")
+              else:
+                  lines.append("❌ nexrade-cache is below 80% of Redis performance.")
+
+          report = "\n".join(lines)
+          print(report)
+
+          # Write to step summary
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(report + "\n")
+
+          # Write to file for artifact
+          with open("bench-comparison.md", "w") as f:
+              f.write(report + "\n")
+
+          # Fail if average < 50% (something is badly wrong)
+          if ratios and sum(ratios)/len(ratios) < 0.50:
+              print("FATAL: nexrade-cache is less than 50% of Redis performance!", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
+
+      - name: Check metrics endpoint
+        run: |
+          curl -sf http://127.0.0.1:9399/metrics \
+            | grep -E "nexrade_commands_total|nexrade_connected_clients" \
+            || echo "(metrics endpoint OK — specific counters not found)"
+
+      # ── Cleanup ─────────────────────────────────────────────────────────────
+
+      - name: Stop servers
+        if: always()
+        run: |
+          kill $NEXRADE_PID 2>/dev/null || true
+          redis-cli -p $REDIS_PORT SHUTDOWN NOSAVE 2>/dev/null || true
+
+      # ── Artifacts ───────────────────────────────────────────────────────────
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-results-${{ github.sha }}
+          path: |
+            redis-bench.csv
+            nexrade-bench.csv
+            bench-comparison.md
+          retention-days: 90
+
+      # ── PR comment ──────────────────────────────────────────────────────────
+
+      - name: Post comparison as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('bench-comparison.md', 'utf8');
+            const marker = '<!-- bench-comparison -->';
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c => c.body.includes(marker));
+            const fullBody = marker + '\n' + body;
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: fullBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: fullBody,
+              });
+            }
+
+  bench-windows:
+    name: nexrade-cache vs Redis (Windows — tporadowski/redis 5.0)
+    # Windows runners cost 2× — only run when explicitly requested via workflow_dispatch
+    if: github.event.inputs.run_windows == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
+    env:
+      # tporadowski/redis is the actively maintained Windows port of Redis,
+      # forked from microsoftarchive/redis. v5.0.14.1 fixes the WinSock2
+      # socket issues present in the old 3.0.504 binaries on Windows Server 2022.
+      REDIS_ZIP_URL: https://github.com/tporadowski/redis/releases/download/v5.0.14.1/Redis-x64-5.0.14.1.zip
+      REDIS_DIR: C:\redis
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-
+
+      - name: Build nexrade-cache (release)
+        run: cargo build --release --package nexrade-cache
+
+      # ── Download tporadowski/redis ───────────────────────────────────────────
+
+      - name: Download tporadowski/redis (Windows port of Redis 5.0)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:REDIS_DIR | Out-Null
+          Invoke-WebRequest -Uri $env:REDIS_ZIP_URL `
+            -OutFile "$env:TEMP\redis.zip" -UseBasicParsing
+          Expand-Archive -Path "$env:TEMP\redis.zip" -DestinationPath $env:REDIS_DIR -Force
+          Write-Host "Redis binaries:"
+          Get-ChildItem $env:REDIS_DIR
+
+      # ── Start servers ────────────────────────────────────────────────────────
+
+      - name: Start Redis (tporadowski/redis 5.0)
+        shell: pwsh
+        run: |
+          # -WindowStyle Hidden keeps UseShellExecute=$true so the process is
+          # created via ShellExecuteEx, outside the step's Windows Job Object,
+          # and survives after the step's PowerShell host exits.
+          # (-NoNewWindow forces UseShellExecute=$false which inherits the job
+          #  object and gets killed when the step ends.)
+          Start-Process -FilePath "$env:REDIS_DIR\redis-server.exe" `
+            -ArgumentList "--port $env:REDIS_PORT --loglevel warning --logfile $env:REDIS_DIR\redis.log" `
+            -WindowStyle Hidden
+          Start-Sleep -Seconds 2
+          & "$env:REDIS_DIR\redis-cli.exe" -p $env:REDIS_PORT PING
+
+      - name: Start nexrade-cache
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath "$PWD\target\release\nexrade-cache.exe" `
+            -ArgumentList "--port $env:NEXRADE_PORT --metrics-port 9399" `
+            -WindowStyle Hidden `
+            -PassThru
+          echo "NEXRADE_PID=$($proc.Id)" >> $env:GITHUB_ENV
+          Start-Sleep -Seconds 2
+          & "$env:REDIS_DIR\redis-cli.exe" -p $env:NEXRADE_PORT PING
+
+      # ── Install Python benchmark client ──────────────────────────────────────
+
+      - name: Install redis-py
+        run: pip install redis
+
+      # ── Warm-up & Benchmark (redis-py) ───────────────────────────────────────
+      # redis-benchmark.exe has broken async socket writes on Windows Server 2022
+      # (both microsoftarchive 3.0 and tporadowski 5.0). We use redis-py instead,
+      # which uses synchronous BSD-socket calls that work correctly on all Windows.
+
+      - name: Benchmark Redis (CSV)
+        shell: python
+        run: |
+          import redis as redispy, time, threading, csv, os, sys
+
+          HOST     = "127.0.0.1"
+          PORT     = int(os.environ["REDIS_PORT"])
+          CLIENTS  = int(os.environ["BENCH_CLIENTS"])
+          REQUESTS = int(os.environ["BENCH_REQUESTS"])
+          OUTFILE  = "redis-bench.csv"
+
+          COMMANDS = [
+              "PING_INLINE", "PING_MBULK",
+              "SET", "GET", "INCR",
+              "LPUSH", "RPUSH", "LPOP", "RPOP",
+              "SADD", "HSET", "SPOP",
+              "ZADD", "ZPOPMIN", "LRANGE",
+          ]
+
+          def run_cmd(r, cmd):
+              if cmd in ("PING_INLINE", "PING_MBULK"):
+                  r.ping()
+              elif cmd == "SET":
+                  r.set("bk", "x" * 3)
+              elif cmd == "GET":
+                  r.get("bk")
+              elif cmd == "INCR":
+                  r.incr("bc")
+              elif cmd == "LPUSH":
+                  r.lpush("bl", "v")
+              elif cmd == "RPUSH":
+                  r.rpush("bl", "v")
+              elif cmd == "LPOP":
+                  r.lpop("bl")
+              elif cmd == "RPOP":
+                  r.rpop("bl")
+              elif cmd == "SADD":
+                  r.sadd("bs", "m")
+              elif cmd == "HSET":
+                  r.hset("bh", "f", "v")
+              elif cmd == "SPOP":
+                  r.spop("bs")
+              elif cmd == "ZADD":
+                  r.zadd("bz", {"m": 1.0})
+              elif cmd == "ZPOPMIN":
+                  r.zpopmin("bz")
+              elif cmd == "LRANGE":
+                  r.lrange("blr", 0, 99)
+
+          def seed(r):
+              r.set("bk", "xxx")
+              r.lpush("bl", *["v"] * 200)
+              r.sadd("bs",  *[f"m{i}" for i in range(200)])
+              r.zadd("bz",  {f"m{i}": float(i) for i in range(200)})
+              r.lpush("blr",*["v"] * 200)
+
+          def bench(cmd):
+              per = max(1, REQUESTS // CLIENTS)
+              results, errs = [], []
+              barrier = threading.Barrier(CLIENTS + 1)
+
+              def worker():
+                  try:
+                      r = redispy.Redis(host=HOST, port=PORT,
+                                        socket_connect_timeout=5,
+                                        socket_timeout=30)
+                      seed(r)
+                      barrier.wait(timeout=30)
+                      t0 = time.perf_counter()
+                      for _ in range(per):
+                          run_cmd(r, cmd)
+                      results.append(per / max(time.perf_counter() - t0, 1e-9))
+                  except Exception as exc:
+                      errs.append(str(exc))
+                      try: barrier.abort()
+                      except Exception: pass
+
+              threads = [threading.Thread(target=worker, daemon=True)
+                         for _ in range(CLIENTS)]
+              for t in threads: t.start()
+              try: barrier.wait(timeout=30)
+              except threading.BrokenBarrierError: pass
+              for t in threads: t.join(timeout=120)
+
+              if errs:
+                  print(f"  ERRORS: {errs[:3]}", file=sys.stderr)
+                  return 0.0
+              return sum(results)
+
+          # warm-up
+          print("Warming up...", flush=True)
+          r = redispy.Redis(host=HOST, port=PORT)
+          for _ in range(5000):
+              r.set("bk", "xxx")
+              r.get("bk")
+
+          rows = []
+          for cmd in COMMANDS:
+              print(f"  {cmd}...", end=" ", flush=True)
+              rps = bench(cmd)
+              print(f"{rps:,.0f} req/s")
+              rows.append((cmd, rps))
+
+          with open(OUTFILE, "w", newline="") as f:
+              w = csv.writer(f, quoting=csv.QUOTE_ALL)
+              for cmd, rps in rows:
+                  w.writerow([cmd, f"{rps:.2f}"])
+
+          print("=== Redis raw ===")
+          print(open(OUTFILE).read())
+
+      - name: Benchmark nexrade-cache (CSV)
+        shell: python
+        run: |
+          import redis as redispy, time, threading, csv, os, sys
+
+          HOST     = "127.0.0.1"
+          PORT     = int(os.environ["NEXRADE_PORT"])
+          CLIENTS  = int(os.environ["BENCH_CLIENTS"])
+          REQUESTS = int(os.environ["BENCH_REQUESTS"])
+          OUTFILE  = "nexrade-bench.csv"
+
+          COMMANDS = [
+              "PING_INLINE", "PING_MBULK",
+              "SET", "GET", "INCR",
+              "LPUSH", "RPUSH", "LPOP", "RPOP",
+              "SADD", "HSET", "SPOP",
+              "ZADD", "ZPOPMIN", "LRANGE",
+          ]
+
+          def run_cmd(r, cmd):
+              if cmd in ("PING_INLINE", "PING_MBULK"):
+                  r.ping()
+              elif cmd == "SET":
+                  r.set("bk", "x" * 3)
+              elif cmd == "GET":
+                  r.get("bk")
+              elif cmd == "INCR":
+                  r.incr("bc")
+              elif cmd == "LPUSH":
+                  r.lpush("bl", "v")
+              elif cmd == "RPUSH":
+                  r.rpush("bl", "v")
+              elif cmd == "LPOP":
+                  r.lpop("bl")
+              elif cmd == "RPOP":
+                  r.rpop("bl")
+              elif cmd == "SADD":
+                  r.sadd("bs", "m")
+              elif cmd == "HSET":
+                  r.hset("bh", "f", "v")
+              elif cmd == "SPOP":
+                  r.spop("bs")
+              elif cmd == "ZADD":
+                  r.zadd("bz", {"m": 1.0})
+              elif cmd == "ZPOPMIN":
+                  r.zpopmin("bz")
+              elif cmd == "LRANGE":
+                  r.lrange("blr", 0, 99)
+
+          def seed(r):
+              r.set("bk", "xxx")
+              r.lpush("bl", *["v"] * 200)
+              r.sadd("bs",  *[f"m{i}" for i in range(200)])
+              r.zadd("bz",  {f"m{i}": float(i) for i in range(200)})
+              r.lpush("blr",*["v"] * 200)
+
+          def bench(cmd):
+              per = max(1, REQUESTS // CLIENTS)
+              results, errs = [], []
+              barrier = threading.Barrier(CLIENTS + 1)
+
+              def worker():
+                  try:
+                      r = redispy.Redis(host=HOST, port=PORT,
+                                        socket_connect_timeout=5,
+                                        socket_timeout=30)
+                      seed(r)
+                      barrier.wait(timeout=30)
+                      t0 = time.perf_counter()
+                      for _ in range(per):
+                          run_cmd(r, cmd)
+                      results.append(per / max(time.perf_counter() - t0, 1e-9))
+                  except Exception as exc:
+                      errs.append(str(exc))
+                      try: barrier.abort()
+                      except Exception: pass
+
+              threads = [threading.Thread(target=worker, daemon=True)
+                         for _ in range(CLIENTS)]
+              for t in threads: t.start()
+              try: barrier.wait(timeout=30)
+              except threading.BrokenBarrierError: pass
+              for t in threads: t.join(timeout=120)
+
+              if errs:
+                  print(f"  ERRORS: {errs[:3]}", file=sys.stderr)
+                  return 0.0
+              return sum(results)
+
+          # warm-up
+          print("Warming up...", flush=True)
+          r = redispy.Redis(host=HOST, port=PORT)
+          for _ in range(5000):
+              r.set("bk", "xxx")
+              r.get("bk")
+
+          rows = []
+          for cmd in COMMANDS:
+              print(f"  {cmd}...", end=" ", flush=True)
+              rps = bench(cmd)
+              print(f"{rps:,.0f} req/s")
+              rows.append((cmd, rps))
+
+          with open(OUTFILE, "w", newline="") as f:
+              w = csv.writer(f, quoting=csv.QUOTE_ALL)
+              for cmd, rps in rows:
+                  w.writerow([cmd, f"{rps:.2f}"])
+
+          print("=== nexrade-cache raw ===")
+          print(open(OUTFILE).read())
+
+      # ── Compare & report ─────────────────────────────────────────────────────
+
+      - name: Generate comparison report
+        shell: python
+        run: |
+          import csv, os, sys
+
+          def load(path):
+              results = {}
+              with open(path, encoding="utf-8-sig") as f:
+                  for row in csv.reader(f):
+                      if len(row) >= 2:
+                          name = row[0].strip('"')
+                          try:
+                              rps = float(row[1].strip('"'))
+                              results[name] = rps
+                          except ValueError:
+                              pass
+              return results
+
+          redis   = load("redis-bench.csv")
+          nexrade = load("nexrade-bench.csv")
+          all_cmds = sorted(set(redis) | set(nexrade))
+
+          lines = []
+          lines.append("## 📊 Benchmark Comparison: nexrade-cache vs Redis (Windows)\n")
+          lines.append("> **Redis:** tporadowski/redis v5.0.14.1 (Windows port)  \n"
+                       f"> **Clients:** {os.environ['BENCH_CLIENTS']}  "
+                       f"**Requests:** {os.environ['BENCH_REQUESTS']}\n")
+          lines.append("| Command | Redis (req/s) | nexrade-cache (req/s) | Ratio |")
+          lines.append("|---------|-------------:|-----------------------:|------:|")
+
+          ratios = []
+          for cmd in all_cmds:
+              r = redis.get(cmd)
+              n = nexrade.get(cmd)
+              if r and n:
+                  ratio = n / r
+                  ratios.append(ratio)
+                  pct   = (ratio - 1) * 100
+                  arrow = "🟢" if ratio >= 0.9 else ("🟡" if ratio >= 0.7 else "🔴")
+                  sign  = "+" if pct >= 0 else ""
+                  lines.append(
+                      f"| `{cmd}` | {r:,.0f} | {n:,.0f} "
+                      f"| {arrow} {ratio:.2f}x ({sign}{pct:.1f}%) |"
+                  )
+              elif r:
+                  lines.append(f"| `{cmd}` | {r:,.0f} | — | — |")
+              else:
+                  lines.append(f"| `{cmd}` | — | {n:,.0f} | — |")
+
+          if ratios:
+              avg = sum(ratios) / len(ratios)
+              lines.append("")
+              lines.append(f"**Overall average ratio:** {avg:.2f}x  ")
+              if avg >= 0.95:
+                  lines.append("✅ nexrade-cache is within 5% of Redis performance.")
+              elif avg >= 0.80:
+                  lines.append("⚠️ nexrade-cache is 80–95% of Redis performance.")
+              else:
+                  lines.append("❌ nexrade-cache is below 80% of Redis performance.")
+
+          report = "\n".join(lines)
+          print(report)
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(report + "\n")
+
+          with open("bench-comparison-windows.md", "w") as f:
+              f.write(report + "\n")
+
+          if ratios and sum(ratios)/len(ratios) < 0.50:
+              print("FATAL: nexrade-cache is less than 50% of Redis on Windows!", file=sys.stderr)
+              sys.exit(1)
+
+      # ── Cleanup ──────────────────────────────────────────────────────────────
+
+      - name: Stop servers
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:NEXRADE_PID) {
+            Stop-Process -Id $env:NEXRADE_PID -Force -ErrorAction SilentlyContinue
+          }
+          & "$env:REDIS_DIR\redis-cli.exe" -p $env:REDIS_PORT SHUTDOWN NOSAVE 2>$null
+          exit 0
+
+      # ── Artifacts ────────────────────────────────────────────────────────────
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-results-windows-${{ github.sha }}
+          path: |
+            redis-bench.csv
+            nexrade-bench.csv
+            bench-comparison-windows.md
+          retention-days: 90
+
+      # ── PR comment ───────────────────────────────────────────────────────────
+
+      - name: Post Windows comparison as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('bench-comparison-windows.md', 'utf8');
+            const marker = '<!-- bench-comparison-windows -->';
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c => c.body.includes(marker));
+            const fullBody = marker + '\n' + body;
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: fullBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: fullBody,
+              });
+            }

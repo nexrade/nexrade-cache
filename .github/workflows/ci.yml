@@ -1,0 +1,274 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "nexrade-cli/**"
+      - "fuzz/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "nexrade-cli/**"
+      - "fuzz/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci.yml"
+
+# Cancel stale runs on the same ref — never pay for an outdated run
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ─── Format check (ubuntu only — cheap, fast) ───────────────────────────────
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable + rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # ─── Clippy lints (ubuntu only) ─────────────────────────────────────────────
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable + clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-clippy-
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # ─── Tests — Linux only ─────────────────────────────────────────────────────
+  # macOS costs 10× and Windows costs 2× billed minutes.
+  # Cross-platform compatibility is validated in the release workflow (tags only).
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
+
+      - name: Run all tests
+        run: cargo test --workspace --all-features
+
+      - name: Run nexrade-core tests (verbose)
+        run: cargo test --package nexrade-core -- --nocapture
+
+  # ─── Security audit ─────────────────────────────────────────────────────────
+  # Removed standalone cargo-audit job — cargo-deny (below) covers advisory
+  # checks with proper ignore rules from deny.toml. Running both caused
+  # failures when cargo-audit flagged advisories that deny.toml explicitly
+  # allows (e.g. unmaintained-but-safe crates).
+
+  # ─── Code coverage (cargo-llvm-cov) ─────────────────────────────────────────
+  # Skipped on PRs — coverage doesn't block merge and takes ~15 min.
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable + llvm-tools
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-llvm-cov
+            target
+          key: ${{ runner.os }}-cargo-cov-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-llvm-cov
+        run: |
+          if ! command -v cargo-llvm-cov &>/dev/null; then
+            cargo install cargo-llvm-cov --locked
+          fi
+
+      - name: Generate coverage report
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v6
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+
+  # ─── Fuzz build check (cargo-fuzz — compile only, no fuzzing in CI) ─────────
+  # Skipped on PRs — nightly toolchain install adds ~8 min with little PR value.
+  fuzz-build:
+    name: Fuzz build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install nightly Rust (required by cargo-fuzz)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-fuzz
+            target
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-fuzz
+        run: |
+          if ! command -v cargo-fuzz &>/dev/null; then
+            cargo +nightly install cargo-fuzz --locked
+          fi
+
+      - name: Build fuzz targets (compile check only)
+        # Explicitly use +nightly so the workspace's rust-toolchain.toml (which
+        # pins stable for the rest of CI) does not override the fuzz build.
+        run: cargo +nightly fuzz build resp_parser
+
+  # ─── Smoke test — Linux + Windows (no macOS) ────────────────────────────────
+  # Only runs on PRs/pushes targeting main — skipped on feature branches.
+  smoke:
+    name: Smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    if: >
+      github.ref == 'refs/heads/main' ||
+      github.base_ref == 'main' ||
+      github.base_ref == 'master'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-smoke-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-smoke-
+
+      - name: Build release binary
+        run: cargo build --release --package nexrade-cache
+
+      - name: Smoke test — PING/PONG (Linux)
+        if: runner.os != 'Windows'
+        run: |
+          ./target/release/nexrade-cache --port 16399 &
+          SERVER_PID=$!
+          sleep 1
+          ./target/release/nexrade-cli -p 16399 PING
+          kill $SERVER_PID 2>/dev/null || true
+
+      - name: Smoke test — PING/PONG (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $job = Start-Job { & "$env:GITHUB_WORKSPACE\target\release\nexrade-cache.exe" --port 16399 }
+          Start-Sleep -Seconds 2
+          $result = & "$env:GITHUB_WORKSPACE\target\release\nexrade-cli.exe" -p 16399 PING
+          Write-Host "CLI result: $result"
+          Stop-Job $job; Remove-Job $job
+
+  # ─── Dependency policy (cargo-deny) ─────────────────────────────────────────
+  # Checks: security advisories, license compatibility, duplicate crates,
+  # banned crates, and allowed source registries.  Supersedes cargo-audit for
+  # advisory coverage and adds the licence + bans checks on top.
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # Treat any advisory or licence violation as an error.
+          # deny.toml in the repo root configures the exact policy.
+          command: check
+
+  # ─── MSRV (Minimum Supported Rust Version) ──────────────────────────────────
+  # Skipped on PRs — a full double-build (~10 min) is better suited for main.
+  msrv:
+    name: MSRV (Rust 1.87)
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust 1.87
+        uses: dtolnay/rust-toolchain@1.100
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-msrv-
+
+      - name: Build (MSRV)
+        run: cargo build --workspace
+
+      - name: Test (MSRV)
+        run: cargo test --workspace

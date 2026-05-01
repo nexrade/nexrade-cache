@@ -1,0 +1,38 @@
+version: 2
+
+updates:
+  # ── Cargo dependencies ──────────────────────────────────────────────────────
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 10
+    # Group all non-breaking patch/minor updates into a single PR to reduce noise
+    groups:
+      patch-updates:
+        update-types:
+          - patch
+      minor-updates:
+        update-types:
+          - minor
+    ignore:
+      # mlua vendors Lua 5.4 — let us manage that bump manually
+      - dependency-name: mlua
+        update-types: ["version-update:semver-major"]
+
+  # ── GitHub Actions ──────────────────────────────────────────────────────────
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    groups:
+      actions-updates:
+        patterns:
+          - "*"

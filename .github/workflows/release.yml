@@ -1,0 +1,434 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"   # e.g. v0.1.0, v1.2.3
+
+permissions:
+  contents: write   # needed to create GitHub Releases
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ─── Build release binaries for every platform & arch ──────────────────────
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Linux x86_64 (glibc — most servers) ────────────────────────────
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: nexrade-cache-linux-x86_64
+            exe_suffix: ""
+            cross: false
+
+          # ── Linux x86_64 (musl — static, Alpine / Docker scratch) ──────────
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: nexrade-cache-linux-x86_64-musl
+            exe_suffix: ""
+            cross: true
+
+          # ── Linux ARM64 (Raspberry Pi 4 / AWS Graviton / Apple M1 docker) ──
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: nexrade-cache-linux-arm64
+            exe_suffix: ""
+            cross: true
+
+          # ── Linux ARM64 musl (static ARM64) ────────────────────────────────
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact: nexrade-cache-linux-arm64-musl
+            exe_suffix: ""
+            cross: true
+
+          # ── Linux ARMv7 (Raspberry Pi 2/3) ─────────────────────────────────
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            artifact: nexrade-cache-linux-armv7
+            exe_suffix: ""
+            cross: true
+
+          # ── macOS ARM64 (Apple Silicon M1/M2/M3) ────────────────────────────
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: nexrade-cache-macos-arm64
+            exe_suffix: ""
+            cross: false
+
+          # ── Windows x86_64 ──────────────────────────────────────────────────
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: nexrade-cache-windows-x86_64
+            exe_suffix: ".exe"
+            cross: false
+
+          # ── Windows ARM64 ───────────────────────────────────────────────────
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact: nexrade-cache-windows-arm64
+            exe_suffix: ".exe"
+            cross: false
+
+          # ── FreeBSD x86_64 (via cross) ──────────────────────────────────────
+          - os: ubuntu-latest
+            target: x86_64-unknown-freebsd
+            artifact: nexrade-cache-freebsd-x86_64
+            exe_suffix: ""
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # Native build (no cross-compilation needed)
+      - name: Build (native)
+        if: matrix.cross == false
+        run: |
+          cargo build --release --package nexrade-cache --target ${{ matrix.target }}
+
+      # Cross-compilation via `cross`
+      - name: Install cross
+        if: matrix.cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (cross)
+        if: matrix.cross == true
+        run: |
+          cross build --release --package nexrade-cache --target ${{ matrix.target }}
+
+      # ── Package artifacts ──────────────────────────────────────────────────
+      - name: Package binaries (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+
+          cp target/${{ matrix.target }}/release/nexrade-cache${{ matrix.exe_suffix }} dist/
+          cp target/${{ matrix.target }}/release/nexrade-cli${{ matrix.exe_suffix }} dist/
+          cp nexrade.example.toml dist/nexrade.toml
+          cp README.md dist/
+          cp LICENSE-MIT LICENSE-APACHE dist/
+
+          cd dist
+          tar -czf ../${{ matrix.artifact }}.tar.gz .
+          cd ..
+
+          # Also generate SHA256 checksum
+          sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Package binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+
+          Copy-Item "target\${{ matrix.target }}\release\nexrade-cache${{ matrix.exe_suffix }}" dist\
+          Copy-Item "target\${{ matrix.target }}\release\nexrade-cli${{ matrix.exe_suffix }}" dist\
+          Copy-Item nexrade.example.toml dist\nexrade.toml
+          Copy-Item README.md dist\
+          Copy-Item LICENSE-MIT, LICENSE-APACHE dist\
+
+          Compress-Archive -Path dist\* -DestinationPath ${{ matrix.artifact }}.zip
+
+          $hash = Get-FileHash ${{ matrix.artifact }}.zip -Algorithm SHA256
+          "$($hash.Hash)  ${{ matrix.artifact }}.zip" | Out-File -Encoding utf8 ${{ matrix.artifact }}.zip.sha256
+
+      # ── Upload to GitHub Actions artifacts ────────────────────────────────
+      - name: Upload artifact (tar.gz)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Upload artifact (zip)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.zip.sha256
+
+  # ─── Linux .deb and .rpm packages ─────────────────────────────────────────
+  package-linux:
+    name: Package Linux (${{ matrix.arch }})
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            cross: false
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: linux-pkg-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cross
+        if: matrix.cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Install packaging tools
+        run: cargo install cargo-deb cargo-generate-rpm --locked
+
+      - name: Build (native)
+        if: matrix.cross == false
+        run: cargo build --release --package nexrade-cache --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross == true
+        run: cross build --release --package nexrade-cache --target ${{ matrix.target }}
+
+      - name: Build .deb
+        run: |
+          cargo deb --package nexrade-cache --no-build \
+            --target ${{ matrix.target }} \
+            --output nexrade-cache_${{ github.ref_name }}_${{ matrix.arch }}.deb
+          sha256sum nexrade-cache_${{ github.ref_name }}_${{ matrix.arch }}.deb \
+            > nexrade-cache_${{ github.ref_name }}_${{ matrix.arch }}.deb.sha256
+
+      - name: Build .rpm
+        run: |
+          cargo generate-rpm --package nexrade-cache \
+            --target ${{ matrix.target }} \
+            --output nexrade-cache-${{ github.ref_name }}-1.${{ matrix.arch }}.rpm
+          sha256sum nexrade-cache-${{ github.ref_name }}-1.${{ matrix.arch }}.rpm \
+            > nexrade-cache-${{ github.ref_name }}-1.${{ matrix.arch }}.rpm.sha256
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-deb-${{ matrix.arch }}
+          path: |
+            nexrade-cache_*.deb
+            nexrade-cache_*.deb.sha256
+
+      - name: Upload .rpm artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-rpm-${{ matrix.arch }}
+          path: |
+            nexrade-cache-*.rpm
+            nexrade-cache-*.rpm.sha256
+
+  # ─── Windows MSI installer (cargo-wix) ────────────────────────────────────
+  build-msi:
+    name: Build Windows MSI (${{ matrix.arch }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry + cargo-wix binary
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-wix.exe
+            target
+          key: windows-msi-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}-wix039
+
+      - name: Install WiX Toolset v3
+        run: |
+          $wix = Get-Command candle.exe -ErrorAction SilentlyContinue
+          if (-not $wix) {
+            choco install wixtoolset -y --no-progress
+          }
+          $wixPath = (Get-ChildItem "C:\Program Files (x86)\WiX Toolset*" | Sort-Object Name -Descending | Select-Object -First 1).FullName
+          "$wixPath\bin" | Out-File -Append -FilePath $env:GITHUB_PATH
+
+      - name: Install cargo-wix
+        run: |
+          if (-not (Get-Command cargo-wix -ErrorAction SilentlyContinue)) {
+            cargo install cargo-wix --version 0.3.9 --locked
+          }
+
+      - name: Build release binaries
+        run: cargo build --release --package nexrade-cache --target ${{ matrix.target }}
+
+      - name: Build MSI
+        run: |
+          cargo wix --package nexrade-cache --no-build --nocapture `
+            --target ${{ matrix.target }} `
+            --output "nexrade-cache-${{ github.ref_name }}-${{ matrix.arch }}.msi"
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $f = Get-ChildItem "nexrade-cache-*.msi" | Select-Object -First 1
+          $hash = (Get-FileHash $f.FullName -Algorithm SHA256).Hash
+          "$hash  $($f.Name)" | Out-File -Encoding utf8 "$($f.Name).sha256"
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-msi-${{ matrix.arch }}
+          path: |
+            nexrade-cache-*.msi
+            nexrade-cache-*.msi.sha256
+
+  # ─── Create GitHub Release ─────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: [build, build-msi, package-linux]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "nexrade-cache ${{ steps.version.outputs.version }}"
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}   # pre-release if tag contains '-'
+          generate_release_notes: true
+          body: |
+            # nexrade-cache ${{ steps.version.outputs.version }}
+
+            A high-performance Redis-compatible cache server written in Rust.
+
+            ## Quick start
+
+            ### Linux / macOS
+            ```sh
+            # Download for your platform (example: Linux x86_64 musl — static binary)
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/nexrade-cache-linux-x86_64-musl.tar.gz
+            tar -xzf nexrade-cache-linux-x86_64-musl.tar.gz
+            chmod +x nexrade-cache nexrade-cli
+
+            # Start the server (drop-in Redis replacement on port 6379)
+            ./nexrade-cache
+
+            # Connect with the built-in CLI
+            ./nexrade-cli PING
+            # → PONG
+
+            # Or use redis-cli (fully compatible)
+            redis-cli PING
+            ```
+
+            ### Windows
+            ```powershell
+            # Unzip nexrade-cache-windows-x86_64.zip
+            .\nexrade-cache.exe
+            .\nexrade-cli.exe PING
+            ```
+
+            ### Docker (using musl static binary)
+            ```dockerfile
+            FROM scratch
+            COPY nexrade-cache /nexrade-cache
+            EXPOSE 6379 9091
+            ENTRYPOINT ["/nexrade-cache"]
+            ```
+
+            ## What's new
+
+            See the [full changelog](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details.
+
+            ## Supported platforms
+
+            | Platform | Binary |
+            |----------|--------|
+            | Linux x86_64 (glibc) | `nexrade-cache-linux-x86_64.tar.gz` |
+            | Linux x86_64 (musl, static) | `nexrade-cache-linux-x86_64-musl.tar.gz` |
+            | Linux ARM64 | `nexrade-cache-linux-arm64.tar.gz` |
+            | Linux ARM64 (musl, static) | `nexrade-cache-linux-arm64-musl.tar.gz` |
+            | Linux ARMv7 | `nexrade-cache-linux-armv7.tar.gz` |
+            | macOS ARM64 (Apple Silicon) | `nexrade-cache-macos-arm64.tar.gz` |
+            | Windows x86_64 (installer) | `nexrade-cache-vX.Y.Z-x86_64.msi` |
+            | Windows x86_64 (portable) | `nexrade-cache-windows-x86_64.zip` |
+            | Windows ARM64 (portable) | `nexrade-cache-windows-arm64.zip` |
+            | FreeBSD x86_64 | `nexrade-cache-freebsd-x86_64.tar.gz` |
+
+            Each archive contains:
+            - `nexrade-cache` — server binary (drop-in Redis replacement)
+            - `nexrade-cli` — interactive CLI client
+            - `nexrade.toml` — example config file
+            - `README.md`
+
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.tar.gz.sha256
+            artifacts/**/*.zip
+            artifacts/**/*.zip.sha256
+            artifacts/**/*.msi
+            artifacts/**/*.msi.sha256
+            artifacts/**/*.deb
+            artifacts/**/*.deb.sha256
+            artifacts/**/*.rpm
+            artifacts/**/*.rpm.sha256

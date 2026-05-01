@@ -1,0 +1,287 @@
+name: Examples
+
+on:
+  push:
+    branches: ["**"]
+    # Only run when examples or source code actually changed
+    paths:
+      - "examples/**"
+      - "crates/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/examples.yml"
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "examples/**"
+      - "crates/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/examples.yml"
+
+# Cancel the previous run on the same ref — never waste minutes on stale runs
+concurrency:
+  group: examples-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ─── Single job — 1 runner, sequential steps, minimum billed minutes ─────────
+  run-all-examples:
+    name: Run all examples
+    runs-on: ubuntu-latest
+    # Only run on push to main — examples take ~20 min and are redundant on PRs
+    # where cargo test already validates the core logic.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # ── Rust toolchain (cached) ──────────────────────────────────────────────
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-examples-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-examples-
+
+      # ── Build server once ────────────────────────────────────────────────────
+      - name: Build nexrade-cache
+        run: cargo build --package nexrade-cache
+
+      # ── Install runtime deps ─────────────────────────────────────────────────
+      - name: Install Python deps
+        run: pip install redis
+
+      # nexrade-cli (built above) speaks the same RESP protocol as redis-cli.
+      # Exposing it as redis-cli avoids a flaky apt-get install of redis-tools.
+      - name: Expose nexrade-cli as redis-cli
+        run: |
+          mkdir -p /tmp/bin
+          printf '#!/bin/bash\nexec "%s/target/debug/nexrade-cli" "$@"\n' \
+            "$(pwd)" > /tmp/bin/redis-cli
+          chmod +x /tmp/bin/redis-cli
+          echo "/tmp/bin" >> $GITHUB_PATH
+
+      # ── Start server ─────────────────────────────────────────────────────────
+      - name: Start nexrade-cache server
+        run: |
+          ./target/debug/nexrade-cache --port 6379 &
+          echo "SERVER_PID=$!" >> $GITHUB_ENV
+          sleep 1
+          redis-cli ping
+
+      # ── 01-basic ─────────────────────────────────────────────────────────────
+      - name: "01-basic: hello"
+        run: bash examples/01-basic/hello.sh
+
+      # ── 02-data-types ────────────────────────────────────────────────────────
+      - name: "02-data-types: strings / lists / hashes / sets / sorted-sets"
+        run: |
+          bash examples/02-data-types/strings.sh
+          bash examples/02-data-types/lists.sh
+          bash examples/02-data-types/hashes.sh
+          bash examples/02-data-types/sets.sh
+          bash examples/02-data-types/sorted-sets.sh
+
+      # ── 03-pubsub ────────────────────────────────────────────────────────────
+      - name: "03-pubsub: publisher + subscriber"
+        run: |
+          python3 examples/03-pubsub/subscriber.py news &
+          SUB_PID=$!
+          sleep 0.5
+          python3 examples/03-pubsub/publisher.py
+          sleep 0.5
+          kill $SUB_PID 2>/dev/null || true
+
+      # ── 04-transactions ──────────────────────────────────────────────────────
+      - name: "04-transactions: atomic-ops"
+        run: |
+          bash examples/04-transactions/atomic-ops.sh
+          python3 examples/04-transactions/atomic-ops.py
+
+      # ── 05-lua ───────────────────────────────────────────────────────────────
+      - name: "05-lua: scripting"
+        run: bash examples/05-lua/scripting.sh
+
+      # ── 06-streams ───────────────────────────────────────────────────────────
+      - name: "06-streams: producer-consumer"
+        run: python3 examples/06-streams/producer-consumer.py
+
+      # ── 07-pipeline ──────────────────────────────────────────────────────────
+      - name: "07-pipeline: benchmark"
+        run: python3 examples/07-pipeline/benchmark.py
+
+      # ── Stop server ──────────────────────────────────────────────────────────
+      - name: Stop server
+        if: always()
+        run: kill $SERVER_PID 2>/dev/null || true
+
+      # ── 08-embedded (no server needed) ───────────────────────────────────────
+      - name: "08-embedded: build and run"
+        run: cargo run --manifest-path examples/08-embedded/Cargo.toml
+
+      # ── 09-plugin ────────────────────────────────────────────────────────────
+      - name: "09-plugin: build"
+        run: cargo build --manifest-path examples/09-plugin/Cargo.toml
+
+      # ── 10-wasm ──────────────────────────────────────────────────────────────
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: "10-wasm: build WASM package"
+        run: wasm-pack build crates/nexrade-wasm --target web --release --features wasm
+
+      # ── 11-python-patterns ───────────────────────────────────────────────────
+      - name: Start nexrade-cache server (11-python-patterns)
+        run: |
+          ./target/debug/nexrade-cache --port 6379 &
+          echo "SERVER_PID_11=$!" >> $GITHUB_ENV
+          sleep 1
+          redis-cli ping
+
+      - name: "11-python-patterns: patterns"
+        run: python3 examples/11-python-patterns/patterns.py
+
+      - name: Stop server (11-python-patterns)
+        if: always()
+        run: kill $SERVER_PID_11 2>/dev/null || true
+
+  # ─── Windows job ─────────────────────────────────────────────────────────────
+  # Scope: examples 01-07 + 11 (server/protocol/script compatibility on Windows).
+  # Examples 08-embedded, 09-plugin, 10-wasm produce platform-agnostic Rust/WASM
+  # artefacts and are already covered by the Linux job — skipping them here cuts
+  # ~12 min off the run (wasm-pack alone compiles from source on Windows).
+  run-all-examples-windows:
+    name: Run all examples (Windows)
+    runs-on: windows-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    env:
+      PYTHONUTF8: "1"
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # ── Rust toolchain (cached) — no wasm32 target needed on Windows ─────────
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-examples-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-examples-
+
+      # ── Build server once ────────────────────────────────────────────────────
+      - name: Build nexrade-cache
+        run: cargo build --package nexrade-cache
+
+      # ── Install runtime deps ─────────────────────────────────────────────────
+      - name: Install Python deps
+        run: pip install redis
+
+      # nexrade-cli (built above) is Redis-compatible — expose it as redis-cli
+      - name: Expose nexrade-cli as redis-cli
+        run: |
+          mkdir -p /tmp/bin
+          echo '#!/bin/bash' > /tmp/bin/redis-cli
+          echo 'exec "$(git rev-parse --show-toplevel)/target/debug/nexrade-cli.exe" "$@"' >> /tmp/bin/redis-cli
+          chmod +x /tmp/bin/redis-cli
+          echo "/tmp/bin" >> $GITHUB_PATH
+
+      # Kill any process already listening on 6379 (Windows may have a system Redis)
+      - name: Free port 6379
+        shell: pwsh
+        run: |
+          Get-NetTCPConnection -LocalPort 6379 -State Listen -ErrorAction SilentlyContinue |
+            ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+
+      # ── Start server ─────────────────────────────────────────────────────────
+      - name: Start nexrade-cache server
+        run: |
+          ./target/debug/nexrade-cache.exe --port 6379 &
+          echo "SERVER_PID=$!" >> $GITHUB_ENV
+          sleep 2
+          python3 -c "import redis; redis.Redis().ping(); print('PONG')"
+
+      # ── 01-basic ─────────────────────────────────────────────────────────────
+      - name: "01-basic: hello"
+        run: bash examples/01-basic/hello.sh
+
+      # ── 02-data-types ────────────────────────────────────────────────────────
+      - name: "02-data-types: strings / lists / hashes / sets / sorted-sets"
+        run: |
+          bash examples/02-data-types/strings.sh
+          bash examples/02-data-types/lists.sh
+          bash examples/02-data-types/hashes.sh
+          bash examples/02-data-types/sets.sh
+          bash examples/02-data-types/sorted-sets.sh
+
+      # ── 03-pubsub ────────────────────────────────────────────────────────────
+      - name: "03-pubsub: publisher + subscriber"
+        run: |
+          python3 examples/03-pubsub/subscriber.py news &
+          SUB_PID=$!
+          sleep 0.5
+          python3 examples/03-pubsub/publisher.py
+          sleep 0.5
+          kill $SUB_PID 2>/dev/null || true
+
+      # ── 04-transactions ──────────────────────────────────────────────────────
+      - name: "04-transactions: atomic-ops"
+        run: |
+          bash examples/04-transactions/atomic-ops.sh
+          python3 examples/04-transactions/atomic-ops.py
+
+      # ── 05-lua ───────────────────────────────────────────────────────────────
+      - name: "05-lua: scripting"
+        run: bash examples/05-lua/scripting.sh
+
+      # ── 06-streams ───────────────────────────────────────────────────────────
+      - name: "06-streams: producer-consumer"
+        run: python3 examples/06-streams/producer-consumer.py
+
+      # ── 07-pipeline ──────────────────────────────────────────────────────────
+      - name: "07-pipeline: benchmark"
+        run: python3 examples/07-pipeline/benchmark.py
+
+      # ── Stop server ──────────────────────────────────────────────────────────
+      - name: Stop server
+        if: always()
+        run: kill $SERVER_PID 2>/dev/null || true
+
+      # ── 11-python-patterns ───────────────────────────────────────────────────
+      - name: Start nexrade-cache server (11-python-patterns)
+        run: |
+          ./target/debug/nexrade-cache.exe --port 6379 &
+          echo "SERVER_PID_11=$!" >> $GITHUB_ENV
+          sleep 2
+          python3 -c "import redis; redis.Redis().ping(); print('PONG')"
+
+      - name: "11-python-patterns: patterns"
+        run: python3 examples/11-python-patterns/patterns.py
+
+      - name: Stop server (11-python-patterns)
+        if: always()
+        run: kill $SERVER_PID_11 2>/dev/null || true

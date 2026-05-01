@@ -1,0 +1,109 @@
+name: Criterion benchmarks
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "crates/nexrade-core/benches/**"
+      - "crates/nexrade-core/src/**"
+      - "crates/nexrade-core/Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/criterion.yml"
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "crates/nexrade-core/benches/**"
+      - "crates/nexrade-core/src/**"
+      - "crates/nexrade-core/Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/criterion.yml"
+
+concurrency:
+  group: criterion-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── On every push / PR: just verify the benchmarks compile ─────────────────
+  # Cheap (~1 min after cache warms). Catches benchmark code rot early.
+  bench-compile:
+    name: Benchmarks compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-bench-
+
+      - name: Compile benchmarks (no run)
+        run: cargo bench -p nexrade-core --no-run
+
+  # ── On pushes to main only: run all benchmarks and upload HTML reports ──────
+  # Not run on PRs — avoids noisy 5-min runs on every feature branch push.
+  bench-run:
+    name: Benchmarks run + report
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-run-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-bench-run-
+
+      # Shorter measurement time keeps CI under 5 minutes while still
+      # producing statistically valid results (criterion runs ≥100 samples).
+      - name: Run criterion benchmarks
+        run: |
+          cargo bench -p nexrade-core -- \
+            --warm-up-time 1 \
+            --measurement-time 3 \
+            2>&1 | tee bench-output.txt
+
+      # criterion writes HTML to target/criterion — upload the whole tree.
+      - name: Upload criterion HTML report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: criterion-report-${{ github.sha }}
+          path: target/criterion
+          retention-days: 90
+
+      - name: Upload raw benchmark output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-output-${{ github.sha }}
+          path: bench-output.txt
+          retention-days: 90
+
+      # Post a summary to the Actions job page.
+      - name: Summarise results
+        if: always()
+        run: |
+          echo "## Criterion benchmark results" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -E "^[a-zA-Z]|time:|thrpt:" bench-output.txt \
+            | sed 's/^[ \t]*//' >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
