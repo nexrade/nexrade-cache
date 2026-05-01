@@ -1,0 +1,21 @@
+[package]
+name = "nexrade-fuzz"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Isolate from the root workspace so cargo-fuzz can apply its own flags.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nexrade-core = { path = "../crates/nexrade-core" }
+
+[[bin]]
+name = "resp_parser"
+path = "fuzz_targets/resp_parser.rs"
+test = false
+doc = false

@@ -1,0 +1,12 @@
+[toolchain]
+# MSRV: 1.87 — bumped from 1.86 so cargo-llvm-cov >=0.8 can be installed in CI
+channel = "1.87"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]

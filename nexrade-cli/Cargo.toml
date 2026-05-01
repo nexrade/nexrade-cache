@@ -1,0 +1,75 @@
+[package]
+name = "nexrade-cache"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "nexrade-cache — a high-performance Redis-compatible cache written in Rust"
+homepage = "https://github.com/nexrade/nexrade-cache"
+repository = "https://github.com/nexrade/nexrade-cache"
+
+[package.metadata.wix]
+upgrade-guid = "1A129356-5E6D-4B77-BCF9-63A8E46BBDD0"
+path-guid    = "2F5A15BC-C974-4DCB-A635-926830EA9247"
+eula         = false
+
+[package.metadata.deb]
+name = "nexrade-cache"
+maintainer = "nexrade <nexrade@users.noreply.github.com>"
+copyright = "2024, nexrade contributors"
+license-file = ["../LICENSE-MIT", "0"]
+extended-description = """\
+nexrade-cache is a high-performance, Redis-compatible in-memory cache \
+server written in Rust. It supports strings, lists, sets, sorted sets, \
+hashes, bitmaps, streams, geospatial data, and more."""
+depends = "$auto"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/nexrade-cache", "usr/bin/nexrade-cache", "755"],
+    ["target/release/nexrade-cli",   "usr/bin/nexrade-cli",   "755"],
+    ["nexrade.example.toml",         "etc/nexrade-cache/nexrade.toml", "644"],
+    ["README.md",                    "usr/share/doc/nexrade-cache/README.md", "644"],
+    ["../LICENSE-MIT",               "usr/share/doc/nexrade-cache/LICENSE-MIT", "644"],
+    ["../LICENSE-APACHE",            "usr/share/doc/nexrade-cache/LICENSE-APACHE", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "nexrade-cache"
+license = "MIT OR Apache-2.0"
+summary = "High-performance Redis-compatible cache server"
+group = "System Environment/Daemons"
+assets = [
+    { source = "target/release/nexrade-cache", dest = "/usr/bin/nexrade-cache",                        mode = "0755" },
+    { source = "target/release/nexrade-cli",   dest = "/usr/bin/nexrade-cli",                          mode = "0755" },
+    { source = "nexrade.example.toml",         dest = "/etc/nexrade-cache/nexrade.toml",               mode = "0644", config = true },
+    { source = "README.md",                    dest = "/usr/share/doc/nexrade-cache/README.md",         mode = "0644" },
+    { source = "../LICENSE-MIT",               dest = "/usr/share/doc/nexrade-cache/LICENSE-MIT",       mode = "0644" },
+    { source = "../LICENSE-APACHE",            dest = "/usr/share/doc/nexrade-cache/LICENSE-APACHE",    mode = "0644" },
+]
+
+[[bin]]
+name = "nexrade-cache"
+path = "src/main.rs"
+
+[[bin]]
+name = "nexrade-cli"
+path = "src/cli_client.rs"
+
+[dependencies]
+nexrade-core = { path = "../crates/nexrade-core" }
+nexrade-server = { path = "../crates/nexrade-server" }
+nexrade-metrics = { path = "../crates/nexrade-metrics" }
+nexrade-plugin = { path = "../crates/nexrade-plugin" }
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+config = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"

@@ -1,0 +1,39 @@
+[package]
+name = "nexrade-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core storage engine for nexrade-cache — embeddable Redis-compatible store"
+
+[features]
+default = []
+embedded = []
+
+[dependencies]
+# Only the features actually used by nexrade-core (sync, time, rt).
+# Excludes `net` and other mio-backed features so this crate can compile
+# for wasm32-unknown-unknown (mio has no wasm support).
+tokio = { version = "1", features = ["sync", "time", "rt"], default-features = false }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+ordered-float = { workspace = true }
+indexmap = { workspace = true }
+atoi = { workspace = true }
+bincode = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "store_bench"
+harness = false

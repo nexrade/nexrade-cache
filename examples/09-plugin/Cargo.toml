@@ -1,0 +1,18 @@
+[workspace]
+
+[package]
+name = "nexrade-plugin-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+nexrade-core   = { path = "../../crates/nexrade-core" }
+nexrade-plugin = { path = "../../crates/nexrade-plugin" }
+tokio          = { version = "1", features = ["full"] }
+async-trait    = "0.1"
+anyhow         = "1"
+serde_json     = "1"

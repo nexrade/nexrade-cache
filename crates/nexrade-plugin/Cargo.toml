@@ -1,0 +1,17 @@
+[package]
+name = "nexrade-plugin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Plugin system for nexrade-cache — extend commands with native Rust plugins"
+
+[dependencies]
+nexrade-core = { path = "../nexrade-core" }
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"
+parking_lot = { workspace = true }

@@ -1,0 +1,89 @@
+[workspace]
+members = [
+    "crates/nexrade-core",
+    "crates/nexrade-server",
+    "crates/nexrade-metrics",
+    "crates/nexrade-tls",
+    "crates/nexrade-lua",
+    "crates/nexrade-plugin",
+    "crates/nexrade-wasm",
+    "nexrade-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Nexrade Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nexrade/nexrade-cache"
+description = "A high-performance Redis-compatible cache with Rust — with observability, TLS, Lua, WASM, and plugin support"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Networking
+bytes = { version = "1", features = ["serde"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.1"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+prometheus = { version = "0.14", default-features = false, features = ["process"] }
+
+# TLS
+rustls = "0.23"
+rustls-pki-types = "1"
+tokio-rustls = "0.26"
+
+# Lua
+mlua = { version = "0.9", features = ["lua54", "vendored", "async"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Config
+config = "0.14"
+
+# UUID / ID gen
+# `js` enables getrandom's JS backend on wasm32-unknown-unknown; ignored on other targets
+uuid = { version = "1", features = ["v4", "js"] }
+
+# dashmap for concurrent access
+dashmap = "6"
+
+# parking_lot
+parking_lot = "0.12"
+
+# ordered-float for sorted sets
+ordered-float = { version = "5", features = ["serde"] }
+
+# skiplist / sorted structures
+indexmap = "2"
+
+# RESP protocol
+atoi = "2"
+
+# Persistence
+bincode = { version = "2", features = ["serde"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

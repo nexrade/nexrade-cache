@@ -1,0 +1,20 @@
+[package]
+name = "nexrade-lua"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Lua scripting for nexrade-cache — EVAL, EVALSHA, SCRIPT commands"
+
+[dependencies]
+nexrade-core = { path = "../nexrade-core" }
+
+mlua = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }

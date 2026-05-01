@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>nexrade-cache WASM demo</title>
+  <style>
+    body { font-family: monospace; max-width: 700px; margin: 2rem auto; background: #1e1e2e; color: #cdd6f4; }
+    h1 { color: #89b4fa; }
+    pre { background: #181825; padding: 1rem; border-radius: 6px; overflow-x: auto; }
+    input { background: #313244; border: 1px solid #45475a; color: #cdd6f4; padding: .4rem .6rem; width: 60%; border-radius: 4px; }
+    button { background: #89b4fa; color: #1e1e2e; border: none; padding: .4rem .8rem; border-radius: 4px; cursor: pointer; font-weight: bold; }
+    #output { margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>nexrade-cache — WASM Demo</h1>
+  <p>In-process Redis-compatible store running in your browser tab.</p>
+
+  <div>
+    <input id="cmd" type="text" placeholder="SET hello world" value="SET hello world" />
+    <button onclick="runCmd()">Run</button>
+  </div>
+
+  <pre id="output">Loading WASM...</pre>
+
+  <h2>Pre-built demo</h2>
+  <button onclick="runDemo()">Run full demo</button>
+
+  <script type="module">
+    import init, { NexradeWasm } from './pkg/nexrade_wasm.js';
+
+    let store;
+
+    async function setup() {
+      await init();
+      store = new NexradeWasm();
+      document.getElementById('output').textContent = 'Ready. Try a command above.';
+      window.store = store;
+    }
+
+    window.runCmd = async function () {
+      const raw = document.getElementById('cmd').value.trim();
+      if (!raw || !store) return;
+      const result = await store.execute(raw);
+      document.getElementById('output').textContent = `> ${raw}\n${result}`;
+    };
+
+    window.runDemo = async function () {
+      const cmds = [
+        'SET greeting "Hello, WASM!"',
+        'GET greeting',
+        'INCR visitors',
+        'INCR visitors',
+        'INCR visitors',
+        'GET visitors',
+        'RPUSH queue job:1 job:2 job:3',
+        'LRANGE queue 0 -1',
+        'ZADD scores 100 alice 200 bob 150 carol',
+        'ZREVRANGE scores 0 -1 WITHSCORES',
+        'HSET user:1 name Alice age 30',
+        'HGETALL user:1',
+        'DBSIZE',
+      ];
+
+      let out = '';
+      for (const cmd of cmds) {
+        const result = await store.execute(cmd);
+        out += `> ${cmd}\n${result}\n\n`;
+      }
+      document.getElementById('output').textContent = out.trim();
+    };
+
+    setup();
+  </script>
+</body>
+</html>

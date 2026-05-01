@@ -1,0 +1,30 @@
+[package]
+name = "nexrade-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Async TCP server for nexrade-cache — Redis-compatible protocol"
+
+[features]
+default = ["tls"]
+tls = ["nexrade-tls"]
+
+[dependencies]
+nexrade-core = { path = "../nexrade-core" }
+nexrade-lua = { path = "../nexrade-lua" }
+nexrade-metrics = { path = "../nexrade-metrics" }
+nexrade-tls = { path = "../nexrade-tls", optional = true }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+bincode = { workspace = true }

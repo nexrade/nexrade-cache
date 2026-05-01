@@ -1,0 +1,97 @@
+# nexrade-cache configuration file
+# All settings have sensible defaults — only override what you need.
+
+# Network
+bind = "127.0.0.1"
+port = 6379
+
+# Databases (0-15, like Redis)
+databases = 16
+
+# Maximum connected clients
+max_clients = 10000
+
+# Require authentication
+# requirepass = "your-secret-password"
+
+# Logging: trace | debug | info | warn | error
+loglevel = "info"
+
+# Active key expiry cycle frequency (Hz)
+hz = 10
+
+# ─── Persistence ────────────────────────────────────────────────────────────────
+
+[persistence]
+# RDB snapshot path (set to "" to disable)
+rdb_path = "nexrade.rdb"
+
+# AOF log path (set to "" to disable)
+# aof_path = "nexrade.aof"
+
+# AOF sync policy: always | everysec | no
+aof_sync = "everysec"
+
+# Auto-save rules: [[seconds, min_changes], ...]
+# Save after 900s if at least 1 key changed
+# Save after 300s if at least 10 keys changed
+# Save after 60s if at least 10000 keys changed
+save_rules = [
+    [900, 1],
+    [300, 10],
+    [60, 10000],
+]
+
+# ─── TLS ────────────────────────────────────────────────────────────────────────
+
+[tls]
+enabled = false
+port = 6380
+# cert = "cert.pem"
+# key  = "key.pem"
+#
+# To generate a self-signed cert:
+#   openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
+
+# ─── Metrics / Observability ────────────────────────────────────────────────────
+
+[metrics]
+enabled = true
+# Prometheus metrics endpoint: http://host:port/metrics
+port = 9091
+
+# Set NEXRADE_LOG_JSON=1 for structured JSON logging (for Loki/Datadog/etc.)
+
+# ─── Lua scripting ──────────────────────────────────────────────────────────────
+
+[lua]
+# Maximum script execution time in milliseconds
+time_limit_ms = 5000
+
+# ─── Slow log ───────────────────────────────────────────────────────────────────
+
+[slowlog]
+# Log commands slower than this many microseconds (-1 to disable)
+log_slower_than = 10000
+# Maximum slow log entries to keep
+max_len = 128
+
+# ─── Memory ─────────────────────────────────────────────────────────────────────
+
+# Maximum memory usage (bytes). 0 = unlimited.
+# max_memory = 0
+
+# ─── Replication ────────────────────────────────────────────────────────────────
+
+# Replication is configured at runtime via the REPLICAOF command:
+#
+#   redis-cli REPLICAOF 127.0.0.1 6379   # become a replica of the given primary
+#   redis-cli REPLICAOF NO ONE           # promote back to primary
+
+# ─── Advanced ───────────────────────────────────────────────────────────────────
+
+# TCP backlog
+tcp_backlog = 511
+
+# Client idle timeout (seconds, 0 = disabled)
+timeout = 0

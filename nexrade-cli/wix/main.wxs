@@ -1,0 +1,204 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
+    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?else ?>
+    <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+<?endif ?>
+
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+    <Product
+        Id='*'
+        Name='nexrade-cache'
+        UpgradeCode='1A129356-5E6D-4B77-BCF9-63A8E46BBDD0'
+        Manufacturer='Nexrade'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package Id='*'
+            Keywords='Installer'
+            Description='nexrade-cache — Redis-compatible cache server written in Rust'
+            Manufacturer='Nexrade'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perMachine'
+            SummaryCodepage='1252'/>
+
+        <!-- Silently replace older versions -->
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+        <Property Id='DiskPrompt' Value='nexrade-cache Installation'/>
+
+        <!-- ── Directory layout ───────────────────────────────────────── -->
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='$(var.PlatformProgramFilesFolder)'>
+                <Directory Id='APPLICATIONFOLDER' Name='nexrade-cache'>
+
+                    <Directory Id='Bin' Name='bin'>
+
+                        <!-- Add bin\ to system PATH -->
+                        <Component Id='Path' Guid='2F5A15BC-C974-4DCB-A635-926830EA9247' KeyPath='yes'>
+                            <Environment
+                                Id='PATH'
+                                Name='PATH'
+                                Value='[Bin]'
+                                Permanent='no'
+                                Part='last'
+                                Action='set'
+                                System='yes'/>
+                        </Component>
+
+                        <!-- Main server binary -->
+                        <Component Id='binary0' Guid='*'>
+                            <File Id='exe0'
+                                Name='nexrade-cache.exe'
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\nexrade-cache.exe'
+                                KeyPath='yes'/>
+                        </Component>
+
+                        <!-- CLI client binary -->
+                        <Component Id='binary1' Guid='*'>
+                            <File Id='exe1'
+                                Name='nexrade-cli.exe'
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\nexrade-cli.exe'
+                                KeyPath='yes'/>
+                        </Component>
+
+                    </Directory>
+
+                    <!-- Example config file in the root install dir -->
+                    <Component Id='ConfigExample' Guid='*'>
+                        <File Id='ConfigExampleFile'
+                            Name='nexrade.example.toml'
+                            DiskId='1'
+                            Source='..\nexrade.example.toml'
+                            KeyPath='yes'/>
+                    </Component>
+
+                </Directory>
+            </Directory>
+
+            <!-- Start Menu shortcuts -->
+            <Directory Id='ProgramMenuFolder'>
+                <Directory Id='ApplicationProgramsFolder' Name='nexrade-cache'>
+                    <Component Id='ApplicationShortcuts' Guid='*'>
+
+                        <Shortcut Id='StartMenuServer'
+                            Name='nexrade-cache Server'
+                            Description='Start nexrade-cache Redis-compatible cache server'
+                            Target='[Bin]nexrade-cache.exe'
+                            WorkingDirectory='APPLICATIONFOLDER'
+                            Icon='ProductICO'/>
+
+                        <Shortcut Id='StartMenuCli'
+                            Name='nexrade-cli'
+                            Description='nexrade-cache command-line client'
+                            Target='[Bin]nexrade-cli.exe'
+                            WorkingDirectory='APPLICATIONFOLDER'
+                            Icon='ProductICO'/>
+
+                        <Shortcut Id='UninstallShortcut'
+                            Name='Uninstall nexrade-cache'
+                            Target='[System64Folder]msiexec.exe'
+                            Arguments='/x [ProductCode]'/>
+
+                        <RemoveFolder Id='ApplicationProgramsFolder' On='uninstall'/>
+                        <RegistryValue
+                            Root='HKCU'
+                            Key='Software\Nexrade\nexrade-cache'
+                            Name='installed'
+                            Type='integer'
+                            Value='1'
+                            KeyPath='yes'/>
+                    </Component>
+                </Directory>
+            </Directory>
+
+            <!-- Desktop shortcut (optional feature) -->
+            <Directory Id='DesktopFolder' Name='Desktop'>
+                <Component Id='DesktopShortcut' Guid='*'>
+                    <Shortcut Id='DesktopServer'
+                        Name='nexrade-cache'
+                        Description='Start nexrade-cache Redis-compatible cache server'
+                        Target='[Bin]nexrade-cache.exe'
+                        WorkingDirectory='APPLICATIONFOLDER'
+                        Icon='ProductICO'/>
+                    <RemoveFolder Id='DesktopFolder' On='uninstall'/>
+                    <RegistryValue
+                        Root='HKCU'
+                        Key='Software\Nexrade\nexrade-cache'
+                        Name='desktop'
+                        Type='integer'
+                        Value='1'
+                        KeyPath='yes'/>
+                </Component>
+            </Directory>
+
+        </Directory>
+
+        <!-- ── Features ──────────────────────────────────────────────── -->
+        <Feature
+            Id='Binaries'
+            Title='nexrade-cache (required)'
+            Description='Installs the nexrade-cache server and nexrade-cli client.'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            Display='expand'
+            Absent='disallow'>
+
+            <ComponentRef Id='binary0'/>
+            <ComponentRef Id='binary1'/>
+            <ComponentRef Id='ConfigExample'/>
+            <ComponentRef Id='ApplicationShortcuts'/>
+
+            <Feature
+                Id='Environment'
+                Title='Add to PATH'
+                Description='Add the install location to the PATH environment variable so nexrade-cache and nexrade-cli can be run from any terminal.'
+                Level='1'
+                Absent='allow'>
+                <ComponentRef Id='Path'/>
+            </Feature>
+
+            <Feature
+                Id='Desktop'
+                Title='Desktop Shortcut'
+                Description='Add a nexrade-cache shortcut to the Desktop.'
+                Level='1'
+                Absent='allow'>
+                <ComponentRef Id='DesktopShortcut'/>
+            </Feature>
+        </Feature>
+
+        <!-- ── Product icon ──────────────────────────────────────────── -->
+        <Icon Id='ProductICO' SourceFile='wix\nexrade-cache.ico'/>
+        <Property Id='ARPPRODUCTICON' Value='ProductICO'/>
+
+        <!-- ── Add/Remove Programs metadata ─────────────────────────── -->
+        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/nexrade/nexrade-cache'/>
+        <Property Id='ARPURLINFOABOUT' Value='https://github.com/nexrade/nexrade-cache'/>
+        <Property Id='ARPCONTACT' Value='https://github.com/nexrade/nexrade-cache/issues'/>
+
+        <!-- ── Installer UI ──────────────────────────────────────────── -->
+        <UI>
+            <UIRef Id='WixUI_FeatureTree'/>
+            <!-- Skip the EULA dialog (go straight to feature selection) -->
+            <Publish Dialog='WelcomeDlg'  Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
+            <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg'  Order='99'>1</Publish>
+        </UI>
+
+        <!-- ── Custom banner image (493×58 px) ──────────────────────── -->
+        <WixVariable Id='WixUIBannerBmp' Value='wix\Banner.bmp'/>
+
+    </Product>
+
+</Wix>
