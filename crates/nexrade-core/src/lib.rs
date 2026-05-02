@@ -4,6 +4,7 @@ pub mod error;
 pub mod expiry;
 pub mod persistence;
 pub mod pubsub;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod replication;
 pub mod resp;
 pub mod slowlog;

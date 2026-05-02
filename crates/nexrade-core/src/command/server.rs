@@ -6,7 +6,9 @@ use crate::command::{get_bytes_vec, get_str};
 use crate::db::unix_secs;
 use crate::db::Db;
 use crate::error::{NexradeError, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::persistence::Snapshot;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::replication::ReplicationRole;
 use crate::resp::Resp;
 use crate::store::glob_match;
@@ -156,6 +158,7 @@ pub async fn cmd_info(db: &Db, args: &[Resp]) -> Result<Resp> {
         info.push_str("\r\n");
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     if section == "all" || section == "replication" {
         info.push_str("# Replication\r\n");
         let repl = &db.replication;
@@ -209,6 +212,10 @@ pub async fn cmd_info(db: &Db, args: &[Resp]) -> Result<Resp> {
         }
         info.push_str("\r\n");
     }
+    #[cfg(target_arch = "wasm32")]
+    if section == "all" || section == "replication" {
+        info.push_str("# Replication\r\nrole:master\r\nconnected_slaves:0\r\n\r\n");
+    }
 
     Ok(Resp::bulk_str(info))
 }
@@ -224,10 +231,11 @@ pub async fn cmd_config(db: &Db, args: &[Resp]) -> Result<Resp> {
             let cfg = db.config.lock();
             let requirepass_str = cfg.requirepass.as_deref().unwrap_or("").to_string();
             let maxmemory_str = cfg.max_memory.map_or("0".to_string(), |m| m.to_string());
-            let appendonly_str = if cfg.persistence.aof_path.is_some() {
-                "yes"
-            } else {
-                "no"
+            let appendonly_str = {
+                #[cfg(not(target_arch = "wasm32"))]
+                { if cfg.persistence.aof_path.is_some() { "yes" } else { "no" } }
+                #[cfg(target_arch = "wasm32")]
+                { "no" }
             };
             let save_str = cfg
                 .save_rules
@@ -391,6 +399,7 @@ pub async fn cmd_command(_args: &[Resp]) -> Result<Resp> {
     Ok(Resp::int(200))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn cmd_save(db: &Db) -> Result<Resp> {
     let rdb_path = db.config.lock().persistence.rdb_path.clone();
     if let Some(path) = rdb_path {
@@ -407,6 +416,12 @@ pub async fn cmd_save(db: &Db) -> Result<Resp> {
     Ok(Resp::ok())
 }
 
+#[cfg(target_arch = "wasm32")]
+pub async fn cmd_save(_db: &Db) -> Result<Resp> {
+    Ok(Resp::error("ERR persistence not available in WASM mode"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn cmd_bgsave(db: &Db) -> Result<Resp> {
     use std::sync::atomic::Ordering::AcqRel;
     if db.stats.bgsave_in_progress.swap(true, AcqRel) {
@@ -437,6 +452,12 @@ pub async fn cmd_bgsave(db: &Db) -> Result<Resp> {
     Ok(Resp::SimpleString("Background saving started".to_string()))
 }
 
+#[cfg(target_arch = "wasm32")]
+pub async fn cmd_bgsave(_db: &Db) -> Result<Resp> {
+    Ok(Resp::error("ERR persistence not available in WASM mode"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn cmd_bgrewriteaof(db: &Db) -> Result<Resp> {
     let aof_path = db.config.lock().persistence.aof_path.clone();
     let Some(path) = aof_path else {
@@ -466,6 +487,11 @@ pub async fn cmd_bgrewriteaof(db: &Db) -> Result<Resp> {
     Ok(Resp::SimpleString(
         "Background append only file rewriting started".to_string(),
     ))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn cmd_bgrewriteaof(_db: &Db) -> Result<Resp> {
+    Ok(Resp::error("ERR persistence not available in WASM mode"))
 }
 
 pub async fn cmd_lastsave(db: &Db) -> Result<Resp> {
@@ -600,6 +626,7 @@ pub async fn cmd_reset() -> Result<Resp> {
 
 // ── Replication commands ──────────────────────────────────────────────────────
 
+#[cfg(not(target_arch = "wasm32"))]
 /// REPLICAOF NO ONE | REPLICAOF <host> <port>
 pub async fn cmd_replicaof(db: &Db, args: &[Resp]) -> Result<Resp> {
     if args.len() < 2 {
@@ -632,6 +659,7 @@ pub async fn cmd_replicaof(db: &Db, args: &[Resp]) -> Result<Resp> {
     Ok(Resp::ok())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// REPLCONF <subcommand> [<arg> ...]
 pub async fn cmd_replconf(
     db: &Db,
@@ -665,6 +693,7 @@ pub async fn cmd_replconf(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// PSYNC <replid> <offset>
 ///
 /// Returns `Ok(Resp::SimpleString("PSYNC_FULLRESYNC"))` as a sentinel so the

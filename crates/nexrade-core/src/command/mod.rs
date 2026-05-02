@@ -13,6 +13,7 @@ use std::sync::atomic::Ordering;
 
 use crate::db::Db;
 use crate::error::{NexradeError, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::persistence::AofSync;
 use crate::resp::Resp;
 
@@ -111,9 +112,8 @@ pub async fn dispatch_with_addr(
     let cmd = parse_cmd_name(&args).unwrap_or_default();
     let is_write = is_write_command(&cmd);
 
-    // Serialize AOF bytes before args are consumed (only when AOF is enabled).
+    #[cfg(not(target_arch = "wasm32"))]
     let aof_bytes: Option<Vec<u8>> = if is_write && db.stats.aof_enabled.load(Ordering::Relaxed) {
-        // Prepend SELECT so replay uses the right database.
         let select_cmd = Resp::Array(Some(vec![
             Resp::bulk_str("SELECT"),
             Resp::bulk_str(db_index.to_string()),
@@ -146,8 +146,8 @@ pub async fn dispatch_with_addr(
     if is_write && !matches!(result, Resp::Error(_)) {
         db.stats.dirty_keys.fetch_add(1, Ordering::Relaxed);
 
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(bytes) = aof_bytes {
-            // Read aof_sync config BEFORE acquiring the aof_writer lock.
             let aof_sync = db.config.lock().persistence.aof_sync.clone();
             let mut writer_guard = db.aof_writer.lock();
             if let Some(ref mut w) = *writer_guard {
@@ -336,8 +336,11 @@ async fn dispatch_inner(
         "PUBSUB" => server::cmd_pubsub(db, &args).await,
 
         // --- Replication commands ---
+        #[cfg(not(target_arch = "wasm32"))]
         "REPLICAOF" | "SLAVEOF" => server::cmd_replicaof(db, &args).await,
+        #[cfg(not(target_arch = "wasm32"))]
         "REPLCONF" => server::cmd_replconf(db, &args, peer_addr).await,
+        #[cfg(not(target_arch = "wasm32"))]
         "PSYNC" => server::cmd_psync(db, &args).await,
 
         // --- Stream commands ---

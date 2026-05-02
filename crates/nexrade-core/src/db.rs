@@ -2,13 +2,18 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+use std::time::SystemTime;
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
-use crate::persistence::{AofWriter, PersistenceConfig};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::persistence::AofWriter;
+use crate::persistence::PersistenceConfig;
 use crate::pubsub::PubSub;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::replication::ReplicationState;
 use crate::slowlog::SlowLog;
 use crate::store::Store;
@@ -27,10 +32,12 @@ pub struct Db {
     /// Monotonically increasing client ID counter.
     pub next_client_id: Arc<AtomicU64>,
     /// AOF writer — shared across all connections (None if AOF is disabled).
+    #[cfg(not(target_arch = "wasm32"))]
     pub aof_writer: Arc<Mutex<Option<AofWriter>>>,
     /// Slow query log — shared across all connections.
     pub slowlog: Arc<SlowLog>,
     /// Replication state — shared across all connections.
+    #[cfg(not(target_arch = "wasm32"))]
     pub replication: Arc<ReplicationState>,
     /// Signalled by SHUTDOWN command to trigger graceful server exit.
     pub shutdown: Arc<Notify>,
@@ -43,15 +50,17 @@ impl Db {
             config.slowlog_log_slower_than.max(0) as u64,
             config.slowlog_max_len,
         ));
-        // Determine initial replication role from config.
-        let replica_of = config.replica_of.clone();
-        let replication_id = ReplicationState::generate_replication_id();
-        let replication = ReplicationState::new_primary(replication_id);
-        // If configured as a replica, update state immediately.
-        if let Some(ref ro) = replica_of {
-            *replication.role.write() = crate::replication::ReplicationRole::Replica;
-            *replication.replica_of.write() = Some(ro.clone());
-        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let replication = {
+            let replica_of = config.replica_of.clone();
+            let replication_id = ReplicationState::generate_replication_id();
+            let repl = ReplicationState::new_primary(replication_id);
+            if let Some(ref ro) = replica_of {
+                *repl.role.write() = crate::replication::ReplicationRole::Replica;
+                *repl.replica_of.write() = Some(ro.clone());
+            }
+            repl
+        };
         Self {
             store: Store::new(db_count),
             pubsub: PubSub::new(),
@@ -60,8 +69,10 @@ impl Db {
             list_notify: Arc::new(Notify::new()),
             move_notify: Arc::new(Notify::new()),
             next_client_id: Arc::new(AtomicU64::new(1)),
+            #[cfg(not(target_arch = "wasm32"))]
             aof_writer: Arc::new(Mutex::new(None)),
             slowlog,
+            #[cfg(not(target_arch = "wasm32"))]
             replication,
             shutdown: Arc::new(Notify::new()),
         }
@@ -88,6 +99,7 @@ pub struct Stats {
     pub total_writes: AtomicU64,
     pub keyspace_hits: AtomicU64,
     pub keyspace_misses: AtomicU64,
+    #[cfg(not(target_arch = "wasm32"))]
     pub start_time: std::sync::OnceLock<Instant>,
     /// Number of write operations since last RDB save (like Redis's dirty counter).
     pub dirty_keys: AtomicU64,
@@ -105,18 +117,32 @@ pub struct Stats {
 
 /// Returns the current Unix timestamp in whole seconds.
 pub fn unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        0
+    }
 }
 
 impl Stats {
     pub fn uptime_secs(&self) -> u64 {
-        self.start_time
-            .get()
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.start_time
+                .get()
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            0
+        }
     }
 
     pub fn record_command(&self) {

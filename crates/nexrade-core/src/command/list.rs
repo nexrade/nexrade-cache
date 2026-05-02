@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use bytes::Bytes;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::time::timeout;
 
 use crate::command::{get_bytes, get_bytes_vec, get_f64, get_i64, get_str};
@@ -389,14 +390,31 @@ pub async fn cmd_rpoplpush(db: &Db, args: &[Resp], db_index: usize) -> Result<Re
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn cmd_blpop(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     blocking_pop(db, args, db_index, true, "BLPOP").await
 }
 
+#[cfg(target_arch = "wasm32")]
+pub async fn cmd_blpop(_db: &Db, _args: &[Resp], _db_index: usize) -> Result<Resp> {
+    Err(NexradeError::Generic(
+        "ERR blocking commands not supported in WASM mode".to_string(),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn cmd_brpop(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     blocking_pop(db, args, db_index, false, "BRPOP").await
 }
 
+#[cfg(target_arch = "wasm32")]
+pub async fn cmd_brpop(_db: &Db, _args: &[Resp], _db_index: usize) -> Result<Resp> {
+    Err(NexradeError::Generic(
+        "ERR blocking commands not supported in WASM mode".to_string(),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 async fn blocking_pop(
     db: &Db,
     args: &[Resp],

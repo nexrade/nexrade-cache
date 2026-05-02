@@ -2,6 +2,7 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::fmt;
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::IoSlice;
 
 use crate::error::{NexradeError, Result};
@@ -394,6 +395,7 @@ impl Buf for SegBuf {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn chunks_vectored<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
         let mut n = 0;
         for (i, seg) in self.segments[self.read_pos..].iter().enumerate() {

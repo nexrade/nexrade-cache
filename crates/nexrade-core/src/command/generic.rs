@@ -44,7 +44,10 @@ pub async fn cmd_unlink(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
     // Drop the values on a background thread so large allocations don't
     // block the async executor.
     if !evicted.is_empty() {
+        #[cfg(not(target_arch = "wasm32"))]
         tokio::task::spawn_blocking(move || drop(evicted));
+        #[cfg(target_arch = "wasm32")]
+        drop(evicted);
     }
     Ok(Resp::int(count))
 }

@@ -308,8 +308,15 @@ fn normalize_index(idx: isize, len: isize) -> usize {
 
 /// Current millisecond timestamp.
 pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        0
+    }
 }

@@ -445,9 +445,18 @@ fn pseudo_rand_idx(len: usize) -> usize {
     if len == 0 {
         return 0;
     }
-    (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as usize)
-        % len
+    {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as usize)
+                % len
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            0
+        }
+    }
 }

@@ -55,5 +55,8 @@ skip-tree = []
 # Only allow crates from crates.io and our own workspace.
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-registry = [
+    "https://github.com/rust-lang/crates.io-index",
+    "sparse+https://index.crates.io/",
+]
 allow-git = []

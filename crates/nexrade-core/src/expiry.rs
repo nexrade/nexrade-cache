@@ -1,8 +1,23 @@
 //! TTL and expiry management.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+
+#[cfg(not(target_arch = "wasm32"))]
+fn system_now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn system_now_ms() -> u128 {
+    0
+}
 
 /// Expiry information for a key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,11 +29,8 @@ pub struct Expiry {
 impl Expiry {
     /// Create expiry from duration relative to now.
     pub fn from_duration(ttl: Duration) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
         Self {
-            expires_at_ms: (now + ttl).as_millis(),
+            expires_at_ms: system_now_ms() + ttl.as_millis(),
         }
     }
 
@@ -38,19 +50,12 @@ impl Expiry {
 
     /// Is this key currently expired?
     pub fn is_expired(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        now >= self.expires_at_ms
+        system_now_ms() >= self.expires_at_ms
     }
 
     /// Remaining TTL in milliseconds, or 0 if already expired.
     pub fn remaining_ms(&self) -> u64 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+        let now = system_now_ms();
         if now >= self.expires_at_ms {
             0
         } else {
@@ -64,12 +69,14 @@ impl Expiry {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Instant-based expiry for in-memory tracking (not serialized).
 #[derive(Debug, Clone, Copy)]
 pub struct InstantExpiry {
     pub deadline: Instant,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl InstantExpiry {
     pub fn new(ttl: Duration) -> Self {
         Self {

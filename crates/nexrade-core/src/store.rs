@@ -22,10 +22,17 @@ pub struct Entry {
 }
 
 fn lru_now() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as u32
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        0
+    }
 }
 
 impl Entry {
@@ -151,10 +158,19 @@ impl Database {
     /// Uses the sorted expiry index to find the earliest-expiring keys first,
     /// so old expired keys are never missed regardless of database size.
     pub fn expire_batch(&mut self, max: usize) -> usize {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+        let now_ms = {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                0u128
+            }
+        };
 
         // Collect expired entries from the front of the sorted index.
         let to_delete: Vec<(u128, Vec<u8>)> = self

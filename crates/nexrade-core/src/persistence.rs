@@ -1,18 +1,28 @@
 //! Persistence: RDB snapshots and Append-Only File (AOF).
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::{File, OpenOptions};
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::{BufReader, BufWriter, Read, Write};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
+#[cfg(not(target_arch = "wasm32"))]
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_arch = "wasm32"))]
 use tracing::{error, info};
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::error::Result;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::resp::Resp;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::store::Database;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::types::DataType;
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Serializable snapshot of all databases.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -21,6 +31,7 @@ pub struct Snapshot {
     pub databases: Vec<(usize, Database)>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Snapshot {
     pub const VERSION: u32 = 2;
 
@@ -66,11 +77,13 @@ impl Snapshot {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// AOF writer — appends raw RESP commands to a file.
 pub struct AofWriter {
     writer: BufWriter<File>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl AofWriter {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = OpenOptions::new()
@@ -102,6 +115,7 @@ impl AofWriter {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl AofWriter {
     /// Rewrite the AOF by serializing the current database state as RESP
     /// commands into a temp file, then atomically replacing the existing AOF.
@@ -204,12 +218,14 @@ impl AofWriter {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// AOF reader — replays commands from the file.
 pub struct AofReader {
     data: Vec<u8>,
     pos: usize,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl AofReader {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path.as_ref())?;

@@ -352,11 +352,7 @@ pub async fn cmd_hrandfield(db: &Db, args: &[Resp], db_index: usize) -> Result<R
                 let fields: Vec<_> = h.keys().cloned().collect();
                 match count {
                     None => {
-                        let idx = (std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .subsec_nanos() as usize)
-                            % fields.len().max(1);
+                        let idx = pseudo_rand_idx(fields.len());
                         Ok(fields
                             .get(idx)
                             .map(|k| Resp::bulk(Bytes::from(k.clone())))
@@ -368,12 +364,7 @@ pub async fn cmd_hrandfield(db: &Db, args: &[Resp], db_index: usize) -> Result<R
                             let count = n.unsigned_abs() as usize;
                             (0..count)
                                 .map(|_| {
-                                    let idx = (std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .subsec_nanos()
-                                        as usize)
-                                        % fields.len().max(1);
+                                    let idx = pseudo_rand_idx(fields.len());
                                     fields
                                         .get(idx)
                                         .map(|k| Resp::bulk(Bytes::from(k.clone())))
@@ -394,5 +385,25 @@ pub async fn cmd_hrandfield(db: &Db, args: &[Resp], db_index: usize) -> Result<R
             }
             _ => Err(NexradeError::WrongType),
         },
+    }
+}
+
+fn pseudo_rand_idx(len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as usize)
+                % len
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            0
+        }
     }
 }
