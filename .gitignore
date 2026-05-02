@@ -1,3 +1,45 @@
+# Build
 /target
+**/target
+
+# IDE / editor
 /.vscode
 /.kilocode
+/.idea
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Persistence artifacts
+*.rdb
+*.aof
+dump.rdb
+
+# Logs
+*.log
+
+# WASM build output
+crates/nexrade-wasm/pkg/
+**/pkg/
+
+# Fuzz corpus & artifacts
+fuzz/artifacts/
+fuzz/corpus/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+lcov.info
+*.profraw
+*.profdata
+
+# Benchmarks
+*-bench.csv
+bench-comparison.md
