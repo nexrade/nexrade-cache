@@ -233,9 +233,17 @@ pub async fn cmd_config(db: &Db, args: &[Resp]) -> Result<Resp> {
             let maxmemory_str = cfg.max_memory.map_or("0".to_string(), |m| m.to_string());
             let appendonly_str = {
                 #[cfg(not(target_arch = "wasm32"))]
-                { if cfg.persistence.aof_path.is_some() { "yes" } else { "no" } }
+                {
+                    if cfg.persistence.aof_path.is_some() {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                }
                 #[cfg(target_arch = "wasm32")]
-                { "no" }
+                {
+                    "no"
+                }
             };
             let save_str = cfg
                 .save_rules

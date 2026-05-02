@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 description = "WebAssembly bindings for nexrade-cache — run in browser or edge functions"
 
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
