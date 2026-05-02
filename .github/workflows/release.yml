@@ -235,7 +235,7 @@ jobs:
 
       - name: Build .rpm
         run: |
-          cargo generate-rpm --package nexrade-cache \
+          cargo generate-rpm --package nexrade-cli \
             --target ${{ matrix.target }} \
             --output nexrade-cache-${{ github.ref_name }}-1.${{ matrix.arch }}.rpm
           sha256sum nexrade-cache-${{ github.ref_name }}-1.${{ matrix.arch }}.rpm \
