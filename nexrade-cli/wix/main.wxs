@@ -78,7 +78,7 @@
                         <File Id='ConfigExampleFile'
                             Name='nexrade.example.toml'
                             DiskId='1'
-                            Source='..\nexrade.example.toml'
+                            Source='nexrade.example.toml'
                             KeyPath='yes'/>
                     </Component>
 
@@ -179,7 +179,7 @@
         </Feature>
 
         <!-- ── Product icon ──────────────────────────────────────────── -->
-        <Icon Id='ProductICO' SourceFile='wix\nexrade-cache.ico'/>
+        <Icon Id='ProductICO' SourceFile='nexrade-cli\wix\nexrade-cache.ico'/>
         <Property Id='ARPPRODUCTICON' Value='ProductICO'/>
 
         <!-- ── Add/Remove Programs metadata ─────────────────────────── -->
@@ -197,7 +197,7 @@
         </UI>
 
         <!-- ── Custom banner image (493×58 px) ──────────────────────── -->
-        <WixVariable Id='WixUIBannerBmp' Value='wix\Banner.bmp'/>
+        <WixVariable Id='WixUIBannerBmp' Value='nexrade-cli\wix\Banner.bmp'/>
 
     </Product>
 

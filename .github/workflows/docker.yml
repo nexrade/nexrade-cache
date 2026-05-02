@@ -57,6 +57,15 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
+      - name: Determine push flag
+        id: push
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]] || [[ "${{ github.event.inputs.push }}" == "true" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v7
@@ -65,27 +74,19 @@ jobs:
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Scope cache per platform so amd64 and arm64 layers don't collide.
           cache-from: type=gha,scope=docker-${{ matrix.slug }}
-          cache-to: type=gha,mode=max,scope=docker-${{ matrix.slug }}
-          # Push individual platform image by digest; the merge job assembles
-          # the multi-arch manifest. Skip push when just building for testing.
-          outputs: >-
-            type=image,
-            name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},
-            push-by-digest=true,
-            name-canonical=true,
-            push=${{ github.event_name == 'push' || github.event.inputs.push == 'true' }}
+          cache-to: ${{ steps.push.outputs.enabled == 'true' && format('type=gha,mode=max,scope=docker-{0}', matrix.slug) || '' }}
+          outputs: ${{ steps.push.outputs.enabled == 'true' && format('type=image,name={0}/{1},push-by-digest=true,name-canonical=true,push=true', env.REGISTRY, env.IMAGE_NAME) || 'type=docker' }}
 
       - name: Export digest
-        if: github.event_name == 'push' || github.event.inputs.push == 'true'
+        if: steps.push.outputs.enabled == 'true'
         run: |
           mkdir -p /tmp/digests
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        if: github.event_name == 'push' || github.event.inputs.push == 'true'
+        if: steps.push.outputs.enabled == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: digests-${{ matrix.slug }}

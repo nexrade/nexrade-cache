@@ -28,8 +28,8 @@ priority = "optional"
 assets = [
     ["target/release/nexrade-cache", "usr/bin/nexrade-cache", "755"],
     ["target/release/nexrade-cli",   "usr/bin/nexrade-cli",   "755"],
-    ["nexrade.example.toml",         "etc/nexrade-cache/nexrade.toml", "644"],
-    ["README.md",                    "usr/share/doc/nexrade-cache/README.md", "644"],
+    ["../nexrade.example.toml",      "etc/nexrade-cache/nexrade.toml", "644"],
+    ["../README.md",                 "usr/share/doc/nexrade-cache/README.md", "644"],
     ["../LICENSE-MIT",               "usr/share/doc/nexrade-cache/LICENSE-MIT", "644"],
     ["../LICENSE-APACHE",            "usr/share/doc/nexrade-cache/LICENSE-APACHE", "644"],
 ]
@@ -42,8 +42,8 @@ group = "System Environment/Daemons"
 assets = [
     { source = "target/release/nexrade-cache", dest = "/usr/bin/nexrade-cache",                        mode = "0755" },
     { source = "target/release/nexrade-cli",   dest = "/usr/bin/nexrade-cli",                          mode = "0755" },
-    { source = "nexrade.example.toml",         dest = "/etc/nexrade-cache/nexrade.toml",               mode = "0644", config = true },
-    { source = "README.md",                    dest = "/usr/share/doc/nexrade-cache/README.md",         mode = "0644" },
+    { source = "../nexrade.example.toml",       dest = "/etc/nexrade-cache/nexrade.toml",               mode = "0644", config = true },
+    { source = "../README.md",                 dest = "/usr/share/doc/nexrade-cache/README.md",         mode = "0644" },
     { source = "../LICENSE-MIT",               dest = "/usr/share/doc/nexrade-cache/LICENSE-MIT",       mode = "0644" },
     { source = "../LICENSE-APACHE",            dest = "/usr/share/doc/nexrade-cache/LICENSE-APACHE",    mode = "0644" },
 ]
