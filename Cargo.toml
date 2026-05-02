@@ -57,7 +57,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 
 # Config
-config = "0.14"
+config = "0.15"
 
 # UUID / ID gen
 # `js` enables getrandom's JS backend on wasm32-unknown-unknown; ignored on other targets
