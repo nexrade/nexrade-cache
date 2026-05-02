@@ -3,9 +3,11 @@
 <head>
   <meta charset="UTF-8" />
   <title>nexrade-cache WASM demo</title>
+  <link rel="icon" type="image/svg+xml" href="../../assets/logo.svg" />
   <style>
     body { font-family: monospace; max-width: 700px; margin: 2rem auto; background: #1e1e2e; color: #cdd6f4; }
-    h1 { color: #89b4fa; }
+    h1 { color: #89b4fa; display: flex; align-items: center; gap: .6rem; }
+    h1 img { height: 1.4em; }
     pre { background: #181825; padding: 1rem; border-radius: 6px; overflow-x: auto; }
     input { background: #313244; border: 1px solid #45475a; color: #cdd6f4; padding: .4rem .6rem; width: 60%; border-radius: 4px; }
     button { background: #89b4fa; color: #1e1e2e; border: none; padding: .4rem .8rem; border-radius: 4px; cursor: pointer; font-weight: bold; }
@@ -13,7 +15,7 @@
   </style>
 </head>
 <body>
-  <h1>nexrade-cache — WASM Demo</h1>
+  <h1><img src="../../assets/logo.svg" alt="" />nexrade-cache — WASM Demo</h1>
   <p>In-process Redis-compatible store running in your browser tab.</p>
 
   <div>

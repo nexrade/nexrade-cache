@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 80" role="img" aria-label="nexrade-cache">
+  <defs>
+    <linearGradient id="layerTop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#F97316"/>
+      <stop offset="100%" stop-color="#EA580C"/>
+    </linearGradient>
+    <linearGradient id="layerMid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FB923C"/>
+      <stop offset="100%" stop-color="#F97316"/>
+    </linearGradient>
+    <linearGradient id="layerBot" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FDBA74"/>
+      <stop offset="100%" stop-color="#FB923C"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Mark: stacked shards with iso "Z", vertically centered.
+       Local mark bounds: y ∈ [-6, 38] → local center y=16.
+       Translate y to 24 so local y=16 lands at canvas y=40 (viewBox height 80 / 2). -->
+  <g transform="translate(40 24)">
+    <path d="M0 14 L24 26 L0 38 L-24 26 Z" fill="url(#layerBot)"/>
+    <path d="M0 4 L24 16 L0 28 L-24 16 Z" fill="url(#layerMid)"/>
+    <path d="M0 -6 L24 6 L0 18 L-24 6 Z" fill="url(#layerTop)"/>
+    <!-- isometric Z: top stroke ∥ R-T edge, horizontal connector, bottom stroke ∥ R-T edge -->
+    <g stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" fill="none">
+      <line x1="0" y1="-2" x2="16" y2="6"/>
+      <line x1="16" y1="6" x2="-16" y2="6"/>
+      <line x1="-16" y1="6" x2="0" y2="14"/>
+    </g>
+  </g>
+
+  <!-- Wordmark, vertically centered around y=40 -->
+  <text x="80" y="38" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Inter, sans-serif"
+        font-size="28" font-weight="700" fill="#0B1220" letter-spacing="-0.5">nexrade</text>
+  <text x="80" y="58" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Inter, sans-serif"
+        font-size="14" font-weight="500" fill="#94A3B8" letter-spacing="3">CACHE</text>
+</svg>

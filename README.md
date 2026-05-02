@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="nexrade-cache" width="320" />
+</p>
+
 # nexrade-cache
 
 **A Redis-compatible cache server built in Rust** — drop-in replacement for Redis with built-in TLS, Prometheus metrics, Lua scripting, a plugin API, and a WebAssembly target. No OpenSSL. No runtime dependencies. Single static binary.

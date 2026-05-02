@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="nexrade-cache">
+  <defs>
+    <linearGradient id="layerTop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#F97316"/>
+      <stop offset="100%" stop-color="#EA580C"/>
+    </linearGradient>
+    <linearGradient id="layerMid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FB923C"/>
+      <stop offset="100%" stop-color="#F97316"/>
+    </linearGradient>
+    <linearGradient id="layerBot" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FDBA74"/>
+      <stop offset="100%" stop-color="#FB923C"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Icon-only mark, centered in 64×64 viewBox.
+       Local mark bounds: x ∈ [-24, 24], y ∈ [-6, 38] → local center (0, 16).
+       Translate to (32, 16) so center lands at viewBox center (32, 32). -->
+  <g transform="translate(32 16)">
+    <path d="M0 14 L24 26 L0 38 L-24 26 Z" fill="url(#layerBot)"/>
+    <path d="M0 4 L24 16 L0 28 L-24 16 Z" fill="url(#layerMid)"/>
+    <path d="M0 -6 L24 6 L0 18 L-24 6 Z" fill="url(#layerTop)"/>
+    <!-- isometric Z -->
+    <g stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" fill="none">
+      <line x1="0" y1="-2" x2="16" y2="6"/>
+      <line x1="16" y1="6" x2="-16" y2="6"/>
+      <line x1="-16" y1="6" x2="0" y2="14"/>
+    </g>
+  </g>
+</svg>

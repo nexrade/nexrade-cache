@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 493 58" width="493" height="58" role="img" aria-label="nexrade-cache">
+  <!-- WiX banner spec: 493 × 58 px, 24-bit BMP, no alpha.
+       White background to match the default WixUI dialog header.
+       Standard WiX layout puts dialog title on the left, artwork on the right —
+       so wordmark sits on the right side. -->
+
+  <rect width="493" height="58" fill="#FFFFFF"/>
+
+  <!-- Right-aligned wordmark -->
+  <text x="478" y="30"
+        text-anchor="end"
+        font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Inter, Arial, sans-serif"
+        font-size="22" font-weight="700" fill="#0B1220" letter-spacing="-0.4">nexrade</text>
+  <text x="478" y="48"
+        text-anchor="end"
+        font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Inter, Arial, sans-serif"
+        font-size="10" font-weight="500" fill="#64748B" letter-spacing="3">REDIS-COMPATIBLE CACHE</text>
+
+  <!-- Subtle orange accent bar on the far right edge (matches logo palette) -->
+  <rect x="488" y="12" width="3" height="34" rx="1.5" fill="#F97316"/>
+</svg>
