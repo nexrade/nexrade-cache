@@ -247,7 +247,7 @@ jobs:
 
       - name: Post comparison as PR comment
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
@@ -691,7 +691,7 @@ jobs:
 
       - name: Post Windows comparison as PR comment
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
