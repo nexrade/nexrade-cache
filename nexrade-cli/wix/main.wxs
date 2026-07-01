@@ -86,7 +86,8 @@
                                 Type='ownProcess'
                                 Start='auto'
                                 ErrorControl='normal'
-                                Account='LocalSystem'>
+                                Account='LocalSystem'
+                                Arguments='--service'>
                                 <ServiceConfig
                                     DelayedAutoStart='yes'
                                     OnInstall='yes'
