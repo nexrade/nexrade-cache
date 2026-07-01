@@ -352,7 +352,7 @@ fn format_resp(resp: &Resp, depth: usize, raw: bool) -> String {
             if raw {
                 String::new()
             } else {
-                format!("\x1b[90m(nil)\x1b[0m", indent)
+                format!("{}\x1b[90m(nil)\x1b[0m", indent)
             }
         }
         Resp::Bool(b) => {
