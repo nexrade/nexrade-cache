@@ -20,6 +20,8 @@
 
 #[cfg(windows)]
 mod windows_svc;
+#[cfg(windows)]
+mod windows_ansi;
 
 use anyhow::Result;
 use clap::Parser;
@@ -266,6 +268,12 @@ async fn main() -> Result<()> {
         std::env::set_var("RUST_LOG", &cli.log_level);
     }
     init_tracing();
+
+    // Enable ANSI escape codes on Windows
+    #[cfg(windows)]
+    {
+        let _ = windows_ansi::enable_ansi_support();
+    }
 
     // Build server config
     let config = config_from_cli(&cli)?;

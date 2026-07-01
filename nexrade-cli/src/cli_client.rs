@@ -10,6 +10,9 @@
 //! nexrade-cli --pipe < commands.txt   # Pipe mode
 //! ```
 
+#[cfg(windows)]
+mod windows_ansi;
+
 use std::io::{self, BufRead, IsTerminal, Write};
 
 use anyhow::Result;
@@ -66,6 +69,12 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Enable ANSI escape codes on Windows
+    #[cfg(windows)]
+    {
+        let _ = windows_ansi::enable_ansi_support();
+    }
+
     let cli = Cli::parse();
     let raw = !io::stdout().is_terminal();
 
@@ -133,12 +142,12 @@ async fn main() -> Result<()> {
     }
 
     // Interactive REPL mode
-    println!("Connected to {}:{}", cli.host, cli.port);
-    println!("Type 'quit' or Ctrl+C to exit.");
+    println!("\x1b[1;36mConnected to {}:{}\x1b[0m", cli.host, cli.port);
+    println!("\x1b[90mType 'quit' or Ctrl+C to exit.\x1b[0m");
 
     let mut input = String::new();
     loop {
-        print!("{}:{}> ", cli.host, cli.port);
+        print!("\x1b[1;34m{}:{}\x1b[0m> ", cli.host, cli.port);
         io::stdout().flush()?;
 
         input.clear();
@@ -270,34 +279,46 @@ fn format_resp(resp: &Resp, depth: usize, raw: bool) -> String {
         "  ".repeat(depth)
     };
     match resp {
-        Resp::SimpleString(s) => s.clone(),
+        Resp::SimpleString(s) => {
+            if raw {
+                s.clone()
+            } else {
+                format!("\x1b[32m{}\x1b[0m", s) // Green for simple strings
+            }
+        }
         Resp::Error(e) => {
             if raw {
                 e.clone()
             } else {
-                format!("{}(error) {}", indent, e)
+                format!("{}\x1b[31m(error)\x1b[0m {}", indent, e) // Red for errors
             }
         }
         Resp::Integer(n) => {
             if raw {
                 format!("{}", n)
             } else {
-                format!("{}(integer) {}", indent, n)
+                format!("{}\x1b[36m(integer)\x1b[0m {}", indent, n) // Cyan for integers
             }
         }
         Resp::BulkString(None) => {
             if raw {
                 String::new()
             } else {
-                format!("{}(nil)", indent)
+                format!("{}\x1b[90m(nil)\x1b[0m", indent) // Gray for nil
             }
         }
-        Resp::BulkString(Some(b)) => String::from_utf8_lossy(b).into_owned(),
+        Resp::BulkString(Some(b)) => {
+            if raw {
+                String::from_utf8_lossy(b).into_owned()
+            } else {
+                format!("\x1b[33m\"{}\"\x1b[0m", String::from_utf8_lossy(b)) // Yellow for bulk strings
+            }
+        }
         Resp::Array(None) => {
             if raw {
                 String::new()
             } else {
-                format!("{}(nil)", indent)
+                format!("{}\x1b[90m(nil)\x1b[0m", indent)
             }
         }
         Resp::Array(Some(items)) => {
@@ -305,7 +326,7 @@ fn format_resp(resp: &Resp, depth: usize, raw: bool) -> String {
                 if raw {
                     return String::new();
                 }
-                return format!("{}(empty array)", indent);
+                return format!("{}\x1b[90m(empty array)\x1b[0m", indent);
             }
             if raw {
                 items
@@ -319,7 +340,7 @@ fn format_resp(resp: &Resp, depth: usize, raw: bool) -> String {
                     .enumerate()
                     .map(|(i, item)| {
                         format!(
-                            "{}{}) {}",
+                            "{}\x1b[90m{})\x1b[0m {}",
                             indent,
                             i + 1,
                             format_resp(item, depth + 1, false).trim_start()
@@ -334,17 +355,29 @@ fn format_resp(resp: &Resp, depth: usize, raw: bool) -> String {
             if raw {
                 String::new()
             } else {
-                format!("{}(nil)", indent)
+                format!("\x1b[90m(nil)\x1b[0m", indent)
             }
         }
-        Resp::Bool(b) => format!("{}(bool) {}", indent, b),
-        Resp::Double(f) => format!("{}(double) {}", indent, f),
+        Resp::Bool(b) => {
+            if raw {
+                format!("{}", b)
+            } else {
+                format!("{}\x1b[35m(bool)\x1b[0m {}", indent, b) // Magenta for bools
+            }
+        }
+        Resp::Double(f) => {
+            if raw {
+                format!("{}", f)
+            } else {
+                format!("{}\x1b[36m(double)\x1b[0m {}", indent, f) // Cyan for doubles
+            }
+        }
         Resp::Map(pairs) => pairs
             .iter()
             .enumerate()
             .map(|(i, (k, v))| {
                 format!(
-                    "{}{}) {} => {}",
+                    "{}\x1b[90m{})\x1b[0m {} \x1b[90m=>\x1b[0m {}",
                     indent,
                     i + 1,
                     format_resp(k, depth + 1, raw).trim_start(),
@@ -358,7 +391,7 @@ fn format_resp(resp: &Resp, depth: usize, raw: bool) -> String {
             .enumerate()
             .map(|(i, item)| {
                 format!(
-                    "{}{}) {}",
+                    "{}\x1b[90m{})\x1b[0m {}",
                     indent,
                     i + 1,
                     format_resp(item, depth + 1, raw).trim_start()

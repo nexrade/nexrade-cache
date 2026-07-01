@@ -71,6 +71,36 @@
                                 KeyPath='yes'/>
                         </Component>
 
+                        <!-- Windows Service (optional) -->
+                        <Component Id='NexradeCacheService' Guid='4B2F8E3D-9A1C-4E7F-B5D6-8C9E2A4F6B1D'>
+                            <File Id='ServiceBinary'
+                                Name='nexrade-cache-service.exe'
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\nexrade-cache.exe'
+                                KeyPath='yes'/>
+                            <ServiceInstall
+                                Id='NexradeCacheServiceInstall'
+                                Name='NexradeCache'
+                                DisplayName='nexrade-cache Server'
+                                Description='Redis-compatible cache server built in Rust'
+                                Type='ownProcess'
+                                Start='auto'
+                                ErrorControl='normal'
+                                Account='LocalSystem'>
+                                <ServiceConfig
+                                    DelayedAutoStart='yes'
+                                    OnInstall='yes'
+                                    OnReinstall='yes'/>
+                            </ServiceInstall>
+                            <ServiceControl
+                                Id='NexradeCacheServiceControl'
+                                Name='NexradeCache'
+                                Start='install'
+                                Stop='both'
+                                Remove='uninstall'
+                                Wait='yes'/>
+                        </Component>
+
                     </Directory>
 
                     <!-- Example config file in the root install dir -->
@@ -175,6 +205,15 @@
                 Level='1'
                 Absent='allow'>
                 <ComponentRef Id='DesktopShortcut'/>
+            </Feature>
+
+            <Feature
+                Id='WindowsService'
+                Title='Windows Service (Auto-start)'
+                Description='Install nexrade-cache as a Windows Service that starts automatically on boot.'
+                Level='1000'
+                Absent='allow'>
+                <ComponentRef Id='NexradeCacheService'/>
             </Feature>
         </Feature>
 

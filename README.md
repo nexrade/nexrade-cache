@@ -584,6 +584,10 @@ Start-Service nexrade-cache
 nexrade-cache.exe --uninstall-service
 ```
 
+### Windows ANSI Color Support
+
+nexrade-cache and nexrade-cli automatically enable ANSI escape code support on Windows 10+, providing colored output in PowerShell, Command Prompt, and Windows Terminal.
+
 ---
 
 ## License
