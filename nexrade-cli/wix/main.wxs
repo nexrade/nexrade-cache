@@ -95,10 +95,8 @@
                             <ServiceControl
                                 Id='NexradeCacheServiceControl'
                                 Name='NexradeCache'
-                                Start='install'
                                 Stop='both'
-                                Remove='uninstall'
-                                Wait='yes'/>
+                                Remove='uninstall'/>
                         </Component>
 
                     </Directory>
