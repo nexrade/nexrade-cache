@@ -19,8 +19,6 @@
 //! ```
 
 #[cfg(windows)]
-mod windows_ansi;
-#[cfg(windows)]
 mod windows_svc;
 
 use anyhow::Result;
@@ -272,7 +270,7 @@ async fn main() -> Result<()> {
     // Enable ANSI escape codes on Windows
     #[cfg(windows)]
     {
-        let _ = windows_ansi::enable_ansi_support();
+        let _ = nexrade_cache::windows_ansi::enable_ansi_support();
     }
 
     // Build server config
