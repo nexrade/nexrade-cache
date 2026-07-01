@@ -39,7 +39,7 @@ pub fn enable_ansi_support() -> std::io::Result<()> {
     unsafe {
         // Enable for stdout
         let stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE);
-        if stdout_handle != INVALID_HANDLE_VALUE && stdout_handle != 0 {
+        if stdout_handle != INVALID_HANDLE_VALUE && !stdout_handle.is_null() {
             let mut mode = 0;
             if GetConsoleMode(stdout_handle, &mut mode) != 0 {
                 let new_mode = mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
@@ -49,7 +49,7 @@ pub fn enable_ansi_support() -> std::io::Result<()> {
 
         // Enable for stderr
         let stderr_handle = GetStdHandle(STD_ERROR_HANDLE);
-        if stderr_handle != INVALID_HANDLE_VALUE && stderr_handle != 0 {
+        if stderr_handle != INVALID_HANDLE_VALUE && !stderr_handle.is_null() {
             let mut mode = 0;
             if GetConsoleMode(stderr_handle, &mut mode) != 0 {
                 let new_mode = mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
