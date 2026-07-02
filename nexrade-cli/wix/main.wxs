@@ -80,9 +80,9 @@
                                 KeyPath='yes'/>
                             <ServiceInstall
                                 Id='NexradeCacheServiceInstall'
-                                Name='NexradeCache'
-                                DisplayName='nexrade-cache Server'
-                                Description='Redis-compatible cache server built in Rust'
+                                Name='nexrade-cache'
+                                DisplayName='Nexrade Cache'
+                                Description='High-performance Redis-compatible cache server (nexrade-cache)'
                                 Type='ownProcess'
                                 Start='auto'
                                 ErrorControl='normal'
@@ -95,9 +95,11 @@
                             </ServiceInstall>
                             <ServiceControl
                                 Id='NexradeCacheServiceControl'
-                                Name='NexradeCache'
+                                Name='nexrade-cache'
+                                Start='install'
                                 Stop='both'
-                                Remove='uninstall'/>
+                                Remove='uninstall'
+                                Wait='no'/>
                         </Component>
 
                     </Directory>
