@@ -4,7 +4,14 @@
 
 # nexrade-cache
 
-**A Redis-compatible cache server built in Rust** — drop-in replacement for Redis with built-in TLS, Prometheus metrics, Lua scripting, a plugin API, and a WebAssembly target. No OpenSSL. No runtime dependencies. Single static binary.
+**v0.2.1**
+
+nexrade-cache is **a Redis-protocol-compatible cache server built in Rust**. It speaks the
+RESP2 / RESP3 wire format, ships with TLS, Prometheus metrics, Lua scripting, a plugin API,
+and a WebAssembly target — without OpenSSL or other C dependencies. **It is not a 1:1
+implementation of Redis.** It implements the commands and behaviours most commonly used by
+applications and proxies that talk to Redis, with intentional gaps in niche features. Check
+the compatibility matrix to verify your workload before adopting it.
 
 ```sh
 nexrade-cache --port 6379 --metrics
@@ -19,17 +26,17 @@ redis-cli ping
 
 ## Why nexrade-cache?
 
-Redis is great. But it ships without built-in observability, requires OpenSSL for TLS, and can't run in the browser or at the edge. nexrade-cache fixes all of that without sacrificing compatibility.
+Redis is great. But it ships without built-in observability, requires OpenSSL for TLS, and can't run in the browser or at the edge. nexrade-cache fixes all of that **for workloads whose command surface fits within its compatibility matrix**.
 
 | | nexrade-cache | Redis OSS |
 |---|:---:|:---:|
 | RESP2 + RESP3 protocol (`HELLO`) | ✅ | ✅ |
-| All major data types + Streams + Geo + Bitmaps | ✅ | ✅ |
+| Most major data types + Streams + Geo + Bitmaps | ✅ | ✅ |
 | Consumer groups (XGROUP / XREADGROUP / XACK) | ✅ | ✅ |
-| RDB snapshots + AOF persistence | ✅ | ✅ |
+| RDB-style snapshots + AOF persistence | ⚠️ custom binary | ✅ |
 | Lua 5.4 scripting (EVAL / EVALSHA) | ✅ | ✅ |
-| Pub/Sub | ✅ | ✅ |
-| **Primary / replica replication (REPLICAOF / PSYNC)** | ✅ | ✅ |
+| Pub/Sub (with RESP3 push) | ✅ | ✅ |
+| Primary / replica replication (REPLICAOF / PSYNC) | ✅ | ✅ |
 | **Built-in Prometheus metrics** | ✅ | ❌ |
 | **Structured JSON logging** | ✅ | ❌ |
 | **TLS without OpenSSL (rustls)** | ✅ | ⚠️ requires OpenSSL + compile flag |
@@ -385,7 +392,7 @@ console.log(val); // active
 
 `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` `LPOP` `RPOP`
 `LLEN` `LRANGE` `LINDEX` `LSET` `LINSERT` `LREM` `LTRIM`
-`LMOVE` `RPOPLPUSH` `LPOS` `BLPOP` `BRPOP`
+`LMOVE` `RPOPLPUSH` `LPOS` `BLPOP` `BRPOP` `LMPOP` `BLMPOP`
 </details>
 
 <details>
@@ -410,7 +417,9 @@ console.log(val); // active
 `ZADD` `ZCARD` `ZSCORE` `ZMSCORE` `ZINCRBY` `ZRANK` `ZREVRANK`
 `ZRANGE` `ZREVRANGE` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZRANGEBYLEX`
 `ZCOUNT` `ZLEXCOUNT` `ZREM` `ZREMRANGEBYRANK` `ZREMRANGEBYSCORE`
-`ZPOPMIN` `ZPOPMAX` `ZRANDMEMBER` `ZUNIONSTORE` `ZINTERSTORE` `ZSCAN`
+`ZPOPMIN` `ZPOPMAX` `ZMPOP` `BZMPOP` `ZRANDMEMBER`
+`ZUNIONSTORE` `ZINTERSTORE` `ZUNION` `ZINTER` `ZDIFF` `ZDIFFSTORE`
+`ZINTERCARD` `ZSCAN`
 </details>
 
 <details>
@@ -448,7 +457,9 @@ console.log(val); // active
 `PING` `ECHO` `QUIT` `SELECT` `DBSIZE` `FLUSHDB` `FLUSHALL`
 `INFO` `CONFIG` `COMMAND` `SAVE` `BGSAVE` `BGREWRITEAOF`
 `LASTSAVE` `DEBUG` `SHUTDOWN` `SLOWLOG` `MEMORY` `LATENCY`
-`ACL` `RESET` `CLIENT` `CLUSTER` `HELLO`
+`ACL` `RESET` `HELLO`
+`CLIENT` (`LIST` `INFO` `PAUSE` `UNPAUSE` `SETNAME` `GETNAME` `ID` `NO-EVICT` `REPLY` `KILL`)
+`CLUSTER` (`KEYSLOT` `NODES` `INFO` `MYID` `COUNTKEYSINSLOT` `GETKEYSINSLOT` `SLOTS`)
 `MULTI` `EXEC` `DISCARD` `WATCH` `UNWATCH`
 `EVAL` `EVALSHA` `SCRIPT`
 `SUBSCRIBE` `UNSUBSCRIBE` `PSUBSCRIBE` `PUNSUBSCRIBE` `PUBLISH` `PUBSUB`
@@ -482,7 +493,7 @@ Operations that touch multiple keys acquire shard locks in a **deterministic sor
 | `RENAME` / `RENAMENX` / `COPY` | Lock src shard + dst shard in index order |
 | `LMOVE` / `RPOPLPUSH` | Atomic cross-shard list move |
 | `SMOVE` | Atomic cross-shard set move |
-| `MSET` / `MSETNX` | Lock all affected shards in order, batch insert |
+| `MSET` / `MSETNX` | Try-lock all affected shards; back off and retry the whole sweep on contention instead of blocking while holding earlier shards |
 | `DEL` / `EXISTS` / `MGET` | One shard per key, independent |
 
 ### Whole-database operations
@@ -493,21 +504,71 @@ Operations that touch multiple keys acquire shard locks in a **deterministic sor
 
 ## Performance
 
-Measured with `redis-benchmark -c 50 -n 100000 -q` on a single instance (loopback, no TLS). Compared against Redis 7.0.15 on the same machine.
+Measured with `redis-benchmark` against Redis 7.4.1 on the same machine (loopback, no TLS).
 
-| Command | nexrade-cache | Redis 7.0.15 | Delta |
+**No pipelining** (`-c 50 -n 100000 -q` — the shape most real client traffic takes):
+nexrade-cache **beats Redis on every commonly-used command**, typically 5-13% faster with
+lower p99 latency:
+
+| Command | nexrade-cache | Redis 7.4.1 | Delta |
 |---------|:---:|:---:|:---:|
-| PING | 224K rps | 200K rps | **+12%** |
-| SET | 226K rps | 199K rps | **+13%** |
-| GET | 220K rps | 197K rps | **+12%** |
-| INCR | 226K rps | 201K rps | **+12%** |
-| LPUSH | 222K rps | 200K rps | **+11%** |
-| SADD | 228K rps | 203K rps | **+12%** |
-| HSET | 227K rps | 207K rps | **+10%** |
-| MSET (10 keys) | 222K rps | 224K rps | **-1%** |
-| LRANGE_300 | 68K rps | 82K rps | -17% |
+| PING | 240K rps | 220K rps | **+9%** |
+| SET | 243K rps | 229K rps | **+6%** |
+| GET | 241K rps | 223K rps | **+8%** |
+| INCR | 245K rps | 226K rps | **+8%** |
+| HSET | 243K rps | 232K rps | **+5%** |
+| ZADD | 246K rps | 230K rps | **+7%** |
+| SADD | 245K rps | 230K rps | **+7%** |
+| MSET (10 keys) | 250K rps | 275K rps | -9% |
+| LRANGE_600 | 40K rps | 41K rps | -2% |
 
-nexrade-cache is **10-13% faster** than Redis on single-key operations thanks to multi-threaded async I/O with `TCP_NODELAY` and zero-copy response serialization. MSET uses batched shard locking for near-parity. LRANGE trails due to the overhead of per-element RESP framing in the sharded architecture vs Redis's single-threaded buffer.
+**Pipelined** (`-P 50 -c 50` — many in-flight commands per connection): the gap against
+Redis has been closed from 6.5× down to **~1.0-1.1×** on the common write commands,
+with several now at parity or ahead:
+
+| Command | nexrade-cache | Redis 7.4.1 | Gap |
+|---------|:---:|:---:|:---:|
+| GET | 3.9-4.0M rps | 4.2M rps | 1.0-1.1× |
+| HSET | 3.0M rps | 3.0M rps | ~parity |
+| SET | ~3.1-3.2M rps | 3.4M rps | ~1.1× |
+| LPUSH | 2.2-3.1M rps | 3.0-3.1M rps | 1.0-1.4× |
+| ZADD | 2.1-3.5M rps | 2.9M rps | 0.8-1.4× (nexrade ahead at the high end) |
+| INCR (single-key) | ~3.2-4.2M rps | 4.17M rps | ~1.0-1.3× |
+| MSET (fixed-key) | edges ahead of Redis | — | nexrade wins |
+
+The single-key `INCR` contention gap (previously ~4.5× under heavy same-key
+concurrency) is now closed via an atomic CAS fast path that skips the shard's
+exclusive write lock entirely once a key is promoted to an integer
+representation. The one gap still open going into a future release is
+pipelined `MSET` against a *randomized* keyspace (each call's keys land on
+different, disjoint shard sets) — nexrade-cache still trails Redis there by
+roughly 1.7-1.8×, since acquiring several shard locks atomically is a
+structural cost real Redis's single-threaded event loop doesn't pay. Closing
+that further needs a full per-shard deferred-queue design, not a smaller
+patch. The numbers above come from atomic mirrors for the replica-role,
+maxmemory, `CLIENT TRACKING`, and
+per-command metrics-handle checks, a single-lookup entry API for
+string/list/hash/set/zset writes, a try-lock-all-with-backoff rewrite for
+MSET/MSETNX, a multi-threaded Tokio runtime, and per-batch (not per-command)
+connection metadata refresh.
+
+### Hot-path optimisations
+
+Beyond single-thread throughput, the storage layer avoids the big constant-factor sources of overhead:
+
+| Path | Before | After |
+|------|--------|-------|
+| `GET` LRU-clock update | `SystemTime::now()` syscall (~25-50ns) per access | Single relaxed atomic load (~1ns) refreshed by the background tick |
+| LRU eviction selection (`allkeys-lru`) | Scan all entries to find min | Reservoir sample of 5 random entries (Redis default) |
+| Memory check in `evict_if_needed` | Recompute total bytes from every entry | Sum of per-shard atomics (O(shards)) |
+| `SET` / `HSET` / `SADD` / `ZADD` / `LPUSH`/`RPUSH` on existing key | Up to 3 `HashMap` lookups (`contains_key` → `insert` → `get_mut`) | 1 lookup via `entries.entry()` / `Database::get_or_insert_with` |
+| Replica-role / replica-count / `CLIENT TRACKING`-enabled check per command | `parking_lot::RwLock` / broadcast-channel `Mutex` per call | Atomic mirror, single relaxed/acquire load — skipped entirely when nobody's using the feature |
+| Per-command Prometheus metric handle resolution | `with_label_values` (hash + `RwLock::read()` + lookup) × 3 per command | Cached `(cmd_name, handles)` pair, reused across runs of the same command in a pipeline batch |
+| `INCR`/`DECR`/`INCRBY`/`DECRBY` on a promoted key | Exclusive shard write-lock every call | `AtomicIntCell` read-lock CAS fast path; write-lock only for creation/promotion/expiry |
+| `INCR`/`INCRBY`/`DECR`/`DECRBY` integer formatting | `i64::to_string()` (heap-allocating) | `itoa::Buffer` (stack, no allocation) |
+| `MSET`/`MSETNX` shard acquisition | Sequential blocking `write()` per shard (convoy stalls under pipelining) | `try_write` sweep with backoff-and-retry; never holds a shard hostage while waiting on another |
+
+See `crates/nexrade-core/tests/perf_tier2.rs` for the benchmark suite; the `estimated_memory_bytes()` × 10k call cost went from O(10M) entries to ~9 ms total.
 
 ---
 

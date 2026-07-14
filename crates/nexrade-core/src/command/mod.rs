@@ -2,6 +2,7 @@ pub mod bit;
 pub mod generic;
 pub mod geo;
 pub mod hash;
+pub mod hll;
 pub mod list;
 pub mod server;
 pub mod set;
@@ -17,12 +18,27 @@ use crate::error::{NexradeError, Result};
 use crate::persistence::AofSync;
 use crate::resp::Resp;
 
-/// Parse the command name from a RESP array.
+/// Parse the command name from a RESP array into a fresh uppercase
+/// `String`. The caller may reuse the same `String` allocation across
+/// calls — see `parse_cmd_name_into` below for the hot-path version.
 pub fn parse_cmd_name(args: &[Resp]) -> Result<String> {
-    args.first()
+    let mut buf = String::with_capacity(8);
+    parse_cmd_name_into(args, &mut buf)?;
+    Ok(buf)
+}
+
+/// Hot-path variant of `parse_cmd_name` that uppercases the input
+/// ASCII-only into the caller's `String`. Avoids both the Unicode
+/// codepath of `to_uppercase()` and the allocation-per-call.
+pub fn parse_cmd_name_into<'a>(args: &[Resp], out: &'a mut String) -> Result<&'a str> {
+    let arg0 = args
+        .first()
         .and_then(|a| a.as_str())
-        .map(|s| s.to_uppercase())
-        .ok_or_else(|| NexradeError::ProtocolError("empty command".to_string()))
+        .ok_or_else(|| NexradeError::ProtocolError("empty command".to_string()))?;
+    out.clear();
+    out.push_str(arg0);
+    out.make_ascii_uppercase();
+    Ok(out.as_str())
 }
 
 /// Get a string argument at index.
@@ -73,13 +89,14 @@ pub fn is_write_command(cmd: &str) -> bool {
         // List
         | "LPUSH" | "RPUSH" | "LPUSHX" | "RPUSHX" | "LPOP" | "RPOP" | "LSET" | "LINSERT"
         | "LREM" | "LTRIM" | "LMOVE" | "RPOPLPUSH" | "BLPOP" | "BRPOP"
+        | "LMPOP" | "BLMPOP"
         // Hash
         | "HSET" | "HMSET" | "HDEL" | "HSETNX" | "HINCRBY" | "HINCRBYFLOAT"
         // Set
         | "SADD" | "SREM" | "SUNIONSTORE" | "SINTERSTORE" | "SDIFFSTORE" | "SMOVE" | "SPOP"
         // ZSet
         | "ZADD" | "ZINCRBY" | "ZREM" | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZPOPMIN"
-        | "ZPOPMAX" | "ZUNIONSTORE" | "ZINTERSTORE"
+        | "ZPOPMAX" | "ZUNIONSTORE" | "ZINTERSTORE" | "ZRANGESTORE" | "ZDIFFSTORE" | "ZMPOP" | "BZMPOP"
         // Generic
         | "DEL" | "UNLINK" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST"
         | "RENAME" | "RENAMENX" | "COPY" | "MOVE" | "RESTORE" | "SORT"
@@ -91,26 +108,117 @@ pub fn is_write_command(cmd: &str) -> bool {
         | "SETBIT" | "BITOP" | "BITFIELD"
         // Geo
         | "GEOADD"
+        // HyperLogLog
+        | "PFADD" | "PFMERGE"
     )
 }
 
-/// Dispatch a command to the appropriate handler.
+/// Dispatch a command as the implicit `"default"` ACL user.
 ///
-/// `peer_addr` is the remote socket address of the connection and is forwarded
-/// to replication commands (e.g. REPLCONF ACK).
+/// **System-internal only** — AOF replay, replication apply, embedded
+/// (WASM) callers, and library tests. These contexts don't have a
+/// real authentication identity to carry: the original command was
+/// already authorized at the time it was originally executed (AOF
+/// /replication replay), the caller is a trusted in-process embedder
+/// (WASM), or the user is irrelevant to the test's intent. Replaying
+/// these commands under `"default"` is intentional — re-checking ACL
+/// with a different identity would either weaken enforcement (since
+/// `"default"` is full-access in the strictest sense) or break valid
+/// commands at replay time.
+///
+/// **For user-facing command paths**, use `dispatch_with_user` (or
+/// `dispatch_tracked`) which take the connection's authenticated
+/// identity. Hard-coding a known-vulnerable pattern at a real user
+/// path by accidentally reaching for this function is the whole
+/// reason the type system doesn't make it more convenient; if you
+/// have to ask "is this `dispatch()` call safe?" the answer is "no,
+/// unless it's documented as system-internal in this comment."
 pub async fn dispatch(db: &Db, args: Vec<Resp>, db_index: usize) -> Resp {
-    dispatch_with_addr(db, args, db_index, None).await
+    dispatch_inner_callable(db, args, db_index, None, "default").await
 }
 
-/// Dispatch with an optional peer address (used by the connection handler).
+/// Dispatch with an optional peer address (used by the connection handler)
+/// and an ACL user (used by the embedded API and library tests; the
+/// connection handler passes its authenticated user via `dispatch_with_user`).
 pub async fn dispatch_with_addr(
     db: &Db,
     args: Vec<Resp>,
     db_index: usize,
     peer_addr: Option<std::net::SocketAddr>,
 ) -> Resp {
-    let cmd = parse_cmd_name(&args).unwrap_or_default();
-    let is_write = is_write_command(&cmd);
+    dispatch_inner_callable(db, args, db_index, peer_addr, "default").await
+}
+
+/// Dispatch for a specific authenticated user. `client_id` is 0 for
+/// contexts without a real client connection (embedded API, Lua, tests) —
+/// CLIENT TRACKING never applies to those since nothing is registered
+/// under id 0.
+pub async fn dispatch_with_user(
+    db: &Db,
+    args: Vec<Resp>,
+    db_index: usize,
+    peer_addr: Option<std::net::SocketAddr>,
+    user: &str,
+) -> Resp {
+    dispatch_inner_callable(db, args, db_index, peer_addr, user).await
+}
+
+/// Internal entry used by the public helpers above — parses `cmd`
+/// itself so callers don't have to.
+async fn dispatch_inner_callable(
+    db: &Db,
+    args: Vec<Resp>,
+    db_index: usize,
+    peer_addr: Option<std::net::SocketAddr>,
+    user: &str,
+) -> Resp {
+    let mut cmd_buf = String::with_capacity(8);
+    let cmd = match parse_cmd_name_into(&args, &mut cmd_buf) {
+        Ok(s) => s,
+        Err(e) => return Resp::Error(e.to_string()),
+    };
+    dispatch_tracked(db, args, db_index, peer_addr, user, 0, cmd).await
+}
+
+/// Dispatch for a specific authenticated user + client id + pre-parsed
+/// uppercase cmd name. The connection handler reuses a per-connection
+/// `String` to avoid the per-command `String` allocation that
+/// `parse_cmd_name` would otherwise incur on the hot path.
+pub async fn dispatch_tracked(
+    db: &Db,
+    args: Vec<Resp>,
+    db_index: usize,
+    peer_addr: Option<std::net::SocketAddr>,
+    user: &str,
+    client_id: u64,
+    cmd: &str,
+) -> Resp {
+    let is_write = is_write_command(cmd);
+    let is_flush = matches!(cmd, "FLUSHALL" | "FLUSHDB");
+
+    // CLIENT PAUSE — gate writes server-wide during the pause window.
+    // Placed before AOF/replication/dispatch so a paused write never
+    // touches the store, never appends to AOF, never propagates.
+    if is_write && db.connections.is_paused() {
+        return Resp::Error(
+            NexradeError::Prefixed("PAUSE Write pause in effect, please retry later".to_string())
+                .to_string(),
+        );
+    }
+
+    // Track which keys this call touches, before `args` is consumed by
+    // dispatch, so we can update the tracking registry afterward AND
+    // pass them to dispatch_inner for the ACL permission check (no
+    // second extract_keys call inside the inner function).
+    let touched_keys: Vec<Vec<u8>> = if !is_flush {
+        extract_keys(cmd, &args)
+            .into_iter()
+            .map(|k| k.to_vec())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let key_refs: Vec<&[u8]> = touched_keys.iter().map(|k| k.as_slice()).collect();
 
     #[cfg(not(target_arch = "wasm32"))]
     let aof_bytes: Option<Vec<u8>> = if is_write && db.stats.aof_enabled.load(Ordering::Relaxed) {
@@ -125,25 +233,40 @@ pub async fn dispatch_with_addr(
         None
     };
 
-    // Enforce maxmemory before write commands.
+    // Enforce maxmemory before write commands. Lock-free fast path:
+    // if `db.max_memory_limit` is 0 (the default), there's nothing to
+    // enforce and we never take the config lock.
     if is_write {
-        let (max_mem, policy) = {
-            let cfg = db.config.lock();
-            (cfg.max_memory, cfg.maxmemory_policy.clone())
-        };
-        if let Some(limit) = max_mem {
-            if limit > 0 {
-                db.store.evict_if_needed(&policy, limit);
-            }
+        let limit = db.max_memory_limit.load(Ordering::Relaxed);
+        if limit > 0 {
+            let policy_u8 = db.maxmemory_policy.load(Ordering::Relaxed);
+            // Decode u8 → MaxMemoryPolicy. NoEviction (0) is a no-op
+            // in `evict_if_needed`; we still call it because the
+            // dispatcher expects a uniform control flow.
+            let policy = match policy_u8 {
+                1 => crate::db::MaxMemoryPolicy::AllKeysRandom,
+                2 => crate::db::MaxMemoryPolicy::AllKeysLru,
+                3 => crate::db::MaxMemoryPolicy::VolatileRandom,
+                4 => crate::db::MaxMemoryPolicy::VolatileLru,
+                5 => crate::db::MaxMemoryPolicy::VolatileTtl,
+                _ => crate::db::MaxMemoryPolicy::NoEviction,
+            };
+            db.store.evict_if_needed(&policy, limit);
         }
     }
 
-    let result = match dispatch_inner(db, args, db_index, peer_addr).await {
+    let result = match dispatch_inner(
+        db, args, db_index, peer_addr, user, client_id, &key_refs, cmd,
+    )
+    .await
+    {
         Ok(resp) => resp,
         Err(e) => Resp::Error(e.to_string()),
     };
 
-    if is_write && !matches!(result, Resp::Error(_)) {
+    let succeeded = !matches!(result, Resp::Error(_));
+
+    if is_write && succeeded {
         db.stats.dirty_keys.fetch_add(1, Ordering::Relaxed);
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -162,22 +285,51 @@ pub async fn dispatch_with_addr(
         }
     }
 
+    // CLIENT TRACKING bookkeeping: reads arm invalidation for this client,
+    // writes fire invalidation pushes to every client tracking the touched
+    // keys. FLUSHALL/FLUSHDB use a dedicated broadcast instead of per-key.
+    if succeeded {
+        if is_flush {
+            db.tracking.flush_all();
+        } else if !key_refs.is_empty() {
+            if is_write {
+                db.tracking.on_write(&key_refs, client_id);
+            } else {
+                db.tracking.track_read(client_id, &key_refs);
+            }
+        }
+    }
+
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_inner(
     db: &Db,
     args: Vec<Resp>,
     db_index: usize,
     peer_addr: Option<std::net::SocketAddr>,
+    authenticated_user: &str,
+    client_id: u64,
+    keys: &[&[u8]],
+    cmd: &str,
 ) -> Result<Resp> {
     if args.is_empty() {
         return Err(NexradeError::ProtocolError("empty command".to_string()));
     }
 
-    let cmd = parse_cmd_name(&args)?;
+    // ACL check: enforce command + key-pattern permissions on the
+    // authenticated user. The connection handler decides who the caller is
+    // and passes that name in. `keys` and `cmd` are pre-computed by the
+    // caller — saves one `extract_keys` allocation and one `String`
+    // allocation per dispatch.
+    if let Err(e) = db.acl.check_permission(authenticated_user, cmd, keys) {
+        // AclError's Display already carries its own reply-code prefix
+        // (WRONGPASS / NOPERM) — use Prefixed so we don't double it up.
+        return Err(NexradeError::Prefixed(e.to_string()));
+    }
 
-    match cmd.as_str() {
+    match cmd {
         // --- String commands ---
         "SET" => string::cmd_set(db, &args, db_index).await,
         "GET" => string::cmd_get(db, &args, db_index).await,
@@ -219,6 +371,8 @@ async fn dispatch_inner(
         "LPOS" => list::cmd_lpos(db, &args, db_index).await,
         "BLPOP" => list::cmd_blpop(db, &args, db_index).await,
         "BRPOP" => list::cmd_brpop(db, &args, db_index).await,
+        "LMPOP" => list::cmd_lmpop(db, &args, db_index).await,
+        "BLMPOP" => list::cmd_blmpop(db, &args, db_index).await,
 
         // --- Hash commands ---
         "HSET" => hash::cmd_hset(db, &args, db_index).await,
@@ -279,6 +433,14 @@ async fn dispatch_inner(
         "ZUNIONSTORE" => zset::cmd_zunionstore(db, &args, db_index).await,
         "ZINTERSTORE" => zset::cmd_zinterstore(db, &args, db_index).await,
         "ZSCAN" => zset::cmd_zscan(db, &args, db_index).await,
+        "ZRANGESTORE" => zset::cmd_zrangestore(db, &args, db_index).await,
+        "ZMPOP" => zset::cmd_zmpop(db, &args, db_index).await,
+        "BZMPOP" => zset::cmd_bzmpop(db, &args, db_index).await,
+        "ZINTER" => zset::cmd_zinter(db, &args, db_index).await,
+        "ZUNION" => zset::cmd_zunion(db, &args, db_index).await,
+        "ZDIFF" => zset::cmd_zdiff(db, &args, db_index).await,
+        "ZDIFFSTORE" => zset::cmd_zdiffstore(db, &args, db_index).await,
+        "ZINTERCARD" => zset::cmd_zintercard(db, &args, db_index).await,
 
         // --- Generic key commands ---
         "DEL" => generic::cmd_del(db, &args, db_index).await,
@@ -305,6 +467,7 @@ async fn dispatch_inner(
         "DUMP" => generic::cmd_dump(db, &args, db_index).await,
         "RESTORE" => generic::cmd_restore(db, &args, db_index).await,
         "SORT" => generic::cmd_sort(db, &args, db_index).await,
+        "SORT_RO" => generic::cmd_sort_ro(db, &args, db_index).await,
         "TOUCH" => generic::cmd_touch(db, &args, db_index).await,
 
         // --- Server commands ---
@@ -325,12 +488,13 @@ async fn dispatch_inner(
         "DEBUG" => server::cmd_debug(&args).await,
         "SHUTDOWN" => server::cmd_shutdown(db, &args).await,
         "SLOWLOG" => server::cmd_slowlog(db, &args).await,
+        "WAIT" => server::cmd_wait(db, &args).await,
         "MEMORY" => server::cmd_memory(db, &args, db_index).await,
         "LATENCY" => server::cmd_latency(&args).await,
-        "ACL" => server::cmd_acl(&args).await,
+        "ACL" => server::cmd_acl(db, &args, authenticated_user).await,
         "RESET" => server::cmd_reset().await,
-        "CLIENT" => server::cmd_client(&args).await,
-        "CLUSTER" => server::cmd_cluster(&args).await,
+        "CLIENT" => server::cmd_client(db, &args, client_id).await,
+        "CLUSTER" => server::cmd_cluster(db, &args).await,
         "HELLO" => server::cmd_hello(&args).await,
         "PUBLISH" => server::cmd_publish(db, &args).await,
         "PUBSUB" => server::cmd_pubsub(db, &args).await,
@@ -373,6 +537,11 @@ async fn dispatch_inner(
         "GEORADIUSBYMEMBER" => geo::cmd_georadiusbymember(db, &args, db_index).await,
         "GEOSEARCH" => geo::cmd_geosearch(db, &args, db_index).await,
 
+        // --- HyperLogLog commands ---
+        "PFADD" => hll::cmd_pfadd(db, &args, db_index).await,
+        "PFCOUNT" => hll::cmd_pfcount(db, &args, db_index).await,
+        "PFMERGE" => hll::cmd_pfmerge(db, &args, db_index).await,
+
         _ => {
             let args_preview = args
                 .iter()
@@ -387,7 +556,84 @@ async fn dispatch_inner(
             } else {
                 format!(", with args beginning with: {args_preview} ")
             };
-            Err(NexradeError::UnknownCommand(cmd, suffix))
+            Err(NexradeError::UnknownCommand(cmd.to_string(), suffix))
         }
     }
+}
+
+/// Best-effort key extraction for ACL pattern checks. Returns the bulk-string
+/// arguments that look like keys, for commands where keys occupy known
+/// positions in the argument vector. Commands not listed here either don't
+/// take keys or have a shape where we can't reliably extract them; those
+/// pass an empty slice and rely on the per-command allow/deny rules.
+fn extract_keys<'a>(cmd: &str, args: &'a [Resp]) -> Vec<&'a [u8]> {
+    let get = |idx: usize| -> Option<&'a [u8]> {
+        args.get(idx).and_then(|r| r.as_bytes().map(|b| b.as_ref()))
+    };
+
+    // (start_index, stride, count) — count = None means "up to end".
+    let spec: &[(usize, usize, Option<usize>)] = match cmd {
+        // Single-key commands.
+        "GET" | "GETSET" | "GETDEL" | "GETEX" | "SET" | "SETNX" | "SETEX" | "PSETEX" | "STRLEN"
+        | "GETRANGE" | "SETRANGE" | "APPEND" | "INCR" | "INCRBY" | "INCRBYFLOAT" | "DECR"
+        | "DECRBY" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "EXPIRETIME"
+        | "PEXPIRETIME" | "TTL" | "PTTL" | "PERSIST" | "DUMP" | "RESTORE" | "TYPE" | "OBJECT"
+        | "RENAMENX" | "TOUCH" | "MOVE" | "BITCOUNT" | "BITPOS" | "GETBIT" | "SETBIT"
+        | "BITFIELD" | "LPUSH" | "LPUSHX" | "RPUSH" | "RPUSHX" | "LPOP" | "RPOP" | "LLEN"
+        | "LRANGE" | "LINDEX" | "LINSERT" | "LSET" | "LREM" | "LTRIM" | "LMPOP" | "BLMPOP"
+        | "HSET" | "HMSET" | "HGET" | "HMGET" | "HDEL" | "HEXISTS" | "HGETALL" | "HKEYS"
+        | "HVALS" | "HLEN" | "HSETNX" | "HINCRBY" | "HINCRBYFLOAT" | "HSCAN" | "HRANDFIELD"
+        | "SADD" | "SREM" | "SISMEMBER" | "SMISMEMBER" | "SMEMBERS" | "SCARD" | "SRANDMEMBER"
+        | "SPOP" | "SSCAN" | "SMOVE" | "ZADD" | "ZREM" | "ZSCORE" | "ZMSCORE" | "ZINCRBY"
+        | "ZCARD" | "ZCOUNT" | "ZLEXCOUNT" | "ZRANGE" | "ZRANGEBYSCORE" | "ZRANGEBYLEX"
+        | "ZREVRANGE" | "ZREVRANGEBYSCORE" | "ZRANK" | "ZREVRANK" | "ZPOPMIN" | "ZPOPMAX"
+        | "ZRANDMEMBER" | "ZSCAN" | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "PFADD"
+        | "PFCOUNT" | "PFMERGE" | "GEOADD" | "GEOPOS" | "GEODIST" | "GEOHASH" | "XADD" | "XLEN"
+        | "XRANGE" | "XREVRANGE" | "XTRIM" | "XDEL" | "XGROUP" | "XACK" | "XPENDING" | "WAIT" => {
+            &[(1, 0, Some(1))]
+        }
+
+        // Multi-key commands: take every remaining key position.
+        "DEL" | "UNLINK" | "EXISTS" => &[(1, 1, None)],
+        "MGET" => &[(1, 1, None)],
+        "MSET" => &[(1, 2, None)], // (k1, v1, k2, v2, …)
+        "MSETNX" => &[(1, 2, None)],
+        "RENAME" | "COPY" => &[(1, 1, Some(2))], // src, dst
+        "LMOVE" | "BLMOVE" => &[(1, 1, Some(2))],
+
+        // BITOP op destkey key [key …]
+        "BITOP" => &[(2, 1, None)],
+
+        // Sorted-set multi-key ops.
+        "ZUNIONSTORE" | "ZINTERSTORE" | "ZDIFFSTORE" | "ZRANGESTORE" => &[(2, 1, None)],
+        "ZUNION" | "ZINTER" | "ZDIFF" | "ZMPOP" | "BZMPOP" => &[(2, 1, None)],
+        "ZINTERCARD" => &[(2, 1, None)],
+
+        // Stream: XREAD/XREADGROUP layout is: COUNT? BLOCK? GROUP group consumer
+        // COUNT? NOACK? STREAMS k1 k2 … id1 id2 … — keys aren't easily
+        // extractable here; we just say "no keys" so the @keyspace check
+        // is bypassed.
+
+        // Commands without keys (return empty).
+        _ => &[],
+    };
+
+    let mut out: Vec<&[u8]> = Vec::new();
+    for (start, stride, count) in spec {
+        let mut idx = *start;
+        let mut taken = 0usize;
+        while idx < args.len() {
+            if let Some(b) = get(idx) {
+                out.push(b);
+            }
+            idx += 1 + stride.saturating_sub(1);
+            taken += 1;
+            if let Some(limit) = count {
+                if taken >= *limit {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }

@@ -15,15 +15,12 @@ fn get_or_create_set<'a>(
     db: &'a mut crate::store::Database,
     key: &[u8],
 ) -> Result<&'a mut HashSet<Vec<u8>>> {
-    if !db.contains_key(key) {
-        db.insert(key.to_vec(), Entry::new(DataType::Set(HashSet::new())));
-    }
-    match db.get_mut(key) {
-        Some(e) => match &mut e.value {
-            DataType::Set(s) => Ok(s),
-            _ => Err(NexradeError::WrongType),
-        },
-        None => unreachable!(),
+    // Single HashMap lookup (via `get_or_insert_with`) instead of
+    // contains_key + insert + get_mut (up to 3 lookups).
+    let entry = db.get_or_insert_with(key, || Entry::new(DataType::Set(HashSet::new())));
+    match &mut entry.value {
+        DataType::Set(s) => Ok(s),
+        _ => Err(NexradeError::WrongType),
     }
 }
 

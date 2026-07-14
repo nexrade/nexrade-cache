@@ -120,11 +120,35 @@ impl AofWriter {
     /// Rewrite the AOF by serializing the current database state as RESP
     /// commands into a temp file, then atomically replacing the existing AOF.
     /// This compacts the file and removes all superseded commands.
-    pub fn rewrite<P: AsRef<Path>>(path: P, databases: &[(usize, Database)]) -> Result<()> {
+    pub fn rewrite<P: AsRef<Path>>(
+        path: P,
+        databases: &[(usize, Database)],
+        acl_lines: &[String],
+    ) -> Result<()> {
         let tmp = format!("{}.rewrite.tmp", path.as_ref().display());
         {
             let file = File::create(&tmp)?;
             let mut w = BufWriter::new(file);
+
+            // Emit ACL state first, before any data — so on replay the
+            // users are configured before any command that uses them.
+            for line in acl_lines {
+                let mut args: Vec<Resp> = vec![Resp::bulk_str("ACL"), Resp::bulk_str("SETUSER")];
+                // Reconstruct an ACL SETUSER call from a stored line. The
+                // canonical format is: "user <name> [on|off] [#<hash>] ~<pat>
+                // [+|-]<cmd|@cat>..." — the first token "user" is the
+                // command name when used as a SETUSER payload.
+                let mut parts = line.split_whitespace();
+                if parts.next() != Some("user") {
+                    continue;
+                }
+                let Some(name) = parts.next() else { continue };
+                args.push(Resp::bulk_str(name));
+                for tok in parts {
+                    args.push(Resp::bulk_str(tok));
+                }
+                w.write_all(&Resp::Array(Some(args)).serialize())?;
+            }
 
             for (db_index, database) in databases {
                 // SELECT to switch to the right database.
@@ -146,6 +170,17 @@ impl AofWriter {
                             Resp::bulk_str("SET"),
                             Resp::bulk(key_bytes.clone()),
                             Resp::bulk(Bytes::copy_from_slice(v)),
+                        ]))),
+                        // Int-encoded keys compact down to a plain SET with
+                        // their decimal representation — AOF replay via SET
+                        // then behaves exactly like a fresh INCR would have
+                        // (re-promotes to Int on the next INCR), which is
+                        // the same fresh-start semantics every other
+                        // compacted key gets.
+                        DataType::Int(cell) => Some(Resp::Array(Some(vec![
+                            Resp::bulk_str("SET"),
+                            Resp::bulk(key_bytes.clone()),
+                            Resp::bulk_str(cell.load().to_string()),
                         ]))),
                         DataType::List(l) if !l.is_empty() => {
                             let mut args =
@@ -190,9 +225,55 @@ impl AofWriter {
                                 }
                                 w.write_all(&Resp::Array(Some(args)).serialize())?;
                             }
+                            // Restore consumer-group state. Pending entries and
+                            // consumer names are not preserved (PEL would require
+                            // XCLAIM replay); only the group's last_delivered_id
+                            // is restored, which is sufficient to resume reads at
+                            // the correct offset.
+                            for (group_name, group) in &entries.groups {
+                                let cg_args = vec![
+                                    Resp::bulk_str("XGROUP"),
+                                    Resp::bulk_str("CREATE"),
+                                    Resp::bulk(key_bytes.clone()),
+                                    Resp::bulk(Bytes::copy_from_slice(group_name)),
+                                    Resp::bulk_str(&group.last_delivered_id),
+                                ];
+                                w.write_all(&Resp::Array(Some(cg_args)).serialize())?;
+                            }
                             None // already written above
                         }
-                        _ => None, // empty or bitmap/hll — skip
+                        DataType::Bitmap(v) if !v.is_empty() => Some(Resp::Array(Some(vec![
+                            // Bitmaps are stored as raw bytes. Re-emit them as a
+                            // string so GETBIT/SETBIT continue to work after replay
+                            // (those commands accept both String and Bitmap).
+                            Resp::bulk_str("SET"),
+                            Resp::bulk(key_bytes.clone()),
+                            Resp::bulk(Bytes::copy_from_slice(v)),
+                        ]))),
+                        DataType::HyperLogLog(v) if !v.is_empty() => Some(Resp::Array(Some(
+                            // HyperLogLog registers are raw bytes. SET preserves them;
+                            // PFCOUNT/PFADD accept both HyperLogLog and String types
+                            // of the correct register-array length, so replay still
+                            // works correctly.
+                            vec![
+                                Resp::bulk_str("SET"),
+                                Resp::bulk(key_bytes.clone()),
+                                Resp::bulk(Bytes::copy_from_slice(v)),
+                            ],
+                        ))),
+                        DataType::Geo(g) if !g.members.is_empty() => {
+                            // Emit a single GEOADD with all (lon, lat, member)
+                            // triples to avoid one rewrite line per member.
+                            let mut args =
+                                vec![Resp::bulk_str("GEOADD"), Resp::bulk(key_bytes.clone())];
+                            for (member, pt) in &g.members {
+                                args.push(Resp::bulk_str(format!("{:.17}", pt.longitude)));
+                                args.push(Resp::bulk_str(format!("{:.17}", pt.latitude)));
+                                args.push(Resp::bulk(Bytes::copy_from_slice(member)));
+                            }
+                            Some(Resp::Array(Some(args)))
+                        }
+                        _ => None, // empty entries are skipped
                     };
 
                     if let Some(c) = cmd {

@@ -76,8 +76,20 @@ impl Resp {
 
     /// Serialize to RESP bytes
     pub fn serialize(&self) -> Bytes {
+        self.serialize_for_version(2)
+    }
+
+    /// Serialize to RESP bytes, respecting the negotiated protocol version.
+    ///
+    /// Differences between RESP2 and RESP3:
+    /// - RESP3 encodes null as `_\r\n`; RESP2 uses `$-1\r\n` (bulk) or
+    ///   `*-1\r\n` (array).
+    /// - RESP3 has native `Map`, `Set`, `Bool`, `Double`, `Push`. When a
+    ///   connection has negotiated RESP2 we degrade those to a sensible
+    ///   RESP2 equivalent so old clients still see meaningful replies.
+    pub fn serialize_for_version(&self, version: u8) -> Bytes {
         let mut buf = SegBuf::with_capacity(64);
-        self.write_to(&mut buf);
+        self.write_to_for_version(&mut buf, version);
         buf.finalize();
         if buf.segments.len() == 1 {
             buf.segments.pop().unwrap()
@@ -92,6 +104,10 @@ impl Resp {
     }
 
     pub fn write_to(&self, buf: &mut SegBuf) {
+        self.write_to_for_version(buf, 2);
+    }
+
+    pub fn write_to_for_version(&self, buf: &mut SegBuf, version: u8) {
         match self {
             Resp::SimpleString(s) => {
                 let b = buf.inner();
@@ -112,7 +128,11 @@ impl Resp {
                 b.put(&b"\r\n"[..]);
             }
             Resp::BulkString(None) => {
-                buf.inner().put(&b"$-1\r\n"[..]);
+                if version >= 3 {
+                    buf.inner().put(&b"_\r\n"[..]);
+                } else {
+                    buf.inner().put(&b"$-1\r\n"[..]);
+                }
             }
             Resp::BulkString(Some(data)) => {
                 let b = buf.inner();
@@ -123,7 +143,11 @@ impl Resp {
                 b.put(&b"\r\n"[..]);
             }
             Resp::Array(None) => {
-                buf.inner().put(&b"*-1\r\n"[..]);
+                if version >= 3 {
+                    buf.inner().put(&b"_\r\n"[..]);
+                } else {
+                    buf.inner().put(&b"*-1\r\n"[..]);
+                }
             }
             Resp::Array(Some(items)) => {
                 let b = buf.inner();
@@ -131,7 +155,7 @@ impl Resp {
                 put_usize(b, items.len());
                 b.put(&b"\r\n"[..]);
                 for item in items {
-                    item.write_to(buf);
+                    item.write_to_for_version(buf, version);
                 }
             }
             // ── RESP3 ─────────────────────────────────────────────────────────
@@ -139,43 +163,93 @@ impl Resp {
                 buf.inner().put(&b"_\r\n"[..]);
             }
             Resp::Bool(b) => {
-                let bf = buf.inner();
-                bf.put_u8(b'#');
-                bf.put_u8(if *b { b't' } else { b'f' });
-                bf.put(&b"\r\n"[..]);
+                if version >= 3 {
+                    let bf = buf.inner();
+                    bf.put_u8(b'#');
+                    bf.put_u8(if *b { b't' } else { b'f' });
+                    bf.put(&b"\r\n"[..]);
+                } else {
+                    let bf = buf.inner();
+                    bf.put_u8(b':');
+                    bf.put_u8(if *b { b'1' } else { b'0' });
+                    bf.put(&b"\r\n"[..]);
+                }
             }
             Resp::Double(d) => {
-                let b = buf.inner();
-                b.put_u8(b',');
-                b.put(format!("{}", d).as_bytes());
-                b.put(&b"\r\n"[..]);
+                if version >= 3 {
+                    let b = buf.inner();
+                    b.put_u8(b',');
+                    b.put(format!("{}", d).as_bytes());
+                    b.put(&b"\r\n"[..]);
+                } else {
+                    let s = format!("{}", d);
+                    let b = buf.inner();
+                    b.put_u8(b'$');
+                    put_usize(b, s.len());
+                    b.put(&b"\r\n"[..]);
+                    b.put(s.as_bytes());
+                    b.put(&b"\r\n"[..]);
+                }
             }
             Resp::Map(pairs) => {
-                let b = buf.inner();
-                b.put_u8(b'%');
-                put_usize(b, pairs.len());
-                b.put(&b"\r\n"[..]);
-                for (k, v) in pairs {
-                    k.write_to(buf);
-                    v.write_to(buf);
+                if version >= 3 {
+                    let b = buf.inner();
+                    b.put_u8(b'%');
+                    put_usize(b, pairs.len());
+                    b.put(&b"\r\n"[..]);
+                    for (k, v) in pairs {
+                        k.write_to_for_version(buf, version);
+                        v.write_to_for_version(buf, version);
+                    }
+                } else {
+                    // RESP2 fallback: flat array of [k1, v1, k2, v2, ...].
+                    let b = buf.inner();
+                    b.put_u8(b'*');
+                    put_usize(b, pairs.len() * 2);
+                    b.put(&b"\r\n"[..]);
+                    for (k, v) in pairs {
+                        k.write_to_for_version(buf, version);
+                        v.write_to_for_version(buf, version);
+                    }
                 }
             }
             Resp::Set(items) => {
-                let b = buf.inner();
-                b.put_u8(b'~');
-                put_usize(b, items.len());
-                b.put(&b"\r\n"[..]);
-                for item in items {
-                    item.write_to(buf);
+                if version >= 3 {
+                    let b = buf.inner();
+                    b.put_u8(b'~');
+                    put_usize(b, items.len());
+                    b.put(&b"\r\n"[..]);
+                    for item in items {
+                        item.write_to_for_version(buf, version);
+                    }
+                } else {
+                    let b = buf.inner();
+                    b.put_u8(b'*');
+                    put_usize(b, items.len());
+                    b.put(&b"\r\n"[..]);
+                    for item in items {
+                        item.write_to_for_version(buf, version);
+                    }
                 }
             }
             Resp::Push(items) => {
-                let b = buf.inner();
-                b.put_u8(b'>');
-                put_usize(b, items.len());
-                b.put(&b"\r\n"[..]);
-                for item in items {
-                    item.write_to(buf);
+                if version >= 3 {
+                    let b = buf.inner();
+                    b.put_u8(b'>');
+                    put_usize(b, items.len());
+                    b.put(&b"\r\n"[..]);
+                    for item in items {
+                        item.write_to_for_version(buf, version);
+                    }
+                } else {
+                    // RESP2 has no push frames; degrade to a regular array.
+                    let b = buf.inner();
+                    b.put_u8(b'*');
+                    put_usize(b, items.len());
+                    b.put(&b"\r\n"[..]);
+                    for item in items {
+                        item.write_to_for_version(buf, version);
+                    }
                 }
             }
             Resp::Raw(bytes) => {

@@ -18,15 +18,13 @@ fn get_or_create_list<'a>(
     db: &'a mut crate::store::Database,
     key: &[u8],
 ) -> Result<&'a mut VecDeque<Bytes>> {
-    if !db.contains_key(key) {
-        db.insert(key.to_vec(), Entry::new(DataType::List(VecDeque::new())));
-    }
-    match db.get_mut(key) {
-        Some(e) => match &mut e.value {
-            DataType::List(l) => Ok(l),
-            _ => Err(NexradeError::WrongType),
-        },
-        None => unreachable!(),
+    // Single HashMap lookup (via `get_or_insert_with`) instead of the old
+    // contains_key + insert + get_mut (up to 3 lookups) — matches
+    // get_or_create_hash/get_or_create_set/get_or_create_zset.
+    let entry = db.get_or_insert_with(key, || Entry::new(DataType::List(VecDeque::new())));
+    match &mut entry.value {
+        DataType::List(l) => Ok(l),
+        _ => Err(NexradeError::WrongType),
     }
 }
 
@@ -491,7 +489,7 @@ pub async fn cmd_lpos(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
             Some("RANK") => {
                 let r = get_i64(args, i + 1, "LPOS")?;
                 if r == 0 {
-                    return Err(NexradeError::Generic("ERR RANK can't be zero: use 1 to start from the first match, 2 from the second, ...".to_string()));
+                    return Err(NexradeError::Generic("RANK can't be zero: use 1 to start from the first match, 2 from the second, ...".to_string()));
                 }
                 rank = r;
                 i += 2;
@@ -578,6 +576,163 @@ pub async fn cmd_lpos(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     } else {
         Ok(results.into_iter().next().unwrap_or(Resp::null()))
     }
+}
+
+// ── LMPOP / BLMPOP ───────────────────────────────────────────────────────────
+
+/// `LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]`
+///
+/// Pops `count` elements from the first non-empty list among the given keys.
+/// Returns `[key, [popped...]]` or nil array if all keys are empty/missing.
+pub async fn cmd_lmpop(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    lmpop_once(db, args, db_index, None).await
+}
+
+/// `BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT count]`
+///
+/// Blocking variant — waits up to `timeout` seconds for any of the keys to
+/// receive a push.
+pub async fn cmd_blmpop(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    if args.len() < 5 {
+        return Err(NexradeError::WrongArity("blmpop".to_string()));
+    }
+    let timeout_secs = get_f64(args, 1, "BLMPOP")?;
+    let numkeys = parse_numkeys(args, 2, "BLMPOP")?;
+    let (keys, rest_start) = parse_keys(args, 3, numkeys, "BLMPOP")?;
+    let (left, count) = parse_lmpop_tail(&args[rest_start..], "BLMPOP")?;
+
+    // Fast path: try once before blocking.
+    if let Some(resp) = lmpop_attempt(db, db_index, &keys, left, count)? {
+        return Ok(resp);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let dur = if timeout_secs == 0.0 {
+            std::time::Duration::from_secs(u64::MAX)
+        } else {
+            std::time::Duration::from_secs_f64(timeout_secs)
+        };
+        match tokio::time::timeout(dur, async {
+            loop {
+                db.list_notify.notified().await;
+                if let Some(resp) = lmpop_attempt(db, db_index, &keys, left, count)? {
+                    return Ok::<Resp, NexradeError>(resp);
+                }
+            }
+        })
+        .await
+        {
+            Ok(resp) => Ok(resp?),
+            Err(_) => Ok(Resp::null_array()),
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (timeout_secs, left, count);
+        Ok(Resp::null_array())
+    }
+}
+
+async fn lmpop_once(
+    db: &Db,
+    args: &[Resp],
+    db_index: usize,
+    _block_ms: Option<u64>,
+) -> Result<Resp> {
+    if args.len() < 4 {
+        return Err(NexradeError::WrongArity("lmpop".to_string()));
+    }
+    let numkeys = parse_numkeys(args, 1, "LMPOP")?;
+    let (keys, rest_start) = parse_keys(args, 2, numkeys, "LMPOP")?;
+    let (left, count) = parse_lmpop_tail(&args[rest_start..], "LMPOP")?;
+    Ok(lmpop_attempt(db, db_index, &keys, left, count)?.unwrap_or_else(Resp::null_array))
+}
+
+fn lmpop_attempt(
+    db: &Db,
+    db_index: usize,
+    keys: &[Vec<u8>],
+    left: bool,
+    count: usize,
+) -> Result<Option<Resp>> {
+    for key in keys {
+        let mut store_db = db.store.db(db_index).write_for(key);
+        if let Some(entry) = store_db.get_mut(key) {
+            if let DataType::List(list) = &mut entry.value {
+                if list.is_empty() {
+                    continue;
+                }
+                let mut popped: Vec<Resp> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let v = if left {
+                        list.pop_front()
+                    } else {
+                        list.pop_back()
+                    };
+                    match v {
+                        Some(b) => popped.push(Resp::bulk(b)),
+                        None => break,
+                    }
+                }
+                return Ok(Some(Resp::array(vec![
+                    Resp::bulk(Bytes::copy_from_slice(key)),
+                    Resp::array(popped),
+                ])));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn parse_numkeys(args: &[Resp], idx: usize, cmd: &str) -> Result<usize> {
+    let n = get_i64(args, idx, cmd)?;
+    if n <= 0 {
+        return Err(NexradeError::Generic(
+            "numkeys should be greater than 0".to_string(),
+        ));
+    }
+    Ok(n as usize)
+}
+
+fn parse_keys(args: &[Resp], idx: usize, n: usize, cmd: &str) -> Result<(Vec<Vec<u8>>, usize)> {
+    if args.len() < idx + n {
+        return Err(NexradeError::WrongArity(cmd.to_string()));
+    }
+    let keys: Vec<Vec<u8>> = (idx..idx + n)
+        .map(|i| get_bytes_vec(args, i, cmd))
+        .collect::<Result<_>>()?;
+    Ok((keys, idx + n))
+}
+
+fn parse_lmpop_tail(args: &[Resp], cmd: &str) -> Result<(bool, usize)> {
+    if args.is_empty() {
+        return Err(NexradeError::WrongArity(cmd.to_string()));
+    }
+    let dir = get_str(args, 0, cmd)?.to_ascii_uppercase();
+    let left = match dir.as_str() {
+        "LEFT" => true,
+        "RIGHT" => false,
+        _ => return Err(NexradeError::Generic("syntax error".to_string())),
+    };
+    let mut count = 1usize;
+    let mut i = 1;
+    if i < args.len() && get_str(args, i, cmd)?.eq_ignore_ascii_case("COUNT") {
+        i += 1;
+        if i >= args.len() {
+            return Err(NexradeError::WrongArity(cmd.to_string()));
+        }
+        let n = get_i64(args, i, cmd)?;
+        if n < 0 {
+            return Err(NexradeError::Generic("value is out of range".to_string()));
+        }
+        count = n as usize;
+        i += 1;
+    }
+    if i != args.len() {
+        return Err(NexradeError::Generic("syntax error".to_string()));
+    }
+    Ok((left, count))
 }
 
 fn normalize_idx(idx: isize, len: isize) -> usize {

@@ -219,6 +219,79 @@ fn bench_shard_scaling(c: &mut Criterion) {
     g.finish();
 }
 
+// ── 7. Concurrent INCR — single hot key vs disjoint keys ─────────────────────
+//
+// The read-lock CAS fast path (`ShardedDatabase::incr_int`) exists to fix
+// single-hot-key contention: N threads all incrementing the *same* key used
+// to fully serialize on that key's shard write lock regardless of critical-
+// section length. `single_hot_key` measures that case directly. The sibling
+// `disjoint_keys` group is a sanity check that the common case (each thread
+// on its own key) is unaffected — it should scale the same way
+// `bench_concurrent_writes` already does.
+
+fn bench_concurrent_incr(c: &mut Criterion) {
+    const OPS: u64 = 10_000;
+    let mut g = c.benchmark_group("concurrent_incr_single_hot_key");
+    for &threads in &[1usize, 2, 4, 8, 16, 50] {
+        g.throughput(Throughput::Elements(OPS * threads as u64));
+        g.bench_with_input(
+            BenchmarkId::new("threads", threads),
+            &threads,
+            |b, &threads| {
+                b.iter(|| {
+                    let sdb = Arc::new(ShardedDatabase::new(16));
+                    // Promote once up front so every thread hits the fast
+                    // path from the first increment.
+                    sdb.incr_int(b"hot", 0).unwrap();
+                    let handles: Vec<_> = (0..threads)
+                        .map(|_| {
+                            let sdb = Arc::clone(&sdb);
+                            thread::spawn(move || {
+                                for _ in 0..OPS {
+                                    sdb.incr_int(b"hot", 1).unwrap();
+                                }
+                            })
+                        })
+                        .collect();
+                    for h in handles {
+                        h.join().unwrap();
+                    }
+                });
+            },
+        );
+    }
+    g.finish();
+
+    let mut g = c.benchmark_group("concurrent_incr_disjoint_keys");
+    for &threads in &[1usize, 2, 4, 8, 16, 50] {
+        g.throughput(Throughput::Elements(OPS * threads as u64));
+        g.bench_with_input(
+            BenchmarkId::new("threads", threads),
+            &threads,
+            |b, &threads| {
+                b.iter(|| {
+                    let sdb = Arc::new(ShardedDatabase::new(16));
+                    let handles: Vec<_> = (0..threads)
+                        .map(|t| {
+                            let sdb = Arc::clone(&sdb);
+                            thread::spawn(move || {
+                                let key = make_key(t as u64);
+                                for _ in 0..OPS {
+                                    sdb.incr_int(&key, 1).unwrap();
+                                }
+                            })
+                        })
+                        .collect();
+                    for h in handles {
+                        h.join().unwrap();
+                    }
+                });
+            },
+        );
+    }
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_set,
@@ -227,5 +300,6 @@ criterion_group!(
     bench_concurrent_reads,
     bench_rename,
     bench_shard_scaling,
+    bench_concurrent_incr,
 );
 criterion_main!(benches);

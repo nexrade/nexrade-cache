@@ -37,6 +37,12 @@ pub enum NexradeError {
     #[error("ERR {0}")]
     Generic(String),
 
+    /// Wraps an error whose `Display` already includes its own reply-code
+    /// prefix (e.g. `WRONGPASS ...`, `NOPERM ...`) — unlike `Generic`,
+    /// this does NOT prepend `ERR `.
+    #[error("{0}")]
+    Prefixed(String),
+
     #[error("EXECABORT Transaction discarded because of previous errors")]
     ExecAbort,
 

@@ -4,7 +4,7 @@
 //! to perform Redis-compatible PSYNC-based replication.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -50,6 +50,18 @@ pub struct ReplicationState {
     pub primary_link_up: AtomicBool,
     /// Monotonically increasing replica ID counter.
     next_replica_id: AtomicU64,
+    /// Atomic mirror of `*role.read() == ReplicationRole::Replica`, kept in
+    /// sync by `set_role`/`set_replica`/`set_primary` — the only ways
+    /// `role` is ever mutated. Lets the hot command-dispatch path do a
+    /// single atomic load instead of taking `role`'s RwLock on every
+    /// command (see `is_replica_fast`).
+    is_replica_flag: AtomicBool,
+    /// Atomic mirror of the number of live replica subscribers to
+    /// `propagate_tx`, kept in sync by `register_replica`/`unregister_replica`
+    /// (the only places replicas are added/removed). Lets the write path
+    /// skip `propagate_tx.receiver_count()`, which takes a `Mutex` lock
+    /// internally, when there are no replicas connected (the common case).
+    propagate_subscribers: AtomicUsize,
 }
 
 impl ReplicationState {
@@ -66,6 +78,8 @@ impl ReplicationState {
             replica_notify: Arc::new(Notify::new()),
             primary_link_up: AtomicBool::new(false),
             next_replica_id: AtomicU64::new(1),
+            is_replica_flag: AtomicBool::new(false),
+            propagate_subscribers: AtomicUsize::new(0),
         })
     }
 
@@ -75,13 +89,43 @@ impl ReplicationState {
     }
 
     /// Returns `true` when this server is currently acting as a replica.
+    /// Takes `role`'s RwLock — prefer `is_replica_fast` on the hot
+    /// command-dispatch path.
     pub fn is_replica(&self) -> bool {
         *self.role.read() == ReplicationRole::Replica
+    }
+
+    /// Fast, lock-free check of the atomic mirror kept in sync by
+    /// `set_role`. Use this instead of `is_replica()` in per-command hot
+    /// paths — a single `Acquire` load instead of a parking_lot
+    /// RwLockReadGuard.
+    #[inline]
+    pub fn is_replica_fast(&self) -> bool {
+        self.is_replica_flag.load(Ordering::Acquire)
+    }
+
+    /// Set the role, keeping the atomic mirror (`is_replica_flag`) in sync.
+    /// This is the only path that should mutate `role` — direct
+    /// `*role.write() = ...` bypasses the mirror and reintroduces the
+    /// per-command lock cost this exists to avoid.
+    pub fn set_role(&self, role: ReplicationRole) {
+        let is_replica = role == ReplicationRole::Replica;
+        *self.role.write() = role;
+        self.is_replica_flag.store(is_replica, Ordering::Release);
     }
 
     /// Subscribe a new receiver to the write-propagation broadcast channel.
     pub fn subscribe_propagation(&self) -> Option<broadcast::Receiver<bytes::Bytes>> {
         self.propagate_tx.as_ref().map(|tx| tx.subscribe())
+    }
+
+    /// Number of live replica subscribers, per the atomic mirror kept in
+    /// sync by `register_replica`/`unregister_replica`. Use this instead
+    /// of `propagate_tx.receiver_count()` (which takes a `Mutex` lock
+    /// internally) on the per-write hot path.
+    #[inline]
+    pub fn propagate_subscriber_count(&self) -> usize {
+        self.propagate_subscribers.load(Ordering::Acquire)
     }
 
     /// Add a replica to the connected list; returns the assigned replica ID.
@@ -92,12 +136,18 @@ impl ReplicationState {
             addr,
             offset: 0,
         });
+        self.propagate_subscribers.fetch_add(1, Ordering::AcqRel);
         id
     }
 
     /// Remove a replica from the connected list.
     pub fn unregister_replica(&self, id: u64) {
-        self.connected_replicas.write().retain(|r| r.id != id);
+        let mut replicas = self.connected_replicas.write();
+        let before = replicas.len();
+        replicas.retain(|r| r.id != id);
+        if replicas.len() < before {
+            self.propagate_subscribers.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     /// Update the acknowledged offset for a replica.

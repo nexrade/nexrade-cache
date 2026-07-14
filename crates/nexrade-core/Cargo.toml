@@ -31,8 +31,23 @@ bincode = { workspace = true }
 futures = { workspace = true }
 uuid = { workspace = true }
 
+# SHA-256 for ACL password hashing; hex for encoding.
+sha2 = "0.10"
+hex = "0.4"
+
+# Fast integer-to-string formatting for the INCR/DECR hot path — avoids the
+# allocation + UTF-8 validation `i64::to_string()` does internally.
+itoa = "1.0.17"
+
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [[bench]]
 name = "store_bench"

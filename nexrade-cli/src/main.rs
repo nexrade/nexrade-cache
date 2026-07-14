@@ -23,7 +23,7 @@ mod windows_svc;
 
 use anyhow::Result;
 use clap::Parser;
-use tracing::{info, warn};
+use tracing::info;
 
 use nexrade_core::db::{Db, ServerConfig};
 use nexrade_metrics::{init_tracing, Metrics, MetricsServer};
@@ -32,7 +32,7 @@ use nexrade_server::Listener;
 #[derive(Parser, Debug)]
 #[command(
     name = "nexrade-cache",
-    version = "0.1.0",
+    version = "0.2.0",
     author = "Nexrade Contributors",
     about = "High-performance Redis-compatible cache — with TLS, Lua, WASM, plugins, and built-in metrics"
 )]
@@ -184,7 +184,39 @@ fn config_from_cli(cli: &Cli) -> Result<ServerConfig> {
         config.timeout = timeout;
     }
 
+    // Relative RDB/AOF paths (the default `rdb_path` is just "nexrade.rdb")
+    // resolve against the current working directory, which is whatever
+    // directory the shell happened to be in when the process was launched
+    // — e.g. `C:\Windows\System32` for an Admin-elevated prompt on Windows,
+    // or wherever a service manager's default CWD is. Anchor them to the
+    // executable's own directory instead, so the save file always lands
+    // next to the binary regardless of how/where it was launched.
+    if let Some(ref rdb_path) = config.persistence.rdb_path {
+        config.persistence.rdb_path = Some(resolve_persistence_path(rdb_path));
+    }
+    if let Some(ref aof_path) = config.persistence.aof_path {
+        config.persistence.aof_path = Some(resolve_persistence_path(aof_path));
+    }
+
     Ok(config)
+}
+
+/// Resolve a possibly-relative persistence file path against the directory
+/// containing the running executable. Absolute paths (including ones the
+/// user explicitly passed via `--rdb-path`/`--aof-path` or a config file)
+/// are returned unchanged — this only affects the relative default.
+fn resolve_persistence_path(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        return path.to_string();
+    }
+    match std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.to_path_buf()))
+    {
+        Some(dir) => dir.join(p).to_string_lossy().into_owned(),
+        None => path.to_string(),
+    }
 }
 
 /// Start the server with the given config.  Called from both `main()` and the
@@ -209,21 +241,10 @@ pub(crate) async fn start_server(config: ServerConfig) -> Result<()> {
         None
     };
 
-    // Start TLS listener if enabled
-    if config.tls_enabled {
-        if let (Some(cert), Some(_key)) = (&config.tls_cert, &config.tls_key) {
-            let tls_port = config.tls_port.unwrap_or(6380);
-            info!(
-                "TLS listener will start on port {} (cert: {})",
-                tls_port, cert
-            );
-            // TLS listener would be started here using nexrade-tls crate
-        } else {
-            warn!("TLS enabled but tls-cert or tls-key not set, TLS listener skipped");
-        }
-    }
-
-    // Start the main TCP server
+    // Start the main TCP server. `Listener::run` also starts a second,
+    // TLS-upgraded accept loop on `tls_port` when `config.tls_enabled` is
+    // set (see `nexrade_server::listener`) — both listeners run
+    // concurrently and share the same shutdown signal.
     let listener = Listener::new(db, metrics);
     listener.run().await?;
 
@@ -238,7 +259,7 @@ pub(crate) async fn run_server_default() -> Result<()> {
     start_server(config).await
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -396,13 +417,19 @@ fn print_banner(config: &ServerConfig) {
     ██║╚██╗██║██╔══╝   ██╔██╗ ██╔══██╗██╔══██║██║  ██║██╔══╝
     ██║ ╚████║███████╗██╔╝ ██╗██║  ██║██║  ██║██████╔╝███████╗
     ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚══════╝
-                    cache  v0.1.0  |  Redis-compatible
+                    cache  v{}  |  Redis-compatible
 
     Listening on   {}:{}
     Databases      {}
     TLS            {}
     Metrics        http://{}:{}/metrics
     "#,
+        // CARGO_PKG_VERSION is the workspace version (from
+        // `[workspace.package].version` propagated via
+        // `version.workspace = true` in our Cargo.toml), so the banner
+        // stays in sync with `nexrade-cli --version` and the actual
+        // release artifact.
+        env!("CARGO_PKG_VERSION"),
         config.bind,
         config.port,
         config.databases,

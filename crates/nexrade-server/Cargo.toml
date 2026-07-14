@@ -8,13 +8,14 @@ description = "Async TCP server for nexrade-cache — Redis-compatible protocol"
 
 [features]
 default = ["tls"]
-tls = ["nexrade-tls"]
+tls = ["nexrade-tls", "tokio-rustls"]
 
 [dependencies]
 nexrade-core = { path = "../nexrade-core" }
 nexrade-lua = { path = "../nexrade-lua" }
 nexrade-metrics = { path = "../nexrade-metrics" }
 nexrade-tls = { path = "../nexrade-tls", optional = true }
+tokio-rustls = { workspace = true, optional = true }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -28,3 +29,12 @@ tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
 bincode = { workspace = true }
+
+[dev-dependencies]
+# Client-side TLS for the end-to-end TLS listener test — trusts the
+# self-signed test cert via a custom `ServerCertVerifier` instead of the
+# platform root store.
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

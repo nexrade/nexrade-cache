@@ -14,8 +14,59 @@ use crate::types::{
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn next_stream_id() -> String {
-    format!("{}-0", now_ms())
+/// Stream entry id parsed into its (milliseconds, sequence) numeric components.
+///
+/// Redis stores IDs as `<ms>-<seq>` and compares them as numbers — `10-0` is
+/// strictly greater than `2-0`. Previously this module compared the raw string
+/// lex order, which silently mis-ordered entries whenever the ms parts had
+/// different digit counts (e.g. `9-0 > 10-0` was wrongly true).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StreamId(pub u64, pub u64);
+
+impl StreamId {
+    pub const MIN: StreamId = StreamId(0, 0);
+    pub const MAX: StreamId = StreamId(u64::MAX, u64::MAX);
+
+    /// Parse a Redis-formatted id (`ms-seq`). Returns None on malformed input.
+    pub fn parse(s: &str) -> Option<Self> {
+        let (ms, seq) = s.split_once('-')?;
+        let ms: u64 = ms.parse().ok()?;
+        let seq: u64 = seq.parse().ok()?;
+        Some(StreamId(ms, seq))
+    }
+
+    /// Render back to the Redis wire format.
+    pub fn to_wire(self) -> String {
+        format!("{}-{}", self.0, self.1)
+    }
+}
+
+/// Parse a Redis stream-id range bound. `-` becomes MIN (inclusive start),
+/// `+` becomes MAX (inclusive end), `$` becomes MAX (XREAD "last entry").
+fn parse_id_bound(s: &str, is_start: bool, allow_dollar: bool) -> Result<StreamId> {
+    if is_start && s == "-" {
+        return Ok(StreamId::MIN);
+    }
+    if (is_start || allow_dollar) && s == "$" {
+        return Ok(StreamId::MAX);
+    }
+    if !is_start && s == "+" {
+        return Ok(StreamId::MAX);
+    }
+    StreamId::parse(s).ok_or_else(|| {
+        NexradeError::Generic(
+            "ERR Invalid stream ID specified as stream command argument".to_string(),
+        )
+    })
+}
+
+/// Largest parsed id in the stream, or None if empty / all entries are
+/// malformed. Used for `XADD ... ms-*` validation.
+fn last_parsed_id(s: &StreamData) -> Option<StreamId> {
+    s.entries
+        .iter()
+        .filter_map(|e| StreamId::parse(&e.id))
+        .max()
 }
 
 fn format_stream_entry(entry: &StreamEntry) -> Resp {
@@ -54,11 +105,6 @@ pub async fn cmd_xadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     }
     let key = get_bytes_vec(args, 1, "XADD")?;
     let id_str = get_str(args, 2, "XADD")?;
-    let id = if id_str == "*" {
-        next_stream_id()
-    } else {
-        id_str.to_string()
-    };
 
     let mut fields = Vec::new();
     let mut i = 3;
@@ -69,6 +115,31 @@ pub async fn cmd_xadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
         ));
         i += 2;
     }
+
+    // Pre-read stream to compute the auto-id under the lock-free path.
+    let last = {
+        let sdb = db.store.db(db_index).read_for(&key);
+        sdb.get_ro(&key).and_then(|e| match &e.value {
+            DataType::Stream(s) => last_parsed_id(s),
+            _ => None,
+        })
+    };
+
+    let id = if id_str == "*" {
+        // Auto-id: ms = now, seq = 0 (or higher if another entry already
+        // landed in this same ms).
+        let ms = now_ms();
+        let seq = match last {
+            Some(StreamId(lm, ls)) if lm == ms => ls + 1,
+            _ => 0,
+        };
+        StreamId(ms, seq).to_wire()
+    } else {
+        // Explicit id may be `ms-seq`, `ms-*`, or `*-seq`.
+        let resolved = resolve_xadd_id(id_str, last)?;
+        resolved.to_wire()
+    };
+
     let entry = StreamEntry {
         id: id.clone(),
         fields,
@@ -77,7 +148,69 @@ pub async fn cmd_xadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     let mut store_db = db.store.db(db_index).write_for(&key);
     let stream = get_stream_mut!(store_db, key);
     stream.entries.push(entry);
+
+    // Wake any XREAD/XREADGROUP BLOCK callers waiting on this shard. The
+    // re-check inside their wait loop filters by key, so cross-stream
+    // wakeups are harmless.
+    #[cfg(not(target_arch = "wasm32"))]
+    db.stream_notify.notify_waiters();
+
     Ok(Resp::bulk_str(id))
+}
+
+/// Resolve an explicit `XADD` id spec into a concrete numeric `StreamId`.
+/// Spec forms accepted: `ms-seq`, `ms-*` (auto-seq), `*-seq` (auto-ms).
+fn resolve_xadd_id(spec: &str, last: Option<StreamId>) -> Result<StreamId> {
+    let (ms_part, seq_part) = spec.split_once('-').ok_or_else(|| {
+        NexradeError::Generic(
+            "ERR Invalid stream ID specified as stream command argument".to_string(),
+        )
+    })?;
+
+    let ms_now = now_ms();
+    let ms: u64 = if ms_part == "*" {
+        // Auto-ms: if last entry is from the current ms, must match it;
+        // otherwise use now.
+        match last {
+            Some(StreamId(lm, _)) if lm >= ms_now => lm,
+            _ => ms_now,
+        }
+    } else {
+        ms_part.parse().map_err(|_| {
+            NexradeError::Generic(
+                "ERR Invalid stream ID specified as stream command argument".to_string(),
+            )
+        })?
+    };
+
+    let seq: u64 = if seq_part == "*" {
+        match last {
+            Some(StreamId(lm, ls)) if lm == ms => ls + 1,
+            _ => 0,
+        }
+    } else {
+        seq_part.parse().map_err(|_| {
+            NexradeError::Generic(
+                "ERR Invalid stream ID specified as stream command argument".to_string(),
+            )
+        })?
+    };
+
+    let id = StreamId(ms, seq);
+    if let Some(prev) = last {
+        if id <= prev {
+            return Err(NexradeError::Generic(
+                "ERR The ID specified in XADD is equal or smaller than the target stream top item"
+                    .to_string(),
+            ));
+        }
+    } else if ms == 0 && seq == 0 {
+        // Redis disallows `0-0` as the very first entry in a stream.
+        return Err(NexradeError::Generic(
+            "ERR The ID specified in XADD must be greater than 0-0".to_string(),
+        ));
+    }
+    Ok(id)
 }
 
 // ── XLEN ─────────────────────────────────────────────────────────────────────
@@ -104,8 +237,8 @@ pub async fn cmd_xrange(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
         return Err(NexradeError::WrongArity("xrange".to_string()));
     }
     let key = get_bytes_vec(args, 1, "XRANGE")?;
-    let start = get_str(args, 2, "XRANGE")?;
-    let end = get_str(args, 3, "XRANGE")?;
+    let start_raw = get_str(args, 2, "XRANGE")?;
+    let end_raw = get_str(args, 3, "XRANGE")?;
     let count = if args.len() >= 6 && get_str(args, 4, "XRANGE")?.to_uppercase() == "COUNT" {
         let n = get_i64(args, 5, "XRANGE")?;
         if n < 0 {
@@ -118,6 +251,9 @@ pub async fn cmd_xrange(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
         None
     };
 
+    let start = parse_id_bound(start_raw, true, false)?;
+    let end = parse_id_bound(end_raw, false, false)?;
+
     let mut store_db = db.store.db(db_index).write_for(&key);
     match store_db.get(&key) {
         None => Ok(Resp::array(vec![])),
@@ -126,9 +262,9 @@ pub async fn cmd_xrange(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
                 let entries: Vec<Resp> = s
                     .entries
                     .iter()
-                    .filter(|e| {
-                        (start == "-" || e.id.as_str() >= start)
-                            && (end == "+" || e.id.as_str() <= end)
+                    .filter(|e| match StreamId::parse(&e.id) {
+                        Some(id) => id >= start && id <= end,
+                        None => false,
                     })
                     .take(count.unwrap_or(usize::MAX))
                     .map(format_stream_entry)
@@ -147,8 +283,8 @@ pub async fn cmd_xrevrange(db: &Db, args: &[Resp], db_index: usize) -> Result<Re
         return Err(NexradeError::WrongArity("xrevrange".to_string()));
     }
     let key = get_bytes_vec(args, 1, "XREVRANGE")?;
-    let end = get_str(args, 2, "XREVRANGE")?;
-    let start = get_str(args, 3, "XREVRANGE")?;
+    let end_raw = get_str(args, 2, "XREVRANGE")?;
+    let start_raw = get_str(args, 3, "XREVRANGE")?;
     let count = if args.len() >= 6 && get_str(args, 4, "XREVRANGE")?.to_uppercase() == "COUNT" {
         let n = get_i64(args, 5, "XREVRANGE")?;
         if n < 0 {
@@ -161,6 +297,10 @@ pub async fn cmd_xrevrange(db: &Db, args: &[Resp], db_index: usize) -> Result<Re
         None
     };
 
+    // XREVRANGE swaps start/end argument order but keeps the inclusive semantics.
+    let start = parse_id_bound(start_raw, true, false)?;
+    let end = parse_id_bound(end_raw, false, false)?;
+
     let mut store_db = db.store.db(db_index).write_for(&key);
     match store_db.get(&key) {
         None => Ok(Resp::array(vec![])),
@@ -169,9 +309,9 @@ pub async fn cmd_xrevrange(db: &Db, args: &[Resp], db_index: usize) -> Result<Re
                 let mut entries: Vec<Resp> = s
                     .entries
                     .iter()
-                    .filter(|e| {
-                        (start == "-" || e.id.as_str() >= start)
-                            && (end == "+" || e.id.as_str() <= end)
+                    .filter(|e| match StreamId::parse(&e.id) {
+                        Some(id) => id >= start && id <= end,
+                        None => false,
                     })
                     .take(count.unwrap_or(usize::MAX))
                     .map(format_stream_entry)
@@ -192,6 +332,7 @@ pub async fn cmd_xread(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
     }
     let mut i = 1;
     let mut count: Option<usize> = None;
+    let mut block_ms: Option<u64> = None;
 
     while i < args.len() {
         let opt = get_str(args, i, "XREAD")?.to_uppercase();
@@ -204,6 +345,17 @@ pub async fn cmd_xread(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
                     ));
                 }
                 count = Some(n as usize);
+                i += 2;
+            }
+            "BLOCK" => {
+                let ms = get_i64(args, i + 1, "XREAD")?;
+                if ms < 0 {
+                    return Err(NexradeError::Generic(
+                        "ERR value is out of range".to_string(),
+                    ));
+                }
+                // 0 means "block forever" — represent as u64::MAX sentinel.
+                block_ms = Some(if ms == 0 { u64::MAX } else { ms as u64 });
                 i += 2;
             }
             "STREAMS" => {
@@ -221,31 +373,96 @@ pub async fn cmd_xread(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
         return Err(NexradeError::WrongArity("xread".to_string()));
     }
     let num_streams = remaining / 2;
-    let mut results = Vec::new();
 
+    // Collect requested keys and cursor ids once (errors fail fast).
+    let mut key_specs: Vec<(Vec<u8>, StreamId)> = Vec::with_capacity(num_streams);
     for j in 0..num_streams {
         let key = get_bytes_vec(args, i + j, "XREAD")?;
-        let last_id = get_str(args, i + num_streams + j, "XREAD")?;
-        let mut store_db = db.store.db(db_index).write_for(&key);
-        let entries: Vec<Resp> = match store_db.get(&key) {
-            None => vec![],
-            Some(e) => match &e.value {
-                DataType::Stream(s) => s
-                    .entries
-                    .iter()
-                    .filter(|e| e.id.as_str() > last_id)
-                    .take(count.unwrap_or(usize::MAX))
-                    .map(format_stream_entry)
-                    .collect(),
-                _ => return Err(NexradeError::WrongType),
-            },
-        };
-        results.push(Resp::array(vec![
-            Resp::bulk(Bytes::from(key)),
-            Resp::array(entries),
-        ]));
+        let last_id_raw = get_str(args, i + num_streams + j, "XREAD")?;
+        // XREAD supports `-`, `+`, `$`, or any concrete `<ms>-<seq>`.
+        let last_id = parse_id_bound(last_id_raw, true, true)?;
+        key_specs.push((key, last_id));
     }
-    Ok(Resp::array(results))
+
+    let snapshot = || -> Result<Resp> {
+        let mut results = Vec::with_capacity(key_specs.len());
+        for (key, last_id) in &key_specs {
+            let mut store_db = db.store.db(db_index).write_for(key);
+            let entries: Vec<Resp> = match store_db.get(key) {
+                None => vec![],
+                Some(e) => match &e.value {
+                    DataType::Stream(s) => s
+                        .entries
+                        .iter()
+                        .filter(|e| match StreamId::parse(&e.id) {
+                            Some(id) => id > *last_id,
+                            None => false,
+                        })
+                        .take(count.unwrap_or(usize::MAX))
+                        .map(format_stream_entry)
+                        .collect(),
+                    _ => return Err(NexradeError::WrongType),
+                },
+            };
+            results.push(Resp::array(vec![
+                Resp::bulk(Bytes::from(key.clone())),
+                Resp::array(entries),
+            ]));
+        }
+        Ok(Resp::array(results))
+    };
+
+    // Fast path: no BLOCK requested, or we already have entries on first read.
+    let initial = snapshot()?;
+    if block_ms.is_none() || has_entries(&initial) {
+        return Ok(initial);
+    }
+
+    // Block until something arrives or the timeout elapses.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let timeout_dur = std::time::Duration::from_millis(block_ms.unwrap());
+        match tokio::time::timeout(timeout_dur, async {
+            loop {
+                db.stream_notify.notified().await;
+                let snap = snapshot()?;
+                if has_entries(&snap) {
+                    return Ok::<Resp, NexradeError>(snap);
+                }
+            }
+        })
+        .await
+        {
+            Ok(resp) => Ok(resp?),
+            Err(_) => Ok(Resp::null_array()),
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = block_ms;
+        Ok(Resp::null_array())
+    }
+}
+
+/// True if `XREAD` reply contains at least one entry (per-stream).
+fn has_entries(reply: &Resp) -> bool {
+    let Resp::Array(Some(streams)) = reply else {
+        return false;
+    };
+    for stream in streams {
+        let Resp::Array(Some(parts)) = stream else {
+            continue;
+        };
+        if parts.len() < 2 {
+            continue;
+        }
+        if let Resp::Array(Some(entries)) = &parts[1] {
+            if !entries.is_empty() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ── XTRIM ────────────────────────────────────────────────────────────────────
@@ -505,7 +722,7 @@ async fn xgroup_delconsumer(db: &Db, args: &[Resp], db_index: usize) -> Result<R
 // ── XREADGROUP ───────────────────────────────────────────────────────────────
 
 pub async fn cmd_xreadgroup(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
-    // XREADGROUP GROUP group consumer [COUNT n] [NOACK] STREAMS key id
+    // XREADGROUP GROUP group consumer [COUNT n] [BLOCK ms] [NOACK] STREAMS key id
     if args.len() < 7 {
         return Err(NexradeError::WrongArity("xreadgroup".to_string()));
     }
@@ -518,11 +735,22 @@ pub async fn cmd_xreadgroup(db: &Db, args: &[Resp], db_index: usize) -> Result<R
     let mut i = 4;
     let mut count: Option<usize> = None;
     let mut noack = false;
+    let mut block_ms: Option<u64> = None;
     while i < args.len() {
         let opt = get_str(args, i, "XREADGROUP")?.to_uppercase();
         match opt.as_str() {
             "COUNT" => {
                 count = Some(get_i64(args, i + 1, "XREADGROUP")? as usize);
+                i += 2;
+            }
+            "BLOCK" => {
+                let ms = get_i64(args, i + 1, "XREADGROUP")?;
+                if ms < 0 {
+                    return Err(NexradeError::Generic(
+                        "ERR value is out of range".to_string(),
+                    ));
+                }
+                block_ms = Some(if ms == 0 { u64::MAX } else { ms as u64 });
                 i += 2;
             }
             "NOACK" => {
@@ -544,97 +772,151 @@ pub async fn cmd_xreadgroup(db: &Db, args: &[Resp], db_index: usize) -> Result<R
         return Err(NexradeError::WrongArity("xreadgroup".to_string()));
     }
     let num_streams = remaining / 2;
-    let mut results = Vec::new();
 
+    let mut key_specs: Vec<(Vec<u8>, String)> = Vec::with_capacity(num_streams);
     for j in 0..num_streams {
         let key = get_bytes_vec(args, i + j, "XREADGROUP")?;
-        let id = get_str(args, i + num_streams + j, "XREADGROUP")?;
+        let id = get_str(args, i + num_streams + j, "XREADGROUP")?.to_string();
+        key_specs.push((key, id));
+    }
+
+    // Synchronous attempt. Pending-id re-delivery (`> {id}`) never blocks, so
+    // we only need to gate the "new entries" path on BLOCK.
+    let read_once = |key_specs: &[(Vec<u8>, String)]| -> Result<Resp> {
+        let mut results = Vec::with_capacity(key_specs.len());
         let now = now_ms();
+        for (key, id) in key_specs {
+            let mut store_db = db.store.db(db_index).write_for(key);
+            let entries_resp: Vec<Resp> = match store_db.get_mut(key) {
+                None => vec![],
+                Some(e) => match &mut e.value {
+                    DataType::Stream(s) => {
+                        let g = s.groups.get_mut(&group).ok_or_else(|| {
+                            NexradeError::Prefixed("NOGROUP No such consumer group".to_string())
+                        })?;
 
-        let mut store_db = db.store.db(db_index).write_for(&key);
-        let entries_resp: Vec<Resp> = match store_db.get_mut(&key) {
-            None => vec![],
-            Some(e) => match &mut e.value {
-                DataType::Stream(s) => {
-                    let g = s.groups.get_mut(&group).ok_or_else(|| {
-                        NexradeError::Generic("-NOGROUP No such consumer group".to_string())
-                    })?;
+                        g.consumers
+                            .entry(consumer.clone())
+                            .or_insert_with(|| Consumer {
+                                name: consumer.clone(),
+                                pending_ids: vec![],
+                            });
 
-                    // Ensure consumer exists
-                    g.consumers
-                        .entry(consumer.clone())
-                        .or_insert_with(|| Consumer {
-                            name: consumer.clone(),
-                            pending_ids: vec![],
-                        });
-
-                    let to_deliver: Vec<StreamEntry> = if id == ">" {
-                        // Deliver new entries after last_delivered_id
-                        let last = g.last_delivered_id.clone();
-                        let entries: Vec<_> = s
-                            .entries
-                            .iter()
-                            .filter(|e| e.id.as_str() > last.as_str())
-                            .take(count.unwrap_or(usize::MAX))
-                            .cloned()
-                            .collect();
-                        if let Some(last_entry) = entries.last() {
-                            g.last_delivered_id = last_entry.id.clone();
-                        }
-                        entries
-                    } else {
-                        // Re-deliver pending entries for this consumer with id > given id
-                        let consumer_pending: Vec<String> = g
-                            .consumers
-                            .get(&consumer)
-                            .map(|c| {
-                                c.pending_ids
-                                    .iter()
-                                    .filter(|pid| pid.as_str() > id)
-                                    .cloned()
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        s.entries
-                            .iter()
-                            .filter(|e| consumer_pending.contains(&e.id))
-                            .take(count.unwrap_or(usize::MAX))
-                            .cloned()
-                            .collect()
-                    };
-
-                    if !noack {
-                        for entry in &to_deliver {
-                            let pending = PendingEntry {
-                                consumer: consumer.clone(),
-                                delivery_time_ms: now,
-                                delivery_count: g
-                                    .pending
-                                    .get(&entry.id)
-                                    .map(|p| p.delivery_count + 1)
-                                    .unwrap_or(1),
+                        let to_deliver: Vec<StreamEntry> = if id == ">" {
+                            let last = match StreamId::parse(&g.last_delivered_id) {
+                                Some(id) => id,
+                                None => StreamId::MIN,
                             };
-                            g.pending.insert(entry.id.clone(), pending);
-                            if let Some(c) = g.consumers.get_mut(&consumer) {
-                                if !c.pending_ids.contains(&entry.id) {
-                                    c.pending_ids.push(entry.id.clone());
+                            let entries: Vec<_> = s
+                                .entries
+                                .iter()
+                                .filter(|e| match StreamId::parse(&e.id) {
+                                    Some(id) => id > last,
+                                    None => false,
+                                })
+                                .take(count.unwrap_or(usize::MAX))
+                                .cloned()
+                                .collect();
+                            if let Some(last_entry) = entries.last() {
+                                g.last_delivered_id = last_entry.id.clone();
+                            }
+                            entries
+                        } else {
+                            let cursor = match StreamId::parse(id) {
+                                Some(id) => id,
+                                None => StreamId::MIN,
+                            };
+                            let consumer_pending: Vec<String> = g
+                                .consumers
+                                .get(&consumer)
+                                .map(|c| {
+                                    c.pending_ids
+                                        .iter()
+                                        .filter(|pid| {
+                                            StreamId::parse(pid)
+                                                .map(|pid| pid > cursor)
+                                                .unwrap_or(false)
+                                        })
+                                        .cloned()
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            s.entries
+                                .iter()
+                                .filter(|e| consumer_pending.contains(&e.id))
+                                .take(count.unwrap_or(usize::MAX))
+                                .cloned()
+                                .collect()
+                        };
+
+                        if !noack {
+                            for entry in &to_deliver {
+                                let pending = PendingEntry {
+                                    consumer: consumer.clone(),
+                                    delivery_time_ms: now,
+                                    delivery_count: g
+                                        .pending
+                                        .get(&entry.id)
+                                        .map(|p| p.delivery_count + 1)
+                                        .unwrap_or(1),
+                                };
+                                g.pending.insert(entry.id.clone(), pending);
+                                if let Some(c) = g.consumers.get_mut(&consumer) {
+                                    if !c.pending_ids.contains(&entry.id) {
+                                        c.pending_ids.push(entry.id.clone());
+                                    }
                                 }
                             }
                         }
+
+                        to_deliver.iter().map(format_stream_entry).collect()
                     }
+                    _ => return Err(NexradeError::WrongType),
+                },
+            };
 
-                    to_deliver.iter().map(format_stream_entry).collect()
-                }
-                _ => return Err(NexradeError::WrongType),
-            },
-        };
+            results.push(Resp::array(vec![
+                Resp::bulk(Bytes::from(key.clone())),
+                Resp::array(entries_resp),
+            ]));
+        }
+        Ok(Resp::array(results))
+    };
 
-        results.push(Resp::array(vec![
-            Resp::bulk(Bytes::from(key)),
-            Resp::array(entries_resp),
-        ]));
+    // We have to be careful: if any key uses `id == ">"`, an immediate read
+    // may legitimately return empty (no new entries yet) — that's the case
+    // we want to block on. Re-delivery reads (`id != ">"`) should never
+    // block.
+    let needs_blocking = block_ms.is_some() && key_specs.iter().any(|(_, id)| id == ">");
+
+    let initial = read_once(&key_specs)?;
+    if !needs_blocking || has_entries(&initial) {
+        return Ok(initial);
     }
-    Ok(Resp::array(results))
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let timeout_dur = std::time::Duration::from_millis(block_ms.unwrap());
+        match tokio::time::timeout(timeout_dur, async {
+            loop {
+                db.stream_notify.notified().await;
+                let snap = read_once(&key_specs)?;
+                if has_entries(&snap) {
+                    return Ok::<Resp, NexradeError>(snap);
+                }
+            }
+        })
+        .await
+        {
+            Ok(resp) => Ok(resp?),
+            Err(_) => Ok(Resp::null_array()),
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = block_ms;
+        Ok(Resp::null_array())
+    }
 }
 
 // ── XACK ─────────────────────────────────────────────────────────────────────
@@ -748,8 +1030,27 @@ pub async fn cmd_xpending(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
                         .pending
                         .iter()
                         .filter(|(id, _)| {
-                            (start == "-" || id.as_str() >= start)
-                                && (end == "+" || id.as_str() <= end)
+                            let parsed = StreamId::parse(id);
+                            let lo = if start == "-" {
+                                StreamId::MIN
+                            } else {
+                                match StreamId::parse(start) {
+                                    Some(v) => v,
+                                    None => StreamId::MIN,
+                                }
+                            };
+                            let hi = if end == "+" {
+                                StreamId::MAX
+                            } else {
+                                match StreamId::parse(end) {
+                                    Some(v) => v,
+                                    None => StreamId::MAX,
+                                }
+                            };
+                            match parsed {
+                                Some(id) => id >= lo && id <= hi,
+                                None => false,
+                            }
                         })
                         .filter(|(_, p)| {
                             consumer_filter

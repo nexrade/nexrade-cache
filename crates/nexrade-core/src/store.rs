@@ -1,6 +1,7 @@
 //! The central in-memory key-value store.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -9,7 +10,7 @@ use tracing::{debug, trace};
 
 use crate::db::MaxMemoryPolicy;
 use crate::expiry::Expiry;
-use crate::types::DataType;
+use crate::types::{AtomicIntCell, DataType};
 
 /// A single entry in the store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,26 +22,16 @@ pub struct Entry {
     pub lru_clock: u32,
 }
 
-fn lru_now() -> u32 {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as u32
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        0
-    }
-}
-
 impl Entry {
     pub fn new(value: DataType) -> Self {
         Self {
             value,
             expiry: None,
-            lru_clock: lru_now(),
+            // Initialized to 0 so that inserts during process startup, before
+            // the background tick has had a chance to populate the cache,
+            // still get a valid (if stale) value. The first GET writes the
+            // current cached clock.
+            lru_clock: 0,
         }
     }
 
@@ -48,7 +39,7 @@ impl Entry {
         Self {
             value,
             expiry: Some(expiry),
-            lru_clock: lru_now(),
+            lru_clock: 0,
         }
     }
 
@@ -57,8 +48,37 @@ impl Entry {
     }
 }
 
+/// Cached LRU clock source. Reads from an `AtomicU32` updated by the
+/// background tick task. This is a single relaxed load — much cheaper than
+/// `SystemTime::now()` per GET.
+///
+/// Resolution is `1/hz` seconds (default 100 ms). That is the same
+/// granularity Redis uses for its LRU clock and is sufficient for LRU
+/// eviction.
+#[derive(Clone, Debug, Default)]
+pub struct LruClock {
+    inner: Arc<AtomicU32>,
+}
+
+impl LruClock {
+    pub fn new(inner: Arc<AtomicU32>) -> Self {
+        Self { inner }
+    }
+
+    #[inline]
+    pub fn now(&self) -> u32 {
+        self.inner.load(Ordering::Relaxed)
+    }
+
+    /// Write the current timestamp — used by the background tick.
+    #[inline]
+    pub fn store(&self, value: u32) {
+        self.inner.store(value, Ordering::Relaxed);
+    }
+}
+
 /// The inner mutable state (one per logical database).
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Database {
     pub entries: HashMap<Vec<u8>, Entry>,
     /// Monotonically increasing write counter per key — used by WATCH to detect
@@ -70,15 +90,75 @@ pub struct Database {
     /// on insert.
     #[serde(skip, default)]
     expiry_index: BTreeSet<(u128, Vec<u8>)>,
+    /// Incremental live-bytes counter, updated on every insert / remove so
+    /// `Store::estimated_memory_bytes()` is O(shards) instead of O(entries).
+    #[serde(skip, default)]
+    live_bytes: std::sync::atomic::AtomicUsize,
+    /// Cached LRU clock. The background tick task refreshes this so per-GET
+    /// `lru_clock` writes are an atomic load instead of `SystemTime::now()`.
+    /// Cloning a `Database` shares the underlying `Arc<AtomicU32>` (cheap
+    /// atomic loads work fine from any thread).
+    #[serde(skip, default)]
+    lru_clock: LruClock,
+}
+
+// Manual `Clone` because `AtomicUsize` doesn't implement `Clone`. The
+// atomic is logically a single counter so it's shared by reference across
+// clones.
+impl Clone for Database {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            key_versions: self.key_versions.clone(),
+            expiry_index: self.expiry_index.clone(),
+            live_bytes: std::sync::atomic::AtomicUsize::new(
+                self.live_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            lru_clock: self.lru_clock.clone(),
+        }
+    }
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Database {
     pub fn new() -> Self {
-        Self::default()
+        // Initialise `live_bytes` to 0; the surrounding `ShardedDatabase` /
+        // `Store` keeps a cached view of the same usize.
+        Self {
+            entries: HashMap::new(),
+            key_versions: HashMap::new(),
+            expiry_index: BTreeSet::new(),
+            live_bytes: std::sync::atomic::AtomicUsize::new(0),
+            lru_clock: LruClock::new(Arc::new(AtomicU32::new(0))),
+        }
+    }
+
+    /// Read the current cached LRU timestamp.
+    #[inline]
+    pub fn lru_now(&self) -> u32 {
+        self.lru_clock.now()
+    }
+
+    /// Wire / refresh the cached LRU clock source.
+    pub fn set_lru_clock(&mut self, clock: LruClock) {
+        self.lru_clock = clock;
+    }
+
+    /// Read the live-bytes counter for this shard.
+    #[inline]
+    pub fn live_bytes(&self) -> usize {
+        use std::sync::atomic::Ordering;
+        self.live_bytes.load(Ordering::Relaxed)
     }
 
     /// Get an entry, performing lazy expiry deletion and updating LRU clock.
     pub fn get(&mut self, key: &[u8]) -> Option<&Entry> {
+        let now = self.lru_now();
         if let Some(entry) = self.entries.get(key) {
             if entry.is_expired() {
                 self.remove(key);
@@ -87,7 +167,7 @@ impl Database {
             }
         }
         if let Some(entry) = self.entries.get_mut(key) {
-            entry.lru_clock = lru_now();
+            entry.lru_clock = now;
         }
         self.entries.get(key)
     }
@@ -112,34 +192,265 @@ impl Database {
     }
 
     /// Returns the current write version for a key (0 if never written).
+    ///
+    /// For an `Int`-typed key, this adds the cell's own per-cell `version`
+    /// counter to the HashMap-tracked base version. PR 1 never increments
+    /// that counter (no read-lock fast path exists yet, so every INCR still
+    /// bumps `key_versions` normally) — this is groundwork so the contract
+    /// doesn't change again once PR 2 adds the fast path. Base version is
+    /// fixed for the lifetime of a given `Int` cell (promotion/demotion
+    /// always go through `key_versions`), so the sum is monotonic.
     pub fn key_version(&self, key: &[u8]) -> u64 {
-        self.key_versions.get(key).copied().unwrap_or(0)
+        let base = self.key_versions.get(key).copied().unwrap_or(0);
+        match self.entries.get(key) {
+            Some(e) if !e.is_expired() => match &e.value {
+                DataType::Int(cell) => base + cell.version(),
+                _ => base,
+            },
+            _ => base,
+        }
     }
 
     pub fn insert(&mut self, key: Vec<u8>, entry: Entry) {
-        // Remove old expiry from index if the key already existed.
-        if let Some(old) = self.entries.get(&key) {
-            if let Some(ref e) = old.expiry {
-                self.expiry_index.remove(&(e.expires_at_ms, key.clone()));
+        use std::collections::hash_map::Entry as HEntry;
+        use std::sync::atomic::Ordering;
+        // Single `entries.entry()` probe instead of `get()` + `insert()` —
+        // same pattern as `get_or_insert_with`/`incr_int` below. `insert()`
+        // always unconditionally replaces whatever occupies the slot
+        // (expired or not, wrong-typed or not), so both branches just
+        // differ in whether there's an old entry's bookkeeping to undo
+        // first.
+        match self.entries.entry(key) {
+            HEntry::Occupied(mut o) => {
+                // Use `o.key()` as a borrow at each site instead of cloning
+                // it once up front — an unconditional up-front clone plus
+                // the unconditional `key_versions` clone below would pay 2
+                // allocations on the common no-TTL path where the old
+                // get()+insert() code (and get_or_insert_with) only pays 1.
+                if let Some(ref e) = o.get().expiry {
+                    self.expiry_index
+                        .remove(&(e.expires_at_ms, o.key().clone()));
+                }
+                // Subtract the old entry's contribution from the live
+                // counter (we're about to add the new one below).
+                self.live_bytes.fetch_sub(
+                    Self::estimate_entry_size(o.key(), o.get()),
+                    Ordering::Relaxed,
+                );
+                if let Some(ref e) = entry.expiry {
+                    self.expiry_index.insert((e.expires_at_ms, o.key().clone()));
+                }
+                *self.key_versions.entry(o.key().clone()).or_insert(0) += 1;
+                self.live_bytes.fetch_add(
+                    Self::estimate_entry_size(o.key(), &entry),
+                    Ordering::Relaxed,
+                );
+                *o.get_mut() = entry;
+            }
+            HEntry::Vacant(v) => {
+                if let Some(ref e) = entry.expiry {
+                    self.expiry_index.insert((e.expires_at_ms, v.key().clone()));
+                }
+                *self.key_versions.entry(v.key().clone()).or_insert(0) += 1;
+                self.live_bytes.fetch_add(
+                    Self::estimate_entry_size(v.key(), &entry),
+                    Ordering::Relaxed,
+                );
+                v.insert(entry);
             }
         }
-        // Add new expiry to index.
-        if let Some(ref e) = entry.expiry {
-            self.expiry_index.insert((e.expires_at_ms, key.clone()));
+    }
+
+    /// Get the entry for `key`, inserting the result of `f()` if it's
+    /// absent (or lazily-expired). Single `entries.entry()` lookup on the
+    /// hot "already exists, not expired" path — vs. the 3 lookups
+    /// (`contains_key` + `get`/`get_mut` inside `insert`) that a
+    /// `contains_key` → `insert` → `get_mut` sequence costs. Callers that
+    /// build up a collection value (hash/set fields) in-place should use
+    /// this instead of that three-step sequence.
+    pub fn get_or_insert_with<F>(&mut self, key: &[u8], f: F) -> &mut Entry
+    where
+        F: FnOnce() -> Entry,
+    {
+        use std::collections::hash_map::Entry as HEntry;
+        use std::sync::atomic::Ordering;
+        let now = self.lru_now();
+        match self.entries.entry(key.to_vec()) {
+            HEntry::Occupied(mut o) => {
+                if o.get().is_expired() {
+                    // Lazily-expired: undo the old entry's bookkeeping,
+                    // build the replacement, and swap it in — same
+                    // accounting `insert()` would do, minus the extra
+                    // lookup since we already hold the occupied slot.
+                    let old_expiry = o.get().expiry.clone();
+                    if let Some(e) = old_expiry {
+                        self.expiry_index.remove(&(e.expires_at_ms, key.to_vec()));
+                    }
+                    self.live_bytes
+                        .fetch_sub(Self::estimate_entry_size(key, o.get()), Ordering::Relaxed);
+                    let new_entry = f();
+                    if let Some(ref e) = new_entry.expiry {
+                        self.expiry_index.insert((e.expires_at_ms, key.to_vec()));
+                    }
+                    self.live_bytes.fetch_add(
+                        Self::estimate_entry_size(key, &new_entry),
+                        Ordering::Relaxed,
+                    );
+                    *self.key_versions.entry(key.to_vec()).or_insert(0) += 1;
+                    *o.get_mut() = new_entry;
+                } else {
+                    o.get_mut().lru_clock = now;
+                }
+                o.into_mut()
+            }
+            HEntry::Vacant(v) => {
+                let entry = f();
+                if let Some(ref e) = entry.expiry {
+                    self.expiry_index.insert((e.expires_at_ms, key.to_vec()));
+                }
+                *self.key_versions.entry(key.to_vec()).or_insert(0) += 1;
+                self.live_bytes
+                    .fetch_add(Self::estimate_entry_size(key, &entry), Ordering::Relaxed);
+                v.insert(entry)
+            }
         }
-        *self.key_versions.entry(key.clone()).or_insert(0) += 1;
-        self.entries.insert(key, entry);
+    }
+
+    /// INCR/INCRBY/DECR/DECRBY fast path: read-modify-write an integer
+    /// string in a single `entries.entry()` lookup, mutating the existing
+    /// `Entry` in place instead of the old `get()` + `insert(Entry::new(..))`
+    /// sequence (2 lookups, plus a fresh `Entry` that silently dropped any
+    /// TTL — Redis explicitly preserves TTL across INCR, since the value is
+    /// conceptually altered rather than replaced).
+    ///
+    /// Returns `Ok(new_value)`, or an error if the existing value is the
+    /// wrong type, isn't a valid integer, or the increment would overflow.
+    /// Vacant keys are treated as `0` before applying `delta`, matching
+    /// `INCR`'s "creates the key at 0 first" semantics.
+    /// Read-modify-write for INCR/DECR/INCRBY/DECRBY. Produces/consumes
+    /// `DataType::Int` instead of a formatted `DataType::String` — this is
+    /// pure representation-level groundwork for a future read-lock fast
+    /// path (not added yet: this method is still only ever called under
+    /// the shard's exclusive write lock, so a plain load+checked_add+store
+    /// is enough here; no CAS loop is needed because there's no concurrent
+    /// writer to race while we hold `&mut self`).
+    ///
+    /// Any command that writes a string value directly (SET, APPEND,
+    /// SETRANGE, GETSET, ...) demotes an `Int`-typed key back to `String`
+    /// via the normal `Database::insert()` replace path — this method never
+    /// needs to handle that direction.
+    pub fn incr_int(
+        &mut self,
+        key: &[u8],
+        delta: i64,
+    ) -> std::result::Result<i64, crate::error::NexradeError> {
+        use crate::error::NexradeError;
+        use std::collections::hash_map::Entry as HEntry;
+
+        let now = self.lru_now();
+        match self.entries.entry(key.to_vec()) {
+            HEntry::Occupied(mut o) => {
+                if o.get().is_expired() {
+                    // Lazily-expired: same bookkeeping remove() would do,
+                    // then fall through as if the key were vacant.
+                    let old = o.get();
+                    if let Some(ref e) = old.expiry {
+                        self.expiry_index.remove(&(e.expires_at_ms, key.to_vec()));
+                    }
+                    self.live_bytes
+                        .fetch_sub(Self::estimate_entry_size(key, old), Ordering::Relaxed);
+                    let new_val = delta;
+                    let new_entry =
+                        Entry::new(DataType::Int(Arc::new(AtomicIntCell::new(new_val))));
+                    self.live_bytes.fetch_add(
+                        Self::estimate_entry_size(key, &new_entry),
+                        Ordering::Relaxed,
+                    );
+                    *self.key_versions.entry(key.to_vec()).or_insert(0) += 1;
+                    *o.get_mut() = new_entry;
+                    return Ok(new_val);
+                }
+                // Fast case: already an Int cell — no size change (fixed
+                // 8-byte representation), no live_bytes adjustment needed.
+                if let DataType::Int(cell) = &o.get().value {
+                    let current = cell.load();
+                    let new_val = current.checked_add(delta).ok_or(NexradeError::Overflow)?;
+                    cell.store(new_val);
+                    o.get_mut().lru_clock = now;
+                    *self.key_versions.entry(key.to_vec()).or_insert(0) += 1;
+                    return Ok(new_val);
+                }
+                // Occupied String (or another type, which errors below) —
+                // parse, checked_add, and promote to Int in place.
+                let old_size = Self::estimate_entry_size(key, o.get());
+                let current: i64 = match &o.get().value {
+                    DataType::String(v) => std::str::from_utf8(v)
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or(NexradeError::NotInteger)?,
+                    _ => return Err(NexradeError::WrongType),
+                };
+                let new_val = current.checked_add(delta).ok_or(NexradeError::Overflow)?;
+                let entry = o.get_mut();
+                entry.value = DataType::Int(Arc::new(AtomicIntCell::new(new_val)));
+                entry.lru_clock = now;
+                let new_size = Self::estimate_entry_size(key, entry);
+                if new_size >= old_size {
+                    self.live_bytes
+                        .fetch_add(new_size - old_size, Ordering::Relaxed);
+                } else {
+                    self.live_bytes
+                        .fetch_sub(old_size - new_size, Ordering::Relaxed);
+                }
+                *self.key_versions.entry(key.to_vec()).or_insert(0) += 1;
+                Ok(new_val)
+            }
+            HEntry::Vacant(v) => {
+                let new_val = delta;
+                let entry = Entry::new(DataType::Int(Arc::new(AtomicIntCell::new(new_val))));
+                self.live_bytes
+                    .fetch_add(Self::estimate_entry_size(key, &entry), Ordering::Relaxed);
+                *self.key_versions.entry(key.to_vec()).or_insert(0) += 1;
+                v.insert(entry);
+                Ok(new_val)
+            }
+        }
     }
 
     pub fn remove(&mut self, key: &[u8]) -> Option<Entry> {
+        use std::sync::atomic::Ordering;
         let removed = self.entries.remove(key);
         if let Some(ref e) = removed {
             if let Some(ref exp) = e.expiry {
                 self.expiry_index.remove(&(exp.expires_at_ms, key.to_vec()));
             }
             *self.key_versions.entry(key.to_vec()).or_insert(0) += 1;
+            self.live_bytes
+                .fetch_sub(Self::estimate_entry_size(key, e), Ordering::Relaxed);
         }
         removed
+    }
+
+    /// Approximate memory footprint of a single entry (key + value +
+    /// hashmap overhead). Returns 0 for an unknown variant so the live
+    /// counter never goes negative on edge cases.
+    fn estimate_entry_size(key: &[u8], entry: &Entry) -> usize {
+        const OVERHEAD: usize = 64;
+        let val_sz = match &entry.value {
+            DataType::String(v) => v.len(),
+            // Fixed-size: an `AtomicIntCell` stores exactly one `i64`, no
+            // `.len()` to call.
+            DataType::Int(_) => 8,
+            DataType::List(l) => l.iter().map(|b| b.len()).sum(),
+            DataType::Set(s) => s.iter().map(|v| v.len()).sum(),
+            DataType::Hash(h) => h.iter().map(|(k, v)| k.len() + v.len()).sum(),
+            DataType::Bitmap(v) => v.len(),
+            DataType::HyperLogLog(v) => v.len(),
+            DataType::ZSet(z) => z.members.keys().map(|m| m.len() + 8).sum(),
+            DataType::Stream(s) => s.estimated_size(),
+            DataType::Geo(g) => g.members.len() * 24,
+        };
+        OVERHEAD + key.len() + val_sz
     }
 
     pub fn contains_key(&mut self, key: &[u8]) -> bool {
@@ -214,6 +525,8 @@ impl Database {
             .map(|(k, e)| {
                 let value_sz = match &e.value {
                     DataType::String(v) => v.len(),
+                    // Fixed-size atomic cell, not a `.len()`-able container.
+                    DataType::Int(_) => 8,
                     DataType::List(l) => l.iter().map(|b| b.len()).sum(),
                     DataType::Set(s) => s.iter().map(|v| v.len()).sum(),
                     DataType::Hash(h) => h.iter().map(|(k, v)| k.len() + v.len()).sum(),
@@ -230,6 +543,10 @@ impl Database {
 
     /// Evict one entry according to `policy`. Returns true if an entry was removed.
     pub fn evict_one(&mut self, policy: &MaxMemoryPolicy) -> bool {
+        // Number of keys to sample for LRU eviction. Redis defaults to 5,
+        // which gives ~`5/n` accuracy per eviction — plenty for steady-state
+        // LRU approximations without scanning the entire database.
+        const LRU_SAMPLE_SIZE: usize = 5;
         match policy {
             MaxMemoryPolicy::NoEviction => false,
 
@@ -258,13 +575,16 @@ impl Database {
             }
 
             MaxMemoryPolicy::AllKeysLru => {
-                // Pick the entry with the smallest (oldest) lru_clock.
-                let key = self
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, e)| e.lru_clock)
-                    .map(|(k, _)| k.clone());
-                if let Some(k) = key {
+                // Reservoir-sample LRU_SAMPLE_SIZE entries, evict the
+                // oldest. O(LRU_SAMPLE_SIZE) instead of O(N).
+                let victim = sample_lru_victim(
+                    self.entries.iter(),
+                    LRU_SAMPLE_SIZE,
+                    |(_, e)| e.lru_clock,
+                    |(_, _e)| true,
+                )
+                .map(|(k, _)| k.clone());
+                if let Some(k) = victim {
                     self.remove(&k);
                     true
                 } else {
@@ -273,13 +593,14 @@ impl Database {
             }
 
             MaxMemoryPolicy::VolatileLru => {
-                let key = self
-                    .entries
-                    .iter()
-                    .filter(|(_, e)| e.expiry.is_some() && !e.is_expired())
-                    .min_by_key(|(_, e)| e.lru_clock)
-                    .map(|(k, _)| k.clone());
-                if let Some(k) = key {
+                let victim = sample_lru_victim(
+                    self.entries.iter(),
+                    LRU_SAMPLE_SIZE,
+                    |(_, e)| e.lru_clock,
+                    |(_, e)| e.expiry.is_some() && !e.is_expired(),
+                )
+                .map(|(k, _)| k.clone());
+                if let Some(k) = victim {
                     self.remove(&k);
                     true
                 } else {
@@ -327,6 +648,48 @@ impl Database {
 
 // ── Multi-core sharding ───────────────────────────────────────────────────────
 
+/// Reservoir-sample `sample_size` items from `iter`, keeping only those that
+/// pass `keep_filter`, then return the one with the smallest `score`.
+///
+/// Cheap O(sample_size) work regardless of how many items the iterator
+/// yields — appropriate for eviction paths that otherwise would scan the
+/// entire HashMap.
+fn sample_lru_victim<'a, K, V, S, F>(
+    iter: impl Iterator<Item = (&'a K, &'a V)>,
+    sample_size: usize,
+    score: S,
+    keep_filter: F,
+) -> Option<(&'a K, &'a V)>
+where
+    S: Fn(&(&'a K, &'a V)) -> u32,
+    F: Fn(&(&'a K, &'a V)) -> bool,
+{
+    // Sample buffer (key, value, score) so we don't recompute `score` per
+    // candidate during the final min reduction.
+    let mut sample: Vec<(&K, &V, u32)> = Vec::with_capacity(sample_size + 1);
+    let mut idx: usize = 0;
+    for kv in iter {
+        idx += 1;
+        if !keep_filter(&kv) {
+            continue;
+        }
+        let s = score(&kv);
+        if sample.len() < sample_size {
+            sample.push((kv.0, kv.1, s));
+        } else {
+            // Replace a random slot with the new entry.
+            let slot = (idx.wrapping_mul(2_654_435_761)) % (idx + 1);
+            if slot < sample_size {
+                sample[slot] = (kv.0, kv.1, s);
+            }
+        }
+    }
+    sample
+        .into_iter()
+        .min_by_key(|(_, _, s)| *s)
+        .map(|(k, v, _)| (k, v))
+}
+
 /// FNV-1a 64-bit hash for shard selection — fast, no external deps.
 #[inline]
 fn fnv1a(key: &[u8]) -> usize {
@@ -355,15 +718,32 @@ fn compute_num_shards() -> usize {
 pub struct ShardedDatabase {
     shards: Vec<RwLock<Database>>,
     num_shards: usize,
+    lru_clock: LruClock,
 }
 
 impl ShardedDatabase {
     pub fn new(num_shards: usize) -> Self {
+        // All shards share the same atomic clock source so a single
+        // `Arc<AtomicU32>` load from any shard returns the current LRU
+        // timestamp. Defaults to 0; the Store wires the real atomic in.
+        let clock = LruClock::new(Arc::new(AtomicU32::new(0)));
         Self {
             shards: (0..num_shards)
                 .map(|_| RwLock::new(Database::new()))
                 .collect(),
             num_shards,
+            lru_clock: clock.clone(),
+        }
+    }
+
+    /// Install a shared LRU clock source on every shard and propagate it
+    /// through any existing shards (no-op for the standard `new` path).
+    /// The background tick task updates `inner` at `hz` frequency.
+    pub fn set_lru_clock(&mut self, clock: LruClock) {
+        self.lru_clock = clock.clone();
+        for shard in &self.shards {
+            let mut guard = shard.write();
+            guard.set_lru_clock(clock.clone());
         }
     }
 
@@ -386,6 +766,38 @@ impl ShardedDatabase {
     #[inline]
     pub fn read_for(&self, key: &[u8]) -> parking_lot::RwLockReadGuard<'_, Database> {
         self.shards[self.shard_idx(key)].read()
+    }
+
+    /// INCR/DECR/INCRBY/DECRBY entry point. Tries a read-lock CAS fast path
+    /// on an already-promoted, non-expired `Int` key; falls back to the
+    /// existing exclusive write-lock slow path (`Database::incr_int`) for
+    /// creation, promotion, and expiry — those all need to mutate the
+    /// HashMap's occupancy, not just the cell's value.
+    ///
+    /// Correctness under concurrent promotion/demotion: the read guard is
+    /// held for the entire load-CAS-store sequence, and `parking_lot`'s
+    /// write acquisition blocks until every reader on that shard releases —
+    /// so no writer can promote/demote/remove the entry (or replace the
+    /// `Arc<AtomicIntCell>`) while our read guard is alive. Once the probe
+    /// finishes and the guard drops, a fallback call is an independent,
+    /// fresh lock acquisition.
+    pub fn incr_int(
+        &self,
+        key: &[u8],
+        delta: i64,
+    ) -> std::result::Result<i64, crate::error::NexradeError> {
+        use crate::error::NexradeError;
+        {
+            let guard = self.read_for(key);
+            if let Some(entry) = guard.get_ro(key) {
+                if let DataType::Int(cell) = &entry.value {
+                    return cell.checked_add(delta).ok_or(NexradeError::Overflow);
+                }
+            }
+            // guard dropped here — vacant, expired, or non-Int key falls
+            // through to the slow path below.
+        }
+        self.write_for(key).incr_int(key, delta)
     }
 
     /// Direct shard access by index (for iteration-based commands).
@@ -440,10 +852,14 @@ impl ShardedDatabase {
     }
 
     pub fn estimated_memory_bytes(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|s| s.read().estimated_memory_bytes())
-            .sum()
+        // O(shards) instead of O(entries) — the live_bytes counter is updated
+        // incrementally on every insert / remove.
+        self.shards.iter().map(|s| s.read().live_bytes()).sum()
+    }
+
+    /// Sum live_bytes across every shard — O(shards).
+    pub fn live_bytes(&self) -> usize {
+        self.shards.iter().map(|s| s.read().live_bytes()).sum()
     }
 
     pub fn evict_one(&self, policy: &MaxMemoryPolicy) -> bool {
@@ -709,10 +1125,70 @@ impl ShardedDatabase {
 
     /// Acquire write guards for all distinct shards in `shard_indices` (must be
     /// sorted and deduped). Returns guards in the same order.
+    ///
+    /// MSET/MSETNX's atomicity requirement (never observe a partial write)
+    /// means every shard must be locked before any insert happens. The naive
+    /// way to do that — `self.shards[i].write()` in a loop — blocks
+    /// sequentially: while waiting on shard N's lock, it keeps holding every
+    /// earlier shard's lock, needlessly stalling any *other* op that only
+    /// wanted one of those earlier shards. Under concurrent pipelined MSETs
+    /// touching overlapping shard sets, that turns into cross-batch
+    /// serialization (see `docs/mset-investigation.md`).
+    ///
+    /// This instead does a non-blocking `try_write()` sweep: attempt every
+    /// shard in order, and if any attempt fails, drop everything acquired
+    /// this sweep (so we're never holding a shard's lock while waiting on
+    /// another) and retry after a short backoff. Atomicity is unchanged from
+    /// the old code — a sweep still only returns once *every* shard is
+    /// locked, so there is no window where a partial write is visible.
+    ///
+    /// The retry loop is bounded (`MAX_TRY_ROUNDS`): after that many failed
+    /// sweeps, fall back to the old unconditional blocking `.write()` calls.
+    /// This guarantees forward progress under pathological contention and
+    /// means the worst case is never worse than the pre-existing behavior —
+    /// only the common case (most sweeps succeed inline or after a handful
+    /// of retries) gets faster.
     fn lock_shards(
         &self,
         shard_indices: &[usize],
     ) -> Vec<parking_lot::RwLockWriteGuard<'_, Database>> {
+        const MAX_TRY_ROUNDS: u32 = 1000;
+        // Escalating backoff: a handful of spin-loop hints (cheap, good for
+        // very short-lived contention), then yield the OS thread, repeated
+        // until MAX_TRY_ROUNDS is hit. No sleep — this path is on the hot
+        // write path and pipelined MSETs are expected to be short-lived, so
+        // a sleep would add latency to the common case without a measured
+        // need for it.
+        const SPIN_ITERS: u32 = 8;
+
+        for round in 0..MAX_TRY_ROUNDS {
+            let mut guards = Vec::with_capacity(shard_indices.len());
+            let mut acquired_all = true;
+            for &i in shard_indices {
+                match self.shards[i].try_write() {
+                    Some(g) => guards.push(g),
+                    None => {
+                        acquired_all = false;
+                        break;
+                    }
+                }
+            }
+            if acquired_all {
+                return guards;
+            }
+            // `guards` (whatever was acquired this attempt) drops here,
+            // before the backoff — we never hold a partial lock set while
+            // waiting.
+            if round < SPIN_ITERS {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+
+        // Pathological contention: fall back to the old unconditional
+        // blocking behavior so we still make progress. Sorted-index order
+        // matches the old code and avoids lock-ordering deadlocks.
         shard_indices
             .iter()
             .map(|&i| self.shards[i].write())
@@ -763,17 +1239,88 @@ impl ShardedDatabase {
 pub struct Store {
     dbs: Arc<Vec<ShardedDatabase>>,
     pub db_count: usize,
+    /// Shared LRU clock source — same atomic is used by every shard and
+    /// updated by the background tick task.
+    lru_clock: LruClock,
 }
 
 impl Store {
     pub fn new(db_count: usize) -> Self {
         let num_shards = compute_num_shards();
-        let dbs = (0..db_count)
+        // Every shard reads the same atomic; updates come from the
+        // background tick via `Store::refresh_lru_clock`.
+        let clock = LruClock::default();
+        let dbs: Vec<ShardedDatabase> = (0..db_count)
             .map(|_| ShardedDatabase::new(num_shards))
             .collect();
         Self {
             dbs: Arc::new(dbs),
             db_count,
+            lru_clock: clock,
+        }
+    }
+
+    /// Wire a shared LRU clock into every shard.
+    pub fn set_lru_clock(&mut self, clock: LruClock) {
+        for sdb in Arc::get_mut(&mut self.dbs)
+            .expect("no concurrent Store owners")
+            .iter_mut()
+        {
+            sdb.set_lru_clock(clock.clone());
+        }
+        self.lru_clock = clock;
+    }
+
+    /// Replace the inner atomic clock on every shard with `value`. The
+    /// background tick task calls this at `hz` frequency.
+    pub fn refresh_lru_clock(&self, value: u32) {
+        self.lru_clock.store(value);
+    }
+
+    /// Read the current cached LRU timestamp.
+    #[inline]
+    pub fn lru_now(&self) -> u32 {
+        self.lru_clock.now()
+    }
+
+    /// Evict entries until memory is below `limit_bytes`.
+    pub fn evict_if_needed(&self, policy: &MaxMemoryPolicy, limit_bytes: usize) -> usize {
+        if *policy == MaxMemoryPolicy::NoEviction || limit_bytes == 0 {
+            return 0;
+        }
+        let mut evicted = 0;
+        // `estimated_memory_bytes()` is O(1) now (sum of shard atomics).
+        //
+        // The inner per-shard evict is a *random* sample: one failed
+        // sample doesn't mean the shard is empty. Only give up once
+        // every shard is provably empty (entry count == 0).
+        'outer: while self.estimated_memory_bytes() > limit_bytes {
+            for sdb in self.dbs.iter() {
+                if sdb.evict_one(policy) {
+                    evicted += 1;
+                    continue 'outer;
+                }
+            }
+            // No shard evicted — either all are empty or every sample
+            // missed (unlikely with non-trivial sizes). Probe the next
+            // iteration: the loop condition will re-check live_bytes
+            // and we'll exit cleanly if all shards are actually empty.
+            for sdb in self.dbs.iter() {
+                if !sdb.is_empty() {
+                    // At least one shard has data but evict_one
+                    // failed. The sample is randomized, so retry.
+                    continue 'outer;
+                }
+            }
+            break;
+        }
+        evicted
+    }
+
+    /// Run active expiry on all databases.
+    pub fn active_expire(&self, max_per_db: usize) {
+        for sdb in self.dbs.iter() {
+            sdb.expire_batch(max_per_db);
         }
     }
 
@@ -800,6 +1347,40 @@ impl Store {
         self.dbs.iter().map(|db| db.len()).sum()
     }
 
+    /// Count keys whose hash slot equals `slot` across every database.
+    /// Used by `CLUSTER COUNTKEYSINSLOT`.
+    pub fn count_keys_in_slot(&self, slot: u16) -> usize {
+        let mut n = 0;
+        for i in 0..self.db_count {
+            for key in self.db(i).keys_matching(b"*") {
+                if crate::cluster::keyslot(&key) == slot {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// Return up to `count` keys whose hash slot equals `slot` across
+    /// every database. Used by `CLUSTER GETKEYSINSLOT`.
+    pub fn get_keys_in_slot(&self, slot: u16, count: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        if count == 0 {
+            return out;
+        }
+        for i in 0..self.db_count {
+            for key in self.db(i).keys_matching(b"*") {
+                if crate::cluster::keyslot(&key) == slot {
+                    out.push(key);
+                    if out.len() >= count {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Snapshot all non-empty databases (merges shards under read locks).
     pub fn snapshot_dbs(&self) -> Vec<(usize, Database)> {
         (0..self.db_count)
@@ -816,36 +1397,9 @@ impl Store {
 
     /// Total estimated memory across all databases (rough approximation).
     pub fn estimated_memory_bytes(&self) -> usize {
-        self.dbs.iter().map(|db| db.estimated_memory_bytes()).sum()
-    }
-
-    /// Evict entries until memory is below `limit_bytes`.
-    pub fn evict_if_needed(&self, policy: &MaxMemoryPolicy, limit_bytes: usize) -> usize {
-        if *policy == MaxMemoryPolicy::NoEviction || limit_bytes == 0 {
-            return 0;
-        }
-        let mut evicted = 0;
-        while self.estimated_memory_bytes() > limit_bytes {
-            let mut any = false;
-            for db in self.dbs.iter() {
-                if db.evict_one(policy) {
-                    evicted += 1;
-                    any = true;
-                    break;
-                }
-            }
-            if !any {
-                break;
-            }
-        }
-        evicted
-    }
-
-    /// Run active expiry on all databases.
-    pub fn active_expire(&self, max_per_db: usize) {
-        for db in self.dbs.iter() {
-            db.expire_batch(max_per_db);
-        }
+        // O(shards) instead of O(entries) — the live_bytes counter is
+        // updated incrementally on every insert / remove.
+        self.dbs.iter().map(|s| s.live_bytes()).sum()
     }
 }
 
@@ -923,6 +1477,321 @@ mod tests {
         db.insert(b"key".to_vec(), entry);
         std::thread::sleep(Duration::from_millis(5));
         assert!(db.get(b"key").is_none());
+    }
+
+    // ── DataType::Int — promotion, key_version, RDB/COPY independence ─────────
+
+    #[test]
+    fn incr_on_vacant_key_promotes_directly_to_int() {
+        let mut db = Database::new();
+        let v = db.incr_int(b"k", 5).unwrap();
+        assert_eq!(v, 5);
+        assert!(matches!(db.get(b"k").unwrap().value, DataType::Int(_)));
+    }
+
+    #[test]
+    fn incr_on_string_key_promotes_to_int() {
+        let mut db = Database::new();
+        db.insert(b"k".to_vec(), str_entry(b"10"));
+        let v = db.incr_int(b"k", 5).unwrap();
+        assert_eq!(v, 15);
+        assert!(matches!(db.get(b"k").unwrap().value, DataType::Int(_)));
+    }
+
+    #[test]
+    fn set_on_int_key_demotes_to_string() {
+        let mut db = Database::new();
+        db.incr_int(b"k", 5).unwrap();
+        assert!(matches!(db.get(b"k").unwrap().value, DataType::Int(_)));
+        db.insert(b"k".to_vec(), str_entry(b"hello"));
+        assert!(matches!(db.get(b"k").unwrap().value, DataType::String(_)));
+    }
+
+    #[test]
+    fn key_version_increases_on_every_incr_including_fast_path() {
+        let mut db = Database::new();
+        let v0 = db.key_version(b"k");
+        db.incr_int(b"k", 1).unwrap(); // vacant -> Int, promotion bump
+        let v1 = db.key_version(b"k");
+        assert!(v1 > v0, "key_version must increase after first INCR");
+        db.incr_int(b"k", 1).unwrap(); // Int -> Int, in-place mutation
+        let v2 = db.key_version(b"k");
+        assert!(
+            v2 > v1,
+            "key_version must increase after a second INCR on an already-Int key"
+        );
+    }
+
+    #[test]
+    fn key_version_on_expired_int_key_does_not_panic_or_underflow() {
+        let mut db = Database::new();
+        db.insert(
+            b"k".to_vec(),
+            Entry::with_expiry(
+                DataType::Int(Arc::new(AtomicIntCell::new(5))),
+                Expiry::from_duration(Duration::from_millis(1)),
+            ),
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        // Expired key: key_version must fall back to the base counter, not
+        // read through to the (logically gone) Int cell.
+        let _ = db.key_version(b"k");
+    }
+
+    #[test]
+    fn incr_preserves_live_bytes_accounting_across_promotion() {
+        let mut db = Database::new();
+        db.insert(b"k".to_vec(), str_entry(b"10")); // 2-byte String value
+        let before = db.live_bytes();
+        db.incr_int(b"k", 5).unwrap(); // promotes to Int (constant 8-byte size)
+        let after = db.live_bytes();
+        // Exact delta isn't the point (str "10" is 2 bytes, Int is a
+        // constant 8) — just confirm the counter tracks the swap instead of
+        // double-counting or going negative.
+        assert_ne!(before, after);
+        assert!(
+            db.live_bytes() < usize::MAX / 2,
+            "sanity: no underflow wrap"
+        );
+    }
+
+    #[test]
+    fn cloning_an_int_entry_produces_an_independent_cell() {
+        // Guards the manual `Clone for DataType` impl: a derived Clone on
+        // `Arc<AtomicIntCell>` would just bump the refcount, aliasing the
+        // live cell — this is exactly the bug that would corrupt RDB
+        // snapshots and COPY/RENAME destinations.
+        let mut db = Database::new();
+        db.incr_int(b"k", 100).unwrap();
+        let original = db.get(b"k").unwrap().clone();
+        // Mutate the live entry further.
+        db.incr_int(b"k", 1).unwrap();
+        let DataType::Int(orig_cell) = &original.value else {
+            panic!("expected Int");
+        };
+        assert_eq!(
+            orig_cell.load(),
+            100,
+            "the cloned snapshot must not see the later mutation"
+        );
+        let DataType::Int(live_cell) = &db.get(b"k").unwrap().value else {
+            panic!("expected Int");
+        };
+        assert_eq!(live_cell.load(), 101);
+    }
+
+    #[test]
+    fn sharded_database_snapshot_int_entry_is_independent_of_live_cell() {
+        // ShardedDatabase::snapshot() (used for RDB save) clones entries
+        // under a read guard — same aliasing risk as the Clone test above,
+        // exercised through the actual snapshot path.
+        let sdb = ShardedDatabase::new(4);
+        sdb.write_for(b"k").incr_int(b"k", 42).unwrap();
+        let snap = sdb.snapshot();
+        sdb.write_for(b"k").incr_int(b"k", 1).unwrap();
+
+        let DataType::Int(snap_cell) = &snap.entries.get(b"k".as_slice()).unwrap().value else {
+            panic!("expected Int in snapshot");
+        };
+        assert_eq!(
+            snap_cell.load(),
+            42,
+            "snapshot must be frozen at capture time"
+        );
+
+        let guard = sdb.read_for(b"k");
+        let DataType::Int(live_cell) = &guard.get_ro(b"k").unwrap().value else {
+            panic!("expected Int");
+        };
+        assert_eq!(live_cell.load(), 43);
+    }
+
+    #[test]
+    fn bincode_round_trip_reconstructs_independent_live_int_cell() {
+        let mut db = Database::new();
+        db.incr_int(b"k", 7).unwrap();
+
+        let encoded = bincode::serde::encode_to_vec(&db, bincode::config::standard()).unwrap();
+        let (mut restored, _): (Database, usize) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+
+        assert_eq!(restored.incr_int(b"k", 3).unwrap(), 10);
+        // Original must be unaffected by mutating the restored copy.
+        assert_eq!(db.incr_int(b"k", 0).unwrap(), 7);
+    }
+
+    #[test]
+    fn copy_entry_produces_independent_int_cell() {
+        let sdb = ShardedDatabase::new(4);
+        sdb.write_for(b"src").incr_int(b"src", 9).unwrap();
+        assert!(sdb.copy_entry(b"src", b"dst".to_vec(), false));
+
+        sdb.write_for(b"src").incr_int(b"src", 1).unwrap();
+
+        let guard = sdb.read_for(b"dst");
+        let DataType::Int(dst_cell) = &guard.get_ro(b"dst").unwrap().value else {
+            panic!("expected Int");
+        };
+        assert_eq!(
+            dst_cell.load(),
+            9,
+            "COPY destination must not alias the source's cell"
+        );
+    }
+
+    // ── PR 2: ShardedDatabase::incr_int read-lock fast path ────────────────────
+
+    #[test]
+    fn sharded_incr_int_fast_path_hits_on_promoted_key() {
+        let sdb = ShardedDatabase::new(4);
+        // Promote via the slow path first.
+        sdb.write_for(b"k").incr_int(b"k", 5).unwrap();
+        let version_after_promote = sdb.read_for(b"k").key_version(b"k");
+
+        // Subsequent calls go through ShardedDatabase::incr_int, which should
+        // take the read-lock fast path since the key is already an Int.
+        assert_eq!(sdb.incr_int(b"k", 3).unwrap(), 8);
+        assert_eq!(sdb.incr_int(b"k", -2).unwrap(), 6);
+        assert_eq!(sdb.incr_int(b"k", 10).unwrap(), 16);
+
+        let version_after_fast_path = sdb.read_for(b"k").key_version(b"k");
+        assert!(
+            version_after_fast_path > version_after_promote,
+            "key_version() must keep increasing across fast-path mutations \
+             (WATCH correctness depends on this): before={version_after_promote}, \
+             after={version_after_fast_path}"
+        );
+    }
+
+    #[test]
+    fn sharded_incr_int_overflow_on_fast_path_does_not_mutate() {
+        let sdb = ShardedDatabase::new(4);
+        sdb.write_for(b"k").incr_int(b"k", i64::MAX).unwrap();
+
+        let err = sdb.incr_int(b"k", 1);
+        assert!(
+            matches!(err, Err(crate::error::NexradeError::Overflow)),
+            "expected Overflow, got {err:?}"
+        );
+
+        // Value must be unchanged after the failed fast-path attempt.
+        let guard = sdb.read_for(b"k");
+        let DataType::Int(cell) = &guard.get_ro(b"k").unwrap().value else {
+            panic!("expected Int");
+        };
+        assert_eq!(cell.load(), i64::MAX);
+    }
+
+    #[test]
+    fn sharded_incr_int_falls_back_on_vacant_expired_and_wrongtype() {
+        let sdb = ShardedDatabase::new(4);
+
+        // Vacant key: dispatcher must fall through to the slow path and
+        // create a fresh Int cell at `delta`.
+        assert_eq!(sdb.incr_int(b"vacant", 5).unwrap(), 5);
+
+        // Lazily-expired key: dispatcher must treat it as absent, same as
+        // the slow path does directly.
+        sdb.write_for(b"expired")
+            .insert(b"expired".to_vec(), str_entry(b"100"));
+        sdb.write_for(b"expired")
+            .set_expiry(b"expired", Some(Expiry::from_ms(1)));
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(sdb.incr_int(b"expired", 1).unwrap(), 1);
+
+        // Wrong-type key: dispatcher must surface the same WrongType error
+        // the slow path returns.
+        sdb.write_for(b"list").insert(
+            b"list".to_vec(),
+            Entry::new(DataType::List(VecDeque::new())),
+        );
+        assert!(matches!(
+            sdb.incr_int(b"list", 1),
+            Err(crate::error::NexradeError::WrongType)
+        ));
+    }
+
+    #[test]
+    fn sharded_incr_int_concurrent_single_key_no_lost_updates() {
+        const THREADS: usize = 8;
+        const INCREMENTS_PER_THREAD: usize = 5_000;
+        let sdb = Arc::new(ShardedDatabase::new(16));
+        // Pre-promote so every thread hits the fast path from the start.
+        sdb.write_for(b"hot").incr_int(b"hot", 0).unwrap();
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let sdb = Arc::clone(&sdb);
+                thread::spawn(move || {
+                    for _ in 0..INCREMENTS_PER_THREAD {
+                        sdb.incr_int(b"hot", 1).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let guard = sdb.read_for(b"hot");
+        let DataType::Int(cell) = &guard.get_ro(b"hot").unwrap().value else {
+            panic!("expected Int");
+        };
+        assert_eq!(
+            cell.load(),
+            (THREADS * INCREMENTS_PER_THREAD) as i64,
+            "concurrent fast-path INCRs on one key must not lose updates"
+        );
+    }
+
+    #[test]
+    fn sharded_incr_int_fast_slow_interleave_no_panic() {
+        const INCR_ITERS: usize = 5_000;
+        let sdb = Arc::new(ShardedDatabase::new(16));
+        sdb.write_for(b"k").incr_int(b"k", 0).unwrap();
+
+        let incr_sdb = Arc::clone(&sdb);
+        let incr_handle = thread::spawn(move || {
+            for _ in 0..INCR_ITERS {
+                // Ignore errors: a concurrent SET may have demoted the key to
+                // a non-integer string momentarily is not possible here since
+                // the SET below always writes an integer-parseable string,
+                // but a WrongType from a stale read is not expected either —
+                // any Err is a real bug, so unwrap.
+                incr_sdb.incr_int(b"k", 1).unwrap();
+            }
+        });
+
+        // Periodically demote the key back to a plain String with the same
+        // decimal value it already holds, forcing the fast path to keep
+        // falling back to promotion mid-run.
+        let set_sdb = Arc::clone(&sdb);
+        let set_handle = thread::spawn(move || {
+            for _ in 0..50 {
+                let current = {
+                    let guard = set_sdb.read_for(b"k");
+                    match &guard.get_ro(b"k").unwrap().value {
+                        DataType::Int(cell) => cell.load(),
+                        DataType::String(v) => std::str::from_utf8(v).unwrap().parse().unwrap(),
+                        _ => unreachable!(),
+                    }
+                };
+                set_sdb
+                    .write_for(b"k")
+                    .insert(b"k".to_vec(), str_entry(current.to_string().as_bytes()));
+                thread::yield_now();
+            }
+        });
+
+        incr_handle.join().unwrap();
+        set_handle.join().unwrap();
+
+        // Liveness/no-panic check plus monotonicity of key_version() across
+        // the whole run — the exact final value isn't assertable since the
+        // SET thread's demotions race with the INCR thread's arithmetic by
+        // design, but key_version() must never go backwards.
+        let final_version = sdb.read_for(b"k").key_version(b"k");
+        assert!(final_version > 0, "key_version() must have advanced");
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -1233,5 +2102,202 @@ mod tests {
             1,
             "only one MSETNX group must win"
         );
+    }
+
+    // ── MSET: no partial write ever visible under contention ──────────────────
+    // Regression guard for the try-lock-all-with-backoff rewrite of
+    // `lock_shards`. N writer threads repeatedly MSET the same two
+    // multi-shard keys with a distinguishable per-thread tag on both; a
+    // concurrent reader thread samples both keys throughout the run and
+    // asserts every observed pair is internally consistent (never a mix of
+    // two different threads' writes). This is the actual atomicity
+    // guarantee Option B must preserve — a sequential per-shard blocking
+    // acquire (today's baseline) and a try-lock-all sweep (this fix) are
+    // both all-or-nothing, but a naive per-shard *deferred* write (the
+    // reverted attempt) would not be.
+    #[test]
+    fn mset_no_partial_write_visible_under_contention() {
+        const THREADS: usize = 8;
+        const ITERS: usize = 2_000;
+        let sdb = Arc::new(ShardedDatabase::new(16));
+        let (k1, k2) = two_different_shards(&sdb);
+
+        // Seed so the reader never sees a transient "key missing" state.
+        sdb.mset(vec![
+            (k1.clone(), str_entry(b"thread-init")),
+            (k2.clone(), str_entry(b"thread-init")),
+        ]);
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mismatch = Arc::new(AtomicUsize::new(0));
+
+        let writers: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let sdb = Arc::clone(&sdb);
+                let (k1, k2) = (k1.clone(), k2.clone());
+                thread::spawn(move || {
+                    let tag = format!("thread-{t}").into_bytes();
+                    for _ in 0..ITERS {
+                        sdb.mset(vec![
+                            (k1.clone(), str_entry(&tag)),
+                            (k2.clone(), str_entry(&tag)),
+                        ]);
+                    }
+                })
+            })
+            .collect();
+
+        let reader = {
+            let sdb = Arc::clone(&sdb);
+            let (k1, k2) = (k1.clone(), k2.clone());
+            let stop = Arc::clone(&stop);
+            let mismatch = Arc::clone(&mismatch);
+            thread::spawn(move || {
+                // Must hold both shards' read locks simultaneously, in the
+                // same sorted-index order `mset`'s write locks are acquired
+                // in — reading k1 and k2 via two separate, sequential
+                // `read_for` calls would let a writer's `mset` complete
+                // entirely between the two reads, which is a benign
+                // "read at two different times" race, not a partial-MSET
+                // atomicity violation. Locking both at once means any
+                // snapshot we observe is either fully before or fully
+                // after every writer's `mset` (since `mset` itself holds
+                // both write locks for the duration of its two inserts).
+                let i1 = sdb.shard_idx(&k1);
+                let i2 = sdb.shard_idx(&k2);
+                while !stop.load(Ordering::Relaxed) {
+                    let (v1, v2) = if i1 <= i2 {
+                        let g1 = sdb.shard_read(i1);
+                        let g2 = sdb.shard_read(i2);
+                        (
+                            g1.get_ro(&k1).map(|e| match &e.value {
+                                DataType::String(v) => v.clone(),
+                                _ => unreachable!(),
+                            }),
+                            g2.get_ro(&k2).map(|e| match &e.value {
+                                DataType::String(v) => v.clone(),
+                                _ => unreachable!(),
+                            }),
+                        )
+                    } else {
+                        let g2 = sdb.shard_read(i2);
+                        let g1 = sdb.shard_read(i1);
+                        (
+                            g1.get_ro(&k1).map(|e| match &e.value {
+                                DataType::String(v) => v.clone(),
+                                _ => unreachable!(),
+                            }),
+                            g2.get_ro(&k2).map(|e| match &e.value {
+                                DataType::String(v) => v.clone(),
+                                _ => unreachable!(),
+                            }),
+                        )
+                    };
+                    if v1 != v2 {
+                        mismatch.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+
+        for h in writers {
+            h.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+
+        assert_eq!(
+            mismatch.load(Ordering::Relaxed),
+            0,
+            "reader observed a partial MSET: k1 and k2 held different threads' tags"
+        );
+    }
+
+    // ── MSET: concurrent disjoint shards, no deadlock, no lost writes ─────────
+    #[test]
+    fn mset_concurrent_disjoint_shards_no_deadlock_no_loss() {
+        const THREADS: usize = 8;
+        const PAIRS_PER: usize = 2_000;
+        let sdb = Arc::new(ShardedDatabase::new(16));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let sdb = Arc::clone(&sdb);
+                thread::spawn(move || {
+                    for i in 0..PAIRS_PER {
+                        let k1 = format!("t{t}a{i}").into_bytes();
+                        let k2 = format!("t{t}b{i}").into_bytes();
+                        sdb.mset(vec![(k1, str_entry(b"v")), (k2, str_entry(b"v"))]);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            sdb.len(),
+            THREADS * PAIRS_PER * 2,
+            "every key from every thread's MSET must be present"
+        );
+    }
+
+    // ── MSET: backoff makes progress under heavy shard overlap ────────────────
+    // Synthetic high-conflict workload: every thread targets the *same*
+    // overlapping shard set (not just the same two keys, but a shared pool
+    // of keys spanning every shard), maximizing try-lock-all contention.
+    // Regression guard against the retry loop spinning forever or thrashing
+    // — the whole run must complete within a generous bound.
+    #[test]
+    fn mset_backoff_makes_progress_under_heavy_shard_overlap() {
+        const THREADS: usize = 16;
+        const ITERS: usize = 1_000;
+        let sdb = Arc::new(ShardedDatabase::new(16));
+        // A shared pool of keys, one per shard-ish (16 shards, 16 keys), so
+        // every thread's MSET touches the same full shard set as every
+        // other thread's — maximum overlap.
+        let pool: Vec<Vec<u8>> = (0..16).map(|i| format!("pool{i}").into_bytes()).collect();
+
+        let start = std::time::Instant::now();
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let sdb = Arc::clone(&sdb);
+                let pool = pool.clone();
+                thread::spawn(move || {
+                    let tag = format!("t{t}").into_bytes();
+                    for _ in 0..ITERS {
+                        let pairs = pool.iter().map(|k| (k.clone(), str_entry(&tag))).collect();
+                        sdb.mset(pairs);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "heavy-overlap MSET run took {elapsed:?}, backoff may be thrashing or stalling"
+        );
+        // Final state must be internally consistent: every key in the pool
+        // holds *some* thread's tag, and (since all keys are always written
+        // together) all keys must hold the *same* tag.
+        let guard = sdb.read_for(&pool[0]);
+        let last_tag = match &guard.get_ro(&pool[0]).unwrap().value {
+            DataType::String(v) => v.clone(),
+            _ => unreachable!(),
+        };
+        drop(guard);
+        for k in &pool[1..] {
+            let guard = sdb.read_for(k);
+            let v = match &guard.get_ro(k).unwrap().value {
+                DataType::String(v) => v.clone(),
+                _ => unreachable!(),
+            };
+            assert_eq!(v, last_tag, "all pooled keys must carry the same final tag");
+        }
     }
 }

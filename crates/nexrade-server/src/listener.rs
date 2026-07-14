@@ -7,7 +7,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::signal;
-use tokio::sync::oneshot;
+#[cfg(feature = "tls")]
+use tokio::sync::watch;
 use tokio::time;
 use tracing::{error, info, warn};
 
@@ -16,10 +17,12 @@ use nexrade_core::db::{unix_secs, Db, ServerConfig};
 use nexrade_core::persistence::{AofReader, AofSync, AofWriter, Snapshot};
 use nexrade_core::replication::ReplicationRole;
 use nexrade_core::resp::{Resp, RespParser};
-use nexrade_lua::LuaEngine;
+use nexrade_lua::{FunctionRegistry, LuaEngine};
 use nexrade_metrics::Metrics;
 
 use crate::connection::Connection;
+#[cfg(feature = "tls")]
+use crate::stream::Stream;
 
 pub struct Listener {
     pub db: Db,
@@ -85,6 +88,11 @@ impl Listener {
                                     }
                                     continue;
                                 }
+                                // System-internal: replay AOF commands under
+                                // "default" since each was already authorized at
+                                // the time it was originally written. See
+                                // `dispatch()`'s doc comment for why a real
+                                // connection path must NEVER use this helper.
                                 let r = dispatch(&self.db, args, current_db).await;
                                 if let nexrade_core::resp::Resp::Error(e) = r {
                                     tracing::warn!("AOF replay error (cmd {}): {}", count + 1, e);
@@ -140,16 +148,71 @@ impl Listener {
         let max_clients = self.config.max_clients;
         let lua_time_limit = Duration::from_millis(self.config.lua_time_limit);
         let lua_engine = LuaEngine::new(lua_time_limit).expect("failed to create Lua engine");
+        let function_registry = FunctionRegistry::new();
 
-        // Unified shutdown channel — fires on SIGINT (Ctrl+C) or SIGTERM.
-        // Using a task + oneshot so we can handle platform-specific signals
-        // without #[cfg] inside tokio::select!.
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        // Unified shutdown signal — fires on SIGINT (Ctrl+C), SIGTERM, or the
+        // SHUTDOWN command. `db.shutdown` is a `Notify`, whose `notify_one()`
+        // wakes exactly one waiter — insufficient once there's a second
+        // (TLS) accept loop that also needs to stop. So a single relay task
+        // owns the one `notified()` wait and fans the signal out to every
+        // accept loop via a `watch` channel instead.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let db_shutdown = db.clone();
         tokio::spawn(async move {
-            await_shutdown_signal().await;
-            let _ = shutdown_tx.send(());
+            tokio::select! {
+                _ = await_shutdown_signal() => {
+                    info!("received shutdown signal (OS) — shutting down");
+                }
+                _ = db_shutdown.shutdown.notified() => {
+                    info!("received SHUTDOWN command — shutting down");
+                }
+            }
+            let _ = shutdown_tx.send(true);
         });
 
+        // ── Optional TLS listener, running alongside the plain-TCP one ──────
+        // `config.tls_enabled` requires both `tls_cert` and `tls_key` to be
+        // set (checked in `nexrade-cache`'s `start_server` before this
+        // point); if either is missing here we just skip starting it rather
+        // than failing the whole server.
+        #[cfg(feature = "tls")]
+        if self.config.tls_enabled {
+            if let (Some(cert), Some(key)) = (&self.config.tls_cert, &self.config.tls_key) {
+                let tls_port = self.config.tls_port.unwrap_or(6380);
+                let tls_addr = format!("{}:{}", self.config.bind, tls_port);
+                match nexrade_tls::TlsAcceptor::from_pem_files(cert, key).await {
+                    Ok(acceptor) => match TcpListener::bind(&tls_addr).await {
+                        Ok(tls_listener) => {
+                            info!("nexrade-cache TLS listening on {}", tls_addr);
+                            let db = db.clone();
+                            let metrics = metrics.clone();
+                            let lua_engine = lua_engine.clone();
+                            let function_registry = function_registry.clone();
+                            let mut shutdown_rx = shutdown_rx.clone();
+                            tokio::spawn(async move {
+                                run_tls_accept_loop(
+                                    tls_listener,
+                                    acceptor,
+                                    db,
+                                    metrics,
+                                    lua_engine,
+                                    function_registry,
+                                    max_clients,
+                                    &mut shutdown_rx,
+                                )
+                                .await;
+                            });
+                        }
+                        Err(e) => error!("failed to bind TLS listener on {}: {}", tls_addr, e),
+                    },
+                    Err(e) => error!("failed to initialize TLS ({}): {}", tls_addr, e),
+                }
+            } else {
+                warn!("TLS enabled but tls-cert or tls-key not set, TLS listener skipped");
+            }
+        }
+
+        let mut shutdown_rx = shutdown_rx;
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -165,9 +228,10 @@ impl Listener {
 
                             let conn = Connection::new(
                                 db.clone(),
-                                stream,
+                                crate::stream::Stream::Plain(stream),
                                 addr,
                                 lua_engine.clone(),
+                                function_registry.clone(),
                                 metrics.clone(),
                             );
                             tokio::spawn(async move {
@@ -179,12 +243,7 @@ impl Listener {
                         }
                     }
                 }
-                _ = &mut shutdown_rx => {
-                    info!("received shutdown signal (OS) — shutting down");
-                    break;
-                }
-                _ = db.shutdown.notified() => {
-                    info!("received SHUTDOWN command — shutting down");
+                _ = shutdown_rx.changed() => {
                     break;
                 }
             }
@@ -200,8 +259,14 @@ impl Listener {
                 let dbs = db.store.snapshot_dbs();
                 let snapshot = Snapshot::new(dbs);
                 match snapshot.save(path) {
-                    Ok(()) => info!("shutdown RDB save complete"),
-                    Err(e) => error!("shutdown RDB save failed: {}", e),
+                    Ok(()) => {
+                        info!("shutdown RDB save complete");
+                        db.stats.bgsave_last_status.store(0, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        error!("shutdown RDB save failed: {}", e);
+                        db.stats.bgsave_last_status.store(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -216,6 +281,72 @@ impl Listener {
     }
 }
 
+/// Accept loop for the TLS listener — mirrors the plain-TCP loop in
+/// `Listener::run`, except each accepted socket is upgraded via
+/// `TlsAcceptor::accept` before a `Connection` is spawned for it. Runs as
+/// its own task so a slow/failed TLS handshake never blocks the plain
+/// listener, and stops on the same shared shutdown signal.
+#[cfg(feature = "tls")]
+#[allow(clippy::too_many_arguments)]
+async fn run_tls_accept_loop(
+    listener: TcpListener,
+    acceptor: nexrade_tls::TlsAcceptor,
+    db: Db,
+    metrics: Option<Metrics>,
+    lua_engine: LuaEngine,
+    function_registry: FunctionRegistry,
+    max_clients: usize,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((tcp_stream, addr)) => {
+                        let _ = tcp_stream.set_nodelay(true);
+                        let active = db.stats.active_connections.load(Ordering::Relaxed);
+                        if active >= max_clients as u64 {
+                            warn!("max clients reached ({}), rejecting TLS {}", max_clients, addr);
+                            drop(tcp_stream);
+                            continue;
+                        }
+
+                        let acceptor = acceptor.clone();
+                        let db = db.clone();
+                        let metrics = metrics.clone();
+                        let lua_engine = lua_engine.clone();
+                        let function_registry = function_registry.clone();
+                        tokio::spawn(async move {
+                            let tls_stream = match acceptor.accept(tcp_stream).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    warn!("TLS handshake failed with {}: {}", addr, e);
+                                    return;
+                                }
+                            };
+                            let conn = Connection::new(
+                                db,
+                                Stream::Tls(Box::new(tls_stream)),
+                                addr,
+                                lua_engine,
+                                function_registry,
+                                metrics,
+                            );
+                            conn.run().await;
+                        });
+                    }
+                    Err(e) => {
+                        error!("TLS accept error: {}", e);
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                break;
+            }
+        }
+    }
+}
+
 /// Background periodic tasks.
 async fn run_background_tasks(db: Db, hz: u32, metrics: Option<Metrics>) {
     let interval = Duration::from_millis(1000 / hz.max(1) as u64);
@@ -226,6 +357,11 @@ async fn run_background_tasks(db: Db, hz: u32, metrics: Option<Metrics>) {
     loop {
         ticker.tick().await;
         ticks += 1;
+
+        // Refresh the cached LRU clock at `hz` frequency. Per-GET
+        // `entry.lru_clock = clock.now()` is now a relaxed atomic load
+        // instead of `SystemTime::now()` (a syscall).
+        db.lru_clock.store(unix_secs() as u32, Ordering::Relaxed);
 
         // Update ops/sec every second (every hz ticks).
         if ticks % hz.max(1) as u64 == 0 {
@@ -282,9 +418,16 @@ async fn run_background_tasks(db: Db, hz: u32, metrics: Option<Metrics>) {
                                     info!("auto BGSAVE completed ({} dirty key(s))", dirty);
                                     stats.dirty_keys.store(0, Ordering::Relaxed);
                                     stats.last_save_time.store(unix_secs(), Ordering::Relaxed);
+                                    stats.bgsave_last_status.store(0, Ordering::Relaxed);
                                 }
-                                Ok(Err(e)) => error!("auto BGSAVE failed: {}", e),
-                                Err(e) => error!("auto BGSAVE task panicked: {}", e),
+                                Ok(Err(e)) => {
+                                    error!("auto BGSAVE failed: {}", e);
+                                    stats.bgsave_last_status.store(1, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    error!("auto BGSAVE task panicked: {}", e);
+                                    stats.bgsave_last_status.store(1, Ordering::Relaxed);
+                                }
                             }
                             stats.bgsave_in_progress.store(false, Ordering::Release);
                         });
@@ -508,7 +651,12 @@ async fn connect_to_primary(db: &Db, host: &str, port: u16, our_port: u16) -> an
                         }
                         continue;
                     }
-                    // Apply the command to local store, bypassing read-only check.
+                    // System-internal: replication-propagated commands were
+                    // already authorized by the primary when their original
+                    // user ran them; the replica mirrors state, not
+                    // independently re-authorizes. See `dispatch()`'s doc
+                    // comment for why user-facing paths must NEVER use
+                    // this helper.
                     let result = dispatch(db, args, 0).await;
                     if let Resp::Error(e) = result {
                         warn!(

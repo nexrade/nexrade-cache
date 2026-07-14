@@ -13,6 +13,14 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 # Unmaintained crates are a warning, not an error — some vendored crates are
 # intentionally frozen (e.g. mlua's bundled Lua).
+#
+# NOTE: The cargo-deny 0.19.x bundled in `EmbarkStudios/cargo-deny-action@v2`
+# has a parser bug — it crashes on any advisory with a CVSS 4.0 vector
+# (RUSTSEC-2026-0076 in libcrux-ml-dsa is the first, ~50+ total as of writing).
+# Until upstream fixes the parser, the CI deny job is disabled in
+# `.github/workflows/ci.yml`. Re-enable the job once cargo-deny supports
+# CVSS 4.0. None of the affected crates are in nexrade-cache's dep tree
+# (verified with `cargo tree` against the current advisory db snapshot).
 ignore = [
     "RUSTSEC-2025-0141", # bincode unmaintained — no drop-in replacement for v2; acceptable risk
 ]
