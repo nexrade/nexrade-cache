@@ -19,9 +19,9 @@
 //! ```
 
 #[cfg(windows)]
-mod windows_svc;
-#[cfg(windows)]
 mod windows_ansi;
+#[cfg(windows)]
+mod windows_svc;
 
 use anyhow::Result;
 use clap::Parser;
