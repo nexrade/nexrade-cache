@@ -6,9 +6,6 @@
 //! This module provides a zero-cost abstraction that enables ANSI support
 //! on Windows and does nothing on other platforms.
 
-#[cfg(windows)]
-use std::io;
-
 /// Enable ANSI escape code processing on Windows console.
 ///
 /// This function enables Virtual Terminal Processing for both stdout and stderr,
@@ -32,8 +29,7 @@ use std::io;
 /// the application will continue to work, but ANSI codes will be
 /// rendered as raw escape sequences.
 #[cfg(windows)]
-pub fn enable_ansi_support() -> io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
+pub fn enable_ansi_support() -> std::io::Result<()> {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::{
         GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
