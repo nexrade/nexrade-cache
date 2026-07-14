@@ -17,15 +17,12 @@ fn get_or_create_hash<'a>(
     db: &'a mut crate::store::Database,
     key: &[u8],
 ) -> Result<&'a mut HashMap<Vec<u8>, Vec<u8>>> {
-    if !db.contains_key(key) {
-        db.insert(key.to_vec(), Entry::new(DataType::Hash(HashMap::new())));
-    }
-    match db.get_mut(key) {
-        Some(e) => match &mut e.value {
-            DataType::Hash(h) => Ok(h),
-            _ => Err(NexradeError::WrongType),
-        },
-        None => unreachable!(),
+    // Single HashMap lookup via `get_or_insert_with` instead of the old
+    // contains_key + insert + get_mut (up to 3 lookups on the hot path).
+    let entry = db.get_or_insert_with(key, || Entry::new(DataType::Hash(HashMap::new())));
+    match &mut entry.value {
+        DataType::Hash(h) => Ok(h),
+        _ => Err(NexradeError::WrongType),
     }
 }
 

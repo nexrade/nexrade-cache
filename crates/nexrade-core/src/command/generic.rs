@@ -112,6 +112,41 @@ async fn set_expire(
         )));
     }
 
+    // Parse conditional options: NX | XX | GT | LT (Redis 7.0+).
+    let mut nx = false;
+    let mut xx = false;
+    let mut gt = false;
+    let mut lt = false;
+    let mut i = 3;
+    while i < args.len() {
+        let opt = get_str(args, i, cmd)?.to_uppercase();
+        match opt.as_str() {
+            "NX" => {
+                nx = true;
+                i += 1;
+            }
+            "XX" => {
+                xx = true;
+                i += 1;
+            }
+            "GT" => {
+                gt = true;
+                i += 1;
+            }
+            "LT" => {
+                lt = true;
+                i += 1;
+            }
+            _ => {
+                return Err(NexradeError::SyntaxError);
+            }
+        }
+    }
+    let cond_count = (nx as u8) + (xx as u8) + (gt as u8) + (lt as u8);
+    if cond_count > 1 {
+        return Err(NexradeError::SyntaxError);
+    }
+
     let expiry = if absolute {
         if millis {
             Expiry::from_ms(val as u64)
@@ -125,9 +160,51 @@ async fn set_expire(
     };
 
     let mut store_db = db.store.db(db_index).write_for(&key);
-    if store_db.get(&key).is_none() {
+
+    // Key must exist for any expire command to apply. Return 0 immediately
+    // if not, regardless of NX/XX/GT/LT flags.
+    let entry = match store_db.get(&key) {
+        None => return Ok(Resp::int(0)),
+        Some(e) => e,
+    };
+
+    let current_expiry_ms: Option<u64> = entry
+        .expiry
+        .as_ref()
+        .map(|e| e.expires_at_ms.min(u64::MAX as u128) as u64);
+
+    // Evaluate conditional flags.
+    if nx && current_expiry_ms.is_some() {
         return Ok(Resp::int(0));
     }
+    if xx && current_expiry_ms.is_none() {
+        return Ok(Resp::int(0));
+    }
+    if gt {
+        match current_expiry_ms {
+            None => {
+                // No existing expiry: GT condition is always met (the new
+                // expiry strictly reduces the key's lifetime to a definite
+                // value).
+            }
+            Some(cur) => {
+                if expiry.expires_at_ms.min(u64::MAX as u128) as u64 <= cur {
+                    return Ok(Resp::int(0));
+                }
+            }
+        }
+    }
+    if lt {
+        match current_expiry_ms {
+            None => return Ok(Resp::int(0)),
+            Some(cur) => {
+                if expiry.expires_at_ms.min(u64::MAX as u128) as u64 >= cur {
+                    return Ok(Resp::int(0));
+                }
+            }
+        }
+    }
+
     store_db.set_expiry(&key, Some(expiry));
     Ok(Resp::int(1))
 }
@@ -291,7 +368,7 @@ pub async fn cmd_scan(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
             "COUNT" => {
                 let n = get_i64(args, i + 1, "SCAN")?;
                 if n <= 0 {
-                    return Err(NexradeError::Generic("ERR syntax error".to_string()));
+                    return Err(NexradeError::Generic("syntax error".to_string()));
                 }
                 count = n as usize;
                 i += 2;
@@ -430,27 +507,89 @@ pub async fn cmd_restore(_db: &Db, _args: &[Resp], _db_index: usize) -> Result<R
 }
 
 pub async fn cmd_sort(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    sort_inner(db, args, db_index, true).await
+}
+
+/// `SORT_RO key [BY pattern] [LIMIT offset count] [GET pattern [GET ...]]
+///             [ASC | DESC] [ALPHA]`
+///
+/// Read-only variant — same options as SORT except STORE is not allowed.
+/// Mirrors Redis 7.4 semantics.
+pub async fn cmd_sort_ro(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    if args
+        .iter()
+        .any(|a| a.as_str().is_some_and(|s| s.eq_ignore_ascii_case("STORE")))
+    {
+        return Err(NexradeError::Generic(
+            "ERR SORT_RO does not support STORE".to_string(),
+        ));
+    }
+    sort_inner(db, args, db_index, false).await
+}
+
+async fn sort_inner(
+    db: &Db,
+    args: &[Resp],
+    db_index: usize,
+    take_write_lock: bool,
+) -> Result<Resp> {
     if args.len() < 2 {
         return Err(NexradeError::WrongArity("sort".to_string()));
     }
     let key = get_bytes_vec(args, 1, "SORT")?;
-    let mut store_db = db.store.db(db_index).write_for(&key);
 
-    let mut items: Vec<Vec<u8>> = match store_db.get(&key) {
-        None => return Ok(Resp::array(vec![])),
-        Some(e) => match &e.value {
-            crate::types::DataType::List(l) => l.iter().map(|v| v.to_vec()).collect(),
-            crate::types::DataType::Set(s) => s.iter().cloned().collect(),
-            _ => return Err(NexradeError::WrongType),
-        },
+    // Acquire either a read or write lock depending on the variant. We drop
+    // the guard before sorting to avoid holding the shard lock across the
+    // (potentially expensive) sort. The lock is only needed for type-check
+    // and copy.
+    enum ListOrSet {
+        List(Vec<Vec<u8>>),
+        Set(Vec<Vec<u8>>),
+    }
+    let items: ListOrSet = if take_write_lock {
+        let mut store_db = db.store.db(db_index).write_for(&key);
+        match store_db.get(&key) {
+            None => return Ok(Resp::array(vec![])),
+            Some(e) => match &e.value {
+                crate::types::DataType::List(l) => {
+                    ListOrSet::List(l.iter().map(|v| v.to_vec()).collect())
+                }
+                crate::types::DataType::Set(s) => ListOrSet::Set(s.iter().cloned().collect()),
+                _ => return Err(NexradeError::WrongType),
+            },
+        }
+    } else {
+        let store_db = db.store.db(db_index).read_for(&key);
+        match store_db.get_ro(&key) {
+            None => return Ok(Resp::array(vec![])),
+            Some(e) => match &e.value {
+                crate::types::DataType::List(l) => {
+                    ListOrSet::List(l.iter().map(|v| v.to_vec()).collect())
+                }
+                crate::types::DataType::Set(s) => ListOrSet::Set(s.iter().cloned().collect()),
+                _ => return Err(NexradeError::WrongType),
+            },
+        }
     };
 
+    // Pull the BY / LIMIT / GET / ASC|DESC / ALPHA options out so the
+    // remaining identical logic can run.
     let alpha = args
         .iter()
         .any(|a| a.as_str().is_some_and(|s| s.eq_ignore_ascii_case("ALPHA")));
     let desc = args
         .iter()
         .any(|a| a.as_str().is_some_and(|s| s.eq_ignore_ascii_case("DESC")));
+    let store_requested = !take_write_lock  // SORT_RO path runs this
+        && args
+            .iter()
+            .any(|a| a.as_str().is_some_and(|s| s.eq_ignore_ascii_case("STORE")));
+    debug_assert!(!store_requested, "STORE should have been rejected above");
+    let _ = store_requested;
+
+    let mut items: Vec<Vec<u8>> = match items {
+        ListOrSet::List(v) | ListOrSet::Set(v) => v,
+    };
 
     if alpha {
         items.sort();

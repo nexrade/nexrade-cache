@@ -1,6 +1,6 @@
 //! High-level database handle combining Store + PubSub + config.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
@@ -9,6 +9,9 @@ use std::time::SystemTime;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
+use crate::acl::AclManager;
+use crate::cluster::generate_node_id;
+use crate::conn_registry::ConnectionRegistry;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::persistence::AofWriter;
 use crate::persistence::PersistenceConfig;
@@ -17,6 +20,7 @@ use crate::pubsub::PubSub;
 use crate::replication::ReplicationState;
 use crate::slowlog::SlowLog;
 use crate::store::Store;
+use crate::tracking::TrackingRegistry;
 
 /// Shared server state — cloneable handle passed to every connection.
 #[derive(Clone)]
@@ -29,6 +33,11 @@ pub struct Db {
     pub list_notify: Arc<Notify>,
     /// Notify waiting BLMOVE callers.
     pub move_notify: Arc<Notify>,
+    /// Notify waiting XREAD/XREADGROUP BLOCK callers when a new entry is
+    /// appended to a stream. Single global notification is enough because
+    /// stream keys are already sharded — the wakeup is filtered by key in the
+    /// caller's re-check loop.
+    pub stream_notify: Arc<Notify>,
     /// Monotonically increasing client ID counter.
     pub next_client_id: Arc<AtomicU64>,
     /// AOF writer — shared across all connections (None if AOF is disabled).
@@ -41,6 +50,36 @@ pub struct Db {
     pub replication: Arc<ReplicationState>,
     /// Signalled by SHUTDOWN command to trigger graceful server exit.
     pub shutdown: Arc<Notify>,
+    /// Cached LRU clock, updated by the background tick task. Reading this
+    /// is a single atomic load — much cheaper than `SystemTime::now()` per
+    /// access. Resolution is `1/hz` seconds.
+    pub lru_clock: Arc<AtomicU32>,
+    /// Server-wide ACL state — multi-user auth + per-command / per-key
+    /// permissions. Cloning is cheap (Arc-internal).
+    pub acl: AclManager,
+    /// CLIENT TRACKING registry — per-client tracking state + key index
+    /// for invalidation push delivery. Cloning is cheap (Arc-internal).
+    pub tracking: TrackingRegistry,
+    /// ACL permission checks (`AclManager::check_permission`) integrated into command dispatch.
+    /// Server-wide registry of live TCP connections for `CLIENT LIST`,
+    /// `CLIENT INFO`, `CLIENT KILL`, `CLIENT PAUSE`. Cloning is cheap
+    /// (Arc-internal).
+    pub connections: ConnectionRegistry,
+    /// Stable 40-char hex node id for this server. Used by `CLUSTER MYID`
+    /// and `CLUSTER NODES`. Generated at startup from a UUIDv4.
+    pub cluster_node_id: String,
+    /// Whether the cluster slot routing is active. When false, no
+    /// MOVED/CROSSSLOT replies are emitted — the server behaves as a
+    /// standalone. Set via `cluster_enabled` config; defaults false so
+    /// the default user experience is unaffected.
+    pub cluster_enabled: Arc<AtomicBool>,
+    /// Lock-free mirror of `config.max_memory`. 0 means "no limit" so
+    /// the dispatch path can skip the eviction check entirely without
+    /// taking the config lock.
+    pub max_memory_limit: Arc<AtomicUsize>,
+    /// Lock-free mirror of `config.maxmemory_policy` encoded as a u8
+    /// (matches the discriminant). Default `NoEviction` is 0.
+    pub maxmemory_policy: Arc<AtomicU8>,
 }
 
 impl Db {
@@ -56,18 +95,27 @@ impl Db {
             let replication_id = ReplicationState::generate_replication_id();
             let repl = ReplicationState::new_primary(replication_id);
             if let Some(ref ro) = replica_of {
-                *repl.role.write() = crate::replication::ReplicationRole::Replica;
+                repl.set_role(crate::replication::ReplicationRole::Replica);
                 *repl.replica_of.write() = Some(ro.clone());
             }
             repl
         };
+        let lru_clock_atomic = Arc::new(AtomicU32::new(current_lru_secs()));
+        let lru_clock = crate::store::LruClock::new(lru_clock_atomic.clone());
+        let mut store = Store::new(db_count);
+        store.set_lru_clock(lru_clock);
+        // Snapshot the initial config into lock-free atomics BEFORE
+        // the config Arc is constructed.
+        let initial_max_memory = config.max_memory.unwrap_or(0);
+        let initial_maxmemory_policy = config.maxmemory_policy.clone() as u8;
         Self {
-            store: Store::new(db_count),
+            store,
             pubsub: PubSub::new(),
             config: Arc::new(Mutex::new(config)),
             stats: Arc::new(Stats::default()),
             list_notify: Arc::new(Notify::new()),
             move_notify: Arc::new(Notify::new()),
+            stream_notify: Arc::new(Notify::new()),
             next_client_id: Arc::new(AtomicU64::new(1)),
             #[cfg(not(target_arch = "wasm32"))]
             aof_writer: Arc::new(Mutex::new(None)),
@@ -75,12 +123,30 @@ impl Db {
             #[cfg(not(target_arch = "wasm32"))]
             replication,
             shutdown: Arc::new(Notify::new()),
+            lru_clock: lru_clock_atomic,
+            acl: AclManager::new(),
+            tracking: TrackingRegistry::new(),
+            connections: ConnectionRegistry::new(),
+            cluster_node_id: generate_node_id(),
+            cluster_enabled: Arc::new(AtomicBool::new(false)),
+            // Mirror the initial config into the lock-free atomics so
+            // the dispatch fast path is correct on startup.
+            max_memory_limit: Arc::new(AtomicUsize::new(initial_max_memory)),
+            maxmemory_policy: Arc::new(AtomicU8::new(initial_maxmemory_policy)),
         }
     }
 
     pub fn db_count(&self) -> usize {
         self.store.db_count
     }
+}
+
+/// Read the current Unix timestamp in whole seconds.
+fn current_lru_secs() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32
 }
 
 impl Default for Db {
@@ -109,6 +175,18 @@ pub struct Stats {
     pub aof_enabled: AtomicBool,
     /// True when a background RDB save is in progress (prevents concurrent saves).
     pub bgsave_in_progress: AtomicBool,
+    /// Outcome of the most recent RDB save — 0 = ok, 1 = error. Surfaced
+    /// via `INFO persistence` `rdb_last_bgsave_status` so operators can
+    /// tell failed saves apart from successful ones.
+    pub bgsave_last_status: AtomicU8,
+    /// True while a background AOF rewrite is in flight (only one
+    /// concurrent rewrite is allowed; a second `BGREWRITEAOF` while this
+    /// is set should be rejected). Surfaced via `INFO persistence`
+    /// `aof_rewrite_in_progress`.
+    pub aof_rewrite_in_progress: AtomicBool,
+    /// Outcome of the most recent AOF rewrite — 0 = ok, 1 = error.
+    /// Surfaced via `INFO persistence` `aof_last_bgrewrite_status`.
+    pub aof_rewrite_last_status: AtomicU8,
     /// Approximate operations per second (updated by background task).
     pub ops_per_sec: AtomicU64,
     /// Snapshot of total_commands from the previous background tick.
@@ -169,20 +247,21 @@ impl Stats {
 
 /// Eviction policy applied when `max_memory` is exceeded.
 #[derive(Debug, Clone, PartialEq, Default)]
+#[repr(u8)]
 pub enum MaxMemoryPolicy {
     /// Return an error on writes when limit is reached (default).
     #[default]
-    NoEviction,
+    NoEviction = 0,
     /// Evict any random key across all databases.
-    AllKeysRandom,
+    AllKeysRandom = 1,
     /// Evict the least-recently-used key across all databases.
-    AllKeysLru,
+    AllKeysLru = 2,
     /// Evict a random key that has a TTL set.
-    VolatileRandom,
+    VolatileRandom = 3,
     /// Evict the least-recently-used key that has a TTL set.
-    VolatileLru,
+    VolatileLru = 4,
     /// Evict the key with the soonest expiry time.
-    VolatileTtl,
+    VolatileTtl = 5,
 }
 
 impl std::str::FromStr for MaxMemoryPolicy {

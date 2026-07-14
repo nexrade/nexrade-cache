@@ -21,6 +21,6 @@ pub mod counters;
 pub mod server;
 pub mod tracing_setup;
 
-pub use counters::Metrics;
+pub use counters::{CommandMetricHandles, Metrics};
 pub use server::MetricsServer;
 pub use tracing_setup::init_tracing;

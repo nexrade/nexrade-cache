@@ -19,3 +19,9 @@ name = "resp_parser"
 path = "fuzz_targets/resp_parser.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "resp_serialize_roundtrip"
+path = "fuzz_targets/resp_serialize_roundtrip.rs"
+test = false
+doc = false

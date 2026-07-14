@@ -517,7 +517,7 @@ pub async fn cmd_georadiusbymember(db: &Db, args: &[Resp], db_index: usize) -> R
     let center = geo
         .members
         .get(&member)
-        .ok_or_else(|| NexradeError::Generic("ERR could not hget key".to_string()))?;
+        .ok_or_else(|| NexradeError::Generic("could not hget key".to_string()))?;
     let (clon, clat) = (center.longitude, center.latitude);
     let opts = GeoSearchOpts {
         center_lon: clon,
@@ -571,12 +571,12 @@ pub async fn cmd_geosearch(db: &Db, args: &[Resp], db_index: usize) -> Result<Re
             let store_db = db.store.db(db_index).read_for(&key);
             let entry = store_db
                 .get_ro(&key)
-                .ok_or_else(|| NexradeError::Generic("ERR no such key".to_string()))?;
+                .ok_or_else(|| NexradeError::Generic("no such key".to_string()))?;
             let geo = get_geo_ro(entry)?;
             let pt = geo
                 .members
                 .get(&member)
-                .ok_or_else(|| NexradeError::Generic("ERR could not hget key".to_string()))?;
+                .ok_or_else(|| NexradeError::Generic("could not hget key".to_string()))?;
             (pt.longitude, pt.latitude, 4usize)
         }
         _ => return Err(NexradeError::SyntaxError),

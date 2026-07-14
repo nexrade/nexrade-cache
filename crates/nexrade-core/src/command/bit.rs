@@ -16,10 +16,15 @@ fn ensure_bitmap(bits: &mut Vec<u8>, byte_idx: usize) {
     }
 }
 
-/// Get a byte slice from a store entry that may be String or Bitmap.
-fn get_bitmap_bytes(entry: &Entry) -> Result<&Vec<u8>> {
+/// Get the byte representation of a store entry that may be String, Bitmap,
+/// or Int (an int-encoded string is still a string for bit-op purposes, same
+/// as real Redis). Returns owned bytes since `Int`'s decimal-ASCII form has
+/// no `Vec<u8>` to borrow — matches how most call sites already `.clone()`
+/// the borrowed form immediately anyway.
+fn get_bitmap_bytes(entry: &Entry) -> Result<Vec<u8>> {
     match &entry.value {
-        DataType::String(v) | DataType::Bitmap(v) => Ok(v),
+        DataType::String(v) | DataType::Bitmap(v) => Ok(v.clone()),
+        DataType::Int(cell) => Ok(cell.load().to_string().into_bytes()),
         _ => Err(NexradeError::WrongType),
     }
 }
@@ -47,6 +52,15 @@ pub async fn cmd_setbit(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
     let bit_pos = 7 - (offset % 8) as u8; // Redis stores MSB first
 
     let mut store_db = db.store.db(db_index).write_for(&key);
+    // SETBIT mutates raw bytes in place, which an atomic `Int` cell has no
+    // bytes to offer — demote to a plain `String` first (same decimal bytes
+    // GET would have returned) so the shared match below can mutate a
+    // `Vec<u8>` uniformly. No-op for every other variant.
+    if let Some(entry) = store_db.get_mut(&key) {
+        if let DataType::Int(cell) = &entry.value {
+            entry.value = DataType::String(cell.load().to_string().into_bytes());
+        }
+    }
     let old_bit = match store_db.get_mut(&key) {
         Some(entry) => match &mut entry.value {
             DataType::String(v) | DataType::Bitmap(v) => {
@@ -374,6 +388,14 @@ pub async fn cmd_bitfield(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
                 let new_val = get_i64(args, i + 3, "BITFIELD")?;
                 i += 4;
                 let mut store_db = db.store.db(db_index).write_for(&key);
+                // Demote an atomic Int cell to a plain String first — see
+                // the comment in cmd_setbit for why in-place byte mutation
+                // can't operate directly on the atomic representation.
+                if let Some(entry) = store_db.get_mut(&key) {
+                    if let DataType::Int(cell) = &entry.value {
+                        entry.value = DataType::String(cell.load().to_string().into_bytes());
+                    }
+                }
                 let old_val = match store_db.get_mut(&key) {
                     None => {
                         let byte_len = (bit_offset + bits).div_ceil(8);
@@ -402,6 +424,12 @@ pub async fn cmd_bitfield(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
                 let incr = get_i64(args, i + 3, "BITFIELD")?;
                 i += 4;
                 let mut store_db = db.store.db(db_index).write_for(&key);
+                // Same Int-cell demotion as BITFIELD SET above.
+                if let Some(entry) = store_db.get_mut(&key) {
+                    if let DataType::Int(cell) = &entry.value {
+                        entry.value = DataType::String(cell.load().to_string().into_bytes());
+                    }
+                }
                 let new_val = match store_db.get_mut(&key) {
                     None => {
                         let byte_len = (bit_offset + bits).div_ceil(8);

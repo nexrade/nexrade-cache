@@ -42,6 +42,17 @@ pub struct Metrics {
     pub aof_appends_total: CounterVec,
 }
 
+/// Pre-resolved per-command metric handles — see `Metrics::handles_for`.
+/// Each field is an `Arc`-backed handle from the underlying `*Vec`, so
+/// cloning `CommandMetricHandles` itself (e.g. to cache it on a
+/// `Connection`) is cheap.
+#[derive(Clone)]
+pub struct CommandMetricHandles {
+    total: prometheus::Counter,
+    duration: prometheus::Histogram,
+    errors: prometheus::Counter,
+}
+
 impl Metrics {
     pub fn new() -> Self {
         let registry = Arc::new(Registry::new());
@@ -170,6 +181,40 @@ impl Metrics {
             .observe(duration_secs);
         if error {
             self.command_errors_total.with_label_values(&[cmd]).inc();
+        }
+    }
+
+    /// Fetch (or create) the metric handles for `cmd`. Each handle is a
+    /// cheap-to-clone `Arc`-backed metric — the intended use is to cache
+    /// the returned struct (e.g. on a `Connection`, keyed by the last-seen
+    /// command name) and call `record_with_handles` for consecutive
+    /// same-named commands, skipping `MetricVec::with_label_values`'s
+    /// per-call FNV hash + `RwLock::read()` + `HashMap` lookup + `Arc`
+    /// clone (paid 2-3x per command otherwise: once each for
+    /// `commands_total`, `command_duration_seconds`, and
+    /// `command_errors_total`). This is exactly the pattern a pipelined
+    /// batch hits, since redis-benchmark-style workloads send runs of the
+    /// same command repeatedly.
+    ///
+    /// Fetching `command_errors_total`'s handle unconditionally (instead of
+    /// only on error, as `record_command` does) eagerly creates that
+    /// command's error-counter series at 0 rather than on first error —
+    /// same eventual reported value, just created a bit earlier.
+    pub fn handles_for(&self, cmd: &str) -> CommandMetricHandles {
+        CommandMetricHandles {
+            total: self.commands_total.with_label_values(&[cmd]),
+            duration: self.command_duration_seconds.with_label_values(&[cmd]),
+            errors: self.command_errors_total.with_label_values(&[cmd]),
+        }
+    }
+
+    /// Record using pre-fetched handles from `handles_for` — no label
+    /// lookup, just three direct metric updates.
+    pub fn record_with_handles(handles: &CommandMetricHandles, duration_secs: f64, error: bool) {
+        handles.total.inc();
+        handles.duration.observe(duration_secs);
+        if error {
+            handles.errors.inc();
         }
     }
 

@@ -22,7 +22,7 @@ use nexrade_core::resp::{Resp, RespParser};
 #[derive(Parser, Debug)]
 #[command(
     name = "nexrade-cli",
-    version = "0.1.0",
+    version = "0.2.0",
     about = "Interactive CLI client for nexrade-cache",
     disable_help_flag = true
 )]

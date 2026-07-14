@@ -105,9 +105,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "arraydeque"
@@ -1013,7 +1013,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-cache"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1028,11 +1028,12 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-service",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "nexrade-core"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "atoi",
@@ -1042,20 +1043,25 @@ dependencies = [
  "criterion",
  "dashmap",
  "futures",
+ "hex",
  "indexmap",
+ "itoa",
+ "libc",
  "ordered-float",
  "parking_lot",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "nexrade-lua"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1071,7 +1077,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-metrics"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "nexrade-core",
@@ -1084,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-plugin"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1097,7 +1103,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-server"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1109,9 +1115,12 @@ dependencies = [
  "nexrade-metrics",
  "nexrade-tls",
  "parking_lot",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
@@ -1119,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-tls"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1133,7 +1142,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-wasm"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",

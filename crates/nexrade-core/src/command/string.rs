@@ -17,7 +17,13 @@ pub async fn cmd_set(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
         return Err(NexradeError::WrongArity("set".to_string()));
     }
 
-    let key = get_bytes_vec(args, 1, "SET")?;
+    // Use the Bytes-backed getter for the key (cheap refcount clone)
+    // since `write_for` only needs a borrowed slice. The value still
+    // needs a Vec<u8> because the Entry stores an owned DataType::String.
+    let key = match args.get(1).and_then(|a| a.as_bytes()) {
+        Some(b) => b.clone(),
+        None => return Err(NexradeError::WrongArity("set".to_string())),
+    };
     let value = get_bytes_vec(args, 2, "SET")?;
 
     let mut expiry: Option<Expiry> = None;
@@ -25,6 +31,9 @@ pub async fn cmd_set(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     let mut xx = false;
     let mut get = false;
     let mut keepttl = false;
+    let mut ifeq: Option<Vec<u8>> = None;
+    let mut ifgt: Option<Vec<u8>> = None;
+    let mut iflt: Option<Vec<u8>> = None;
 
     let mut i = 3;
     while i < args.len() {
@@ -86,10 +95,31 @@ pub async fn cmd_set(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
                 keepttl = true;
                 i += 1;
             }
+            "IFEQ" => {
+                ifeq = Some(get_bytes_vec(args, i + 1, "SET")?);
+                i += 2;
+            }
+            "IFGT" => {
+                ifgt = Some(get_bytes_vec(args, i + 1, "SET")?);
+                i += 2;
+            }
+            "IFLT" => {
+                iflt = Some(get_bytes_vec(args, i + 1, "SET")?);
+                i += 2;
+            }
             _ => {
                 return Err(NexradeError::SyntaxError);
             }
         }
+    }
+
+    // IFEQ/IFGT/IFLT are mutually exclusive with each other and with NX/XX.
+    let cond_count = (ifeq.is_some() as u8) + (ifgt.is_some() as u8) + (iflt.is_some() as u8);
+    if cond_count > 1 {
+        return Err(NexradeError::SyntaxError);
+    }
+    if cond_count == 1 && (nx || xx) {
+        return Err(NexradeError::SyntaxError);
     }
 
     let mut store_db = db.store.db(db_index).write_for(&key);
@@ -97,9 +127,9 @@ pub async fn cmd_set(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     // GET option: return old value before SET
     let old_value = if get {
         match store_db.get(&key) {
-            Some(e) => match &e.value {
-                DataType::String(v) => Some(Resp::bulk(Bytes::from(v.clone()))),
-                _ => return Err(NexradeError::WrongType),
+            Some(e) => match e.value.as_string_bytes() {
+                Some(v) => Some(Resp::bulk(Bytes::from(v))),
+                None => return Err(NexradeError::WrongType),
             },
             None => Some(Resp::null()),
         }
@@ -107,21 +137,58 @@ pub async fn cmd_set(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
         None
     };
 
-    let exists = store_db.contains_key(&key);
-
-    if nx && exists {
-        return Ok(if get {
-            old_value.unwrap()
-        } else {
-            Resp::null()
-        });
+    // Only pay for the existence lookup when NX/XX actually need it — the
+    // common `SET k v` path (no flags) skips straight to IFEQ/KEEPTTL/insert,
+    // saving one HashMap probe per SET.
+    if nx || xx {
+        let exists = store_db.contains_key(&key);
+        if nx && exists {
+            return Ok(if get {
+                old_value.unwrap()
+            } else {
+                Resp::null()
+            });
+        }
+        if xx && !exists {
+            return Ok(if get {
+                old_value.unwrap()
+            } else {
+                Resp::null()
+            });
+        }
     }
-    if xx && !exists {
-        return Ok(if get {
-            old_value.unwrap()
-        } else {
-            Resp::null()
-        });
+
+    // IFEQ / IFGT / IFLT: compare against the current value. If the
+    // comparison fails (including when the key doesn't exist), the SET is
+    // a no-op and we return nil. With GET the old value is still returned
+    // (Redis 7.4 behaviour).
+    if ifeq.is_some() || ifgt.is_some() || iflt.is_some() {
+        let passes = match store_db.get(&key) {
+            Some(e) => {
+                let cur = match e.value.as_string_bytes() {
+                    Some(v) => v,
+                    None => return Err(NexradeError::WrongType),
+                };
+                let cur: &[u8] = &cur;
+                if let Some(target) = &ifeq {
+                    cur == target.as_slice()
+                } else if let Some(target) = &ifgt {
+                    compare_gt(cur, target)
+                } else if let Some(target) = &iflt {
+                    compare_lt(cur, target)
+                } else {
+                    false
+                }
+            }
+            None => false,
+        };
+        if !passes {
+            return Ok(if get {
+                old_value.unwrap()
+            } else {
+                Resp::null()
+            });
+        }
     }
 
     // KEEPTTL: preserve the expiry already on the key (if any).
@@ -135,9 +202,44 @@ pub async fn cmd_set(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
         Some(exp) => Entry::with_expiry(DataType::String(value), exp),
         None => Entry::new(DataType::String(value)),
     };
-    store_db.insert(key, entry);
+    // Convert the `Bytes` key into an owned `Vec<u8>` only at insertion,
+    // since `HashMap::insert` requires owned keys. The earlier lookup
+    // and shard-acquire paths used the cheaper `Bytes::clone`.
+    store_db.insert(key.to_vec(), entry);
 
     Ok(if get { old_value.unwrap() } else { Resp::ok() })
+}
+
+/// Compare two byte strings. If both parse as f64, compare numerically;
+/// otherwise fall back to lex comparison.
+fn compare_gt(a: &[u8], b: &[u8]) -> bool {
+    if let (Some(an), Some(bn)) = (
+        std::str::from_utf8(a)
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok()),
+        std::str::from_utf8(b)
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok()),
+    ) {
+        an > bn
+    } else {
+        a > b
+    }
+}
+
+fn compare_lt(a: &[u8], b: &[u8]) -> bool {
+    if let (Some(an), Some(bn)) = (
+        std::str::from_utf8(a)
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok()),
+        std::str::from_utf8(b)
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok()),
+    ) {
+        an < bn
+    } else {
+        a < b
+    }
 }
 
 pub async fn cmd_get(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
@@ -149,9 +251,9 @@ pub async fn cmd_get(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
 
     match store_db.get_ro(&key) {
         None => Ok(Resp::null()),
-        Some(e) => match &e.value {
-            DataType::String(v) => Ok(Resp::bulk(Bytes::from(v.clone()))),
-            _ => Err(NexradeError::WrongType),
+        Some(e) => match e.value.as_string_bytes() {
+            Some(v) => Ok(Resp::bulk(Bytes::from(v))),
+            None => Err(NexradeError::WrongType),
         },
     }
 }
@@ -166,9 +268,9 @@ pub async fn cmd_getset(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
     let mut store_db = db.store.db(db_index).write_for(&key);
     let old = match store_db.get(&key) {
         None => Resp::null(),
-        Some(e) => match &e.value {
-            DataType::String(v) => Resp::bulk(Bytes::from(v.clone())),
-            _ => return Err(NexradeError::WrongType),
+        Some(e) => match e.value.as_string_bytes() {
+            Some(v) => Resp::bulk(Bytes::from(v)),
+            None => return Err(NexradeError::WrongType),
         },
     };
     store_db.insert(key, Entry::new(DataType::String(value)));
@@ -184,9 +286,9 @@ pub async fn cmd_getdel(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
 
     match store_db.remove(&key) {
         None => Ok(Resp::null()),
-        Some(e) => match e.value {
-            DataType::String(v) => Ok(Resp::bulk(Bytes::from(v))),
-            _ => Err(NexradeError::WrongType),
+        Some(e) => match e.value.as_string_bytes() {
+            Some(v) => Ok(Resp::bulk(Bytes::from(v))),
+            None => Err(NexradeError::WrongType),
         },
     }
 }
@@ -200,9 +302,9 @@ pub async fn cmd_getex(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
 
     let old = match store_db.get(&key) {
         None => return Ok(Resp::null()),
-        Some(e) => match &e.value {
-            DataType::String(v) => Bytes::from(v.clone()),
-            _ => return Err(NexradeError::WrongType),
+        Some(e) => match e.value.as_string_bytes() {
+            Some(v) => Bytes::from(v),
+            None => return Err(NexradeError::WrongType),
         },
     };
 
@@ -317,9 +419,9 @@ pub async fn cmd_mget(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
         let key = get_bytes_vec(args, i, "MGET")?;
         let val = match sdb.read_for(&key).get_ro(&key) {
             None => Resp::null(),
-            Some(e) => match &e.value {
-                DataType::String(v) => Resp::bulk(Bytes::from(v.clone())),
-                _ => Resp::null(),
+            Some(e) => match e.value.as_string_bytes() {
+                Some(v) => Resp::bulk(Bytes::from(v)),
+                None => Resp::null(),
             },
         };
         results.push(val);
@@ -420,25 +522,15 @@ async fn incr_by(db: &Db, args: &[Resp], db_index: usize, delta: i64, cmd: &str)
         return Err(NexradeError::WrongArity(cmd.to_string()));
     }
     let key = get_bytes_vec(args, 1, cmd)?;
-    let mut store_db = db.store.db(db_index).write_for(&key);
 
-    let current: i64 = match store_db.get(&key) {
-        None => 0,
-        Some(e) => match &e.value {
-            DataType::String(v) => std::str::from_utf8(v)
-                .map_err(|_| NexradeError::NotInteger)?
-                .parse()
-                .map_err(|_| NexradeError::NotInteger)?,
-            _ => return Err(NexradeError::WrongType),
-        },
-    };
-
-    let new_val = current.checked_add(delta).ok_or(NexradeError::Overflow)?;
-
-    store_db.insert(
-        key,
-        Entry::new(DataType::String(new_val.to_string().into_bytes())),
-    );
+    // Lock acquisition is now the dispatcher's call, not ours: on an
+    // already-promoted, non-expired `Int` key it takes only a shared read
+    // lock and mutates the cell via CAS; otherwise it falls back to the
+    // exclusive write-lock slow path (creation, promotion, expiry) — see
+    // `ShardedDatabase::incr_int`. Either way, TTL is preserved (the fast
+    // path never touches the `Entry` at all; the slow path mutates it in
+    // place, same as before).
+    let new_val = db.store.db(db_index).incr_int(&key, delta)?;
     Ok(Resp::int(new_val))
 }
 
@@ -453,12 +545,12 @@ pub async fn cmd_incrbyfloat(db: &Db, args: &[Resp], db_index: usize) -> Result<
 
     let current: f64 = match store_db.get(&key) {
         None => 0.0,
-        Some(e) => match &e.value {
-            DataType::String(v) => std::str::from_utf8(v)
+        Some(e) => match e.value.as_string_bytes() {
+            Some(v) => std::str::from_utf8(&v)
                 .map_err(|_| NexradeError::NotFloat)?
                 .parse()
                 .map_err(|_| NexradeError::NotFloat)?,
-            _ => return Err(NexradeError::WrongType),
+            None => return Err(NexradeError::WrongType),
         },
     };
 
@@ -504,6 +596,17 @@ pub async fn cmd_append(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
                 let len = v.len() as i64;
                 Ok(Resp::int(len))
             }
+            // APPEND always demotes an int-encoded key to a raw String —
+            // real Redis does the same (int encoding can't be appended to
+            // in place). Build the concatenated bytes and replace the entry.
+            DataType::Int(cell) => {
+                let mut buf = itoa::Buffer::new();
+                let mut v = buf.format(cell.load()).as_bytes().to_vec();
+                v.extend_from_slice(&val);
+                let len = v.len() as i64;
+                e.value = DataType::String(v);
+                Ok(Resp::int(len))
+            }
             _ => Err(NexradeError::WrongType),
         },
         None => {
@@ -523,9 +626,9 @@ pub async fn cmd_strlen(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
 
     match store_db.get_ro(&key) {
         None => Ok(Resp::int(0)),
-        Some(e) => match &e.value {
-            DataType::String(v) => Ok(Resp::int(v.len() as i64)),
-            _ => Err(NexradeError::WrongType),
+        Some(e) => match e.value.as_string_bytes() {
+            Some(v) => Ok(Resp::int(v.len() as i64)),
+            None => Err(NexradeError::WrongType),
         },
     }
 }
@@ -542,9 +645,9 @@ pub async fn cmd_getrange(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
 
     let bytes = match store_db.get_ro(&key) {
         None => return Ok(Resp::bulk_str("")),
-        Some(e) => match &e.value {
-            DataType::String(v) => v.clone(),
-            _ => return Err(NexradeError::WrongType),
+        Some(e) => match e.value.as_string_bytes() {
+            Some(v) => v,
+            None => return Err(NexradeError::WrongType),
         },
     };
 
@@ -583,9 +686,9 @@ pub async fn cmd_setrange(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
 
     let mut bytes = match store_db.get(&key) {
         None => vec![],
-        Some(e) => match &e.value {
-            DataType::String(v) => v.clone(),
-            _ => return Err(NexradeError::WrongType),
+        Some(e) => match e.value.as_string_bytes() {
+            Some(v) => v,
+            None => return Err(NexradeError::WrongType),
         },
     };
 

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use mlua::{Lua, LuaOptions, StdLib, Value as LuaValue};
 
-use nexrade_core::command::dispatch;
+use nexrade_core::command::dispatch_with_user;
 use nexrade_core::db::Db;
 use nexrade_core::error::{NexradeError, Result};
 use nexrade_core::resp::Resp;
@@ -39,6 +39,11 @@ impl LuaEngine {
     }
 
     /// Execute a Lua script (EVAL).
+    ///
+    /// `user` is the ACL identity of the connection that issued EVAL —
+    /// `redis.call`/`redis.pcall` inside the script dispatch as that same
+    /// user, so a script can't use ACL-restricted commands the caller
+    /// itself couldn't run directly.
     pub async fn eval(
         &self,
         script: &str,
@@ -46,10 +51,12 @@ impl LuaEngine {
         argv: Vec<Vec<u8>>,
         db: Db,
         db_index: usize,
+        user: &str,
     ) -> Result<Resp> {
         // We use a blocking call since mlua's async mode requires Send bounds
         // that are complex to satisfy. For most scripts this is acceptable.
         let script = script.to_string();
+        let user = user.to_string();
         let _time_limit = self.time_limit;
 
         tokio::task::spawn_blocking(move || {
@@ -82,22 +89,33 @@ impl LuaEngine {
 
             // Set up redis.call to use a synchronous dispatch shim
             // (In blocking context we can use tokio::runtime::Handle::current())
+            // Dispatches as `user` — the ACL identity of the connection that
+            // issued EVAL — not as "default", so scripts can't use
+            // ACL-restricted commands the caller itself couldn't run.
             let db_call = db.clone();
+            let user_call = user.clone();
             let call_fn = lua
                 .create_function(move |lua, args: mlua::MultiValue| {
                     let resp_args = multivalue_to_resp_args(args)?;
-                    let result = tokio::runtime::Handle::current()
-                        .block_on(dispatch(&db_call, resp_args, db_index));
+                    let result = tokio::runtime::Handle::current().block_on(dispatch_with_user(
+                        &db_call, resp_args, db_index, None, &user_call,
+                    ));
                     resp_to_lua(lua, result)
                 })
                 .map_err(mlua_err)?;
 
             let db_pcall = db.clone();
+            let user_pcall = user.clone();
             let pcall_fn = lua
                 .create_function(move |lua, args: mlua::MultiValue| {
                     let resp_args = multivalue_to_resp_args(args)?;
-                    let result = tokio::runtime::Handle::current()
-                        .block_on(dispatch(&db_pcall, resp_args, db_index));
+                    let result = tokio::runtime::Handle::current().block_on(dispatch_with_user(
+                        &db_pcall,
+                        resp_args,
+                        db_index,
+                        None,
+                        &user_pcall,
+                    ));
                     resp_to_lua(lua, result)
                 })
                 .map_err(mlua_err)?;
@@ -126,12 +144,13 @@ impl LuaEngine {
         argv: Vec<Vec<u8>>,
         db: Db,
         db_index: usize,
+        user: &str,
     ) -> Result<Resp> {
         match self.cache.get(sha) {
-            None => Err(NexradeError::Generic(
+            None => Err(NexradeError::Prefixed(
                 "NOSCRIPT No matching script. Please use EVAL.".to_string(),
             )),
-            Some(script) => self.eval(&script, keys, argv, db, db_index).await,
+            Some(script) => self.eval(&script, keys, argv, db, db_index, user).await,
         }
     }
 
@@ -244,5 +263,99 @@ fn simple_lua_to_json(val: &LuaValue) -> String {
             format!("[{}]", items.join(","))
         }
         _ => "null".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexrade_core::db::Db;
+
+    fn engine() -> LuaEngine {
+        LuaEngine::new(Duration::from_secs(5)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn eval_dispatches_redis_call_as_default_when_unrestricted() {
+        let e = engine();
+        let db = Db::default();
+        let r = e
+            .eval(
+                "return redis.call('SET', KEYS[1], ARGV[1])",
+                vec![b"k".to_vec()],
+                vec![b"v".to_vec()],
+                db.clone(),
+                0,
+                "default",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(r, Resp::SimpleString(s) if s == "OK"));
+    }
+
+    /// Regression test: EVAL must run `redis.call` under the caller's own
+    /// ACL identity, not a hardcoded "default" full-access user — otherwise
+    /// a restricted user could bypass a command/key restriction just by
+    /// wrapping the forbidden command in a script.
+    #[tokio::test]
+    async fn eval_enforces_callers_acl_restrictions() {
+        let e = engine();
+        let db = Db::default();
+        // "restricted" may only PING — no SET.
+        db.acl.setuser("restricted", &["+ping", "~*"]).unwrap();
+
+        let r = e
+            .eval(
+                "return redis.call('SET', KEYS[1], ARGV[1])",
+                vec![b"k".to_vec()],
+                vec![b"v".to_vec()],
+                db.clone(),
+                0,
+                "restricted",
+            )
+            .await
+            .unwrap();
+        // redis.call surfaces the dispatch error as a Lua table {err=...},
+        // which the script returns verbatim — so the outer eval() call
+        // succeeds (Ok) but its Resp payload is the permission error.
+        match r {
+            Resp::Error(msg) => {
+                assert!(
+                    msg.to_lowercase().contains("permission"),
+                    "expected a permission error, got: {msg}"
+                );
+            }
+            other => panic!("expected redis.call to surface the ACL denial, got: {other:?}"),
+        }
+        // Confirm the SET never actually took effect.
+        assert!(
+            db.store.db(0).read_for(b"k").get_ro(b"k").is_none(),
+            "SET should not have applied — restricted user has no SET permission"
+        );
+    }
+
+    #[tokio::test]
+    async fn eval_allows_commands_the_caller_is_permitted_to_run() {
+        let e = engine();
+        let db = Db::default();
+        // "reader" may GET but not SET; confirm GET still works via EVAL.
+        db.acl.setuser("reader", &["+get", "~*"]).unwrap();
+        db.store.db(0).write_for(b"k").insert(
+            b"k".to_vec(),
+            nexrade_core::store::Entry::new(nexrade_core::types::DataType::String(b"v".to_vec())),
+        );
+
+        let r = e
+            .eval(
+                "return redis.call('GET', KEYS[1])",
+                vec![b"k".to_vec()],
+                vec![],
+                db.clone(),
+                0,
+                "reader",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(r, Resp::BulkString(Some(ref b)) if b.as_ref() == b"v"));
     }
 }

@@ -18,8 +18,10 @@
 //! ```
 
 pub mod engine;
+pub mod function;
 pub mod script_cache;
 pub mod value;
 
 pub use engine::LuaEngine;
+pub use function::{FunctionLibrary, FunctionRegistry, FunctionRestoreMode, FunctionStats};
 pub use script_cache::ScriptCache;
