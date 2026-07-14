@@ -215,7 +215,9 @@ jobs:
           tool: cross
 
       - name: Install packaging tools
-        run: cargo install cargo-deb cargo-generate-rpm --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
 
       - name: Build (native)
         if: matrix.cross == false
