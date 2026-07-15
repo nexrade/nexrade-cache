@@ -94,7 +94,7 @@ jobs:
             cross: true
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -102,7 +102,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -200,7 +200,7 @@ jobs:
             cross: true
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -208,7 +208,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -282,7 +282,7 @@ jobs:
             target: aarch64-pc-windows-msvc
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -290,7 +290,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo registry + cargo-wix binary
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -345,7 +345,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -360,7 +360,7 @@ jobs:
         run: echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: "nexrade-cache ${{ steps.version.outputs.version }}"
           tag_name: ${{ github.ref_name }}
