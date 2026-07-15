@@ -22,7 +22,8 @@ use anyhow::{Context, Result};
 use windows_service::{
     define_windows_service,
     service::{
-        ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
+        ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
+        ServiceErrorControl, ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod,
         ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
     },
     service_control_handler::{self, ServiceControlHandlerResult},
@@ -58,11 +59,47 @@ pub fn install_service() -> Result<()> {
         account_password: None,
     };
 
-    manager
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG)
-        .context("create service")?
-        .set_description(SERVICE_DESCRIPTION)
+    // `START` is required in addition to `CHANGE_CONFIG` because the failure
+    // actions configured below include `SC_ACTION_RESTART` — SCM requires
+    // the handle used to set that action to also hold `SERVICE_START`.
+    let svc = manager
+        .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
+        .context("create service")?;
+    svc.set_description(SERVICE_DESCRIPTION)
         .context("set description")?;
+
+    // `ServiceStartType::AutoStart` only covers a full machine reboot — it
+    // does nothing if the process itself dies while Windows keeps running
+    // (panic, unhandled exception, etc). Without explicit failure actions,
+    // SCM just leaves the service `Stopped` until someone notices. Restart
+    // up to 3 times with a 5s delay, then give the failure counter an hour
+    // to reset so a persistently-crashing binary doesn't restart forever.
+    svc.update_failure_actions(ServiceFailureActions {
+        reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(3600)),
+        reboot_msg: None,
+        command: None,
+        actions: Some(vec![
+            ServiceAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(5),
+            },
+            ServiceAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(5),
+            },
+            ServiceAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(5),
+            },
+        ]),
+    })
+    .context("set failure actions")?;
+    // SCM only applies failure actions to crashes (access violations, etc.)
+    // by default — a clean-but-nonzero process exit ("non-crash failure")
+    // is ignored unless this is enabled. nexrade-cache exiting with an
+    // error should also trigger the restart actions above.
+    svc.set_failure_actions_on_non_crash_failures(true)
+        .context("enable failure actions on non-crash exits")?;
 
     println!("Service '{}' installed successfully.", SERVICE_NAME);
     println!("Start it with:  sc start {}", SERVICE_NAME);

@@ -57,6 +57,16 @@ impl Snapshot {
                 .map_err(|e| crate::error::NexradeError::Generic(e.to_string()))?;
             writer.write_all(&encoded)?;
             writer.flush()?;
+            // fsync the temp file's data to disk *before* the rename below.
+            // `flush()` only empties the userspace `BufWriter` into the OS
+            // page cache — without this, a real power-loss crash can persist
+            // the rename (a metadata operation) before the file's data
+            // blocks are durable, leaving the final RDB path pointing at a
+            // truncated or garbage file. `rename()` itself is still atomic
+            // (no reader ever observes a half-written file at `path`), but
+            // atomicity alone doesn't guarantee the post-rename content
+            // survives a crash without this fsync.
+            writer.get_ref().sync_all()?;
         }
         std::fs::rename(&tmp_path, path.as_ref())?;
         info!("snapshot saved to {:?}", path.as_ref());
@@ -292,6 +302,10 @@ impl AofWriter {
                 }
             }
             w.flush()?;
+            // See the matching comment in `Snapshot::save` — fsync the temp
+            // file's data before the atomic rename so a power-loss crash
+            // can't leave the final AOF path pointing at undurable content.
+            w.get_ref().sync_all()?;
         }
         std::fs::rename(&tmp, path.as_ref())?;
         info!("AOF rewrite complete: {:?}", path.as_ref());

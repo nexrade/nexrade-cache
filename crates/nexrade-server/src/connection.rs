@@ -59,6 +59,33 @@ async fn read_with_timeout(
     }
 }
 
+/// Ensures per-connection registry/stat cleanup happens exactly once, on
+/// any exit path out of `Connection::run()` — normal return, an early
+/// `break`, or a panic unwinding through this task. Before this guard
+/// existed, the cleanup was a plain statement block after the main loop,
+/// which a panic would skip entirely, leaking a phantom `CLIENT LIST`
+/// entry, a permanently-inflated `active_connections` counter, and a dead
+/// `TrackingRegistry` entry for the panicked connection. Only viable
+/// because the release profile is `panic = "unwind"` (see `Cargo.toml`) —
+/// under `panic = "abort"` nothing unwinds far enough to run `Drop` impls
+/// at all, so this guard would be a no-op safety net in that configuration.
+struct ConnectionCleanup {
+    db: Db,
+    client_id: u64,
+    metrics: Option<Metrics>,
+}
+
+impl Drop for ConnectionCleanup {
+    fn drop(&mut self) {
+        self.db.tracking.unregister(self.client_id);
+        self.db.connections.unregister(self.client_id);
+        self.db.stats.disconnect();
+        if let Some(ref m) = self.metrics {
+            m.record_connection(false);
+        }
+    }
+}
+
 /// State for a single connected client.
 pub struct Connection {
     db: Db,
@@ -169,6 +196,20 @@ impl Connection {
             m.record_connection(true);
         }
         info!("new connection from {}", self.addr);
+
+        // Guarantees the registry/stat cleanup below runs exactly once on
+        // every exit path — normal return, an early `break`, or a panic
+        // unwinding through this task (relies on the release profile being
+        // `panic = "unwind"`, see Cargo.toml). Without this, a panic
+        // anywhere in the loop below would skip the cleanup entirely,
+        // leaking a phantom `CLIENT LIST` entry, a permanently-inflated
+        // `active_connections` counter, and a dead tracking-registry
+        // entry, one per panicked connection.
+        let _cleanup = ConnectionCleanup {
+            db: self.db.clone(),
+            client_id: self.client_id,
+            metrics: self.metrics.clone(),
+        };
 
         let idle_timeout = {
             let t = self.db.config.lock().timeout;
@@ -524,12 +565,7 @@ impl Connection {
             }
         }
 
-        self.db.tracking.unregister(self.client_id);
-        self.db.connections.unregister(self.client_id);
-        self.db.stats.disconnect();
-        if let Some(ref m) = self.metrics {
-            m.record_connection(false);
-        }
+        // `_cleanup`'s Drop performs unregister/disconnect bookkeeping.
         info!("connection closed: {}", self.addr);
     }
 
@@ -1646,5 +1682,65 @@ impl Connection {
             Ok(r) => r,
             Err(e) => Resp::error(e.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod panic_isolation_tests {
+    use super::*;
+    use std::panic::AssertUnwindSafe;
+
+    /// Proves the load-bearing part of Fix 1: `ConnectionCleanup`'s `Drop`
+    /// impl runs and performs the registry/stat cleanup even when the
+    /// task it's guarding unwinds from a panic instead of returning
+    /// normally. The full "one client panics, others keep running"
+    /// behavior follows from Tokio's own per-task `catch_unwind` wrapping
+    /// once `panic = "unwind"` is set (see Cargo.toml) — well-established
+    /// Tokio behavior, not something specific to this codebase to reprove.
+    /// What *is* specific here is that the guard actually fires and
+    /// cleans up `db.tracking` / `db.connections` / `db.stats` correctly,
+    /// which this test drives directly via `catch_unwind`.
+    #[test]
+    fn connection_cleanup_runs_on_panic_unwind() {
+        let db = Db::default();
+        let client_id = db.next_client_id.fetch_add(1, Ordering::Relaxed);
+
+        let (tracking_tx, _tracking_rx) = mpsc::channel(8);
+        db.tracking.register(client_id, tracking_tx);
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (meta, _kill_flag) = db.connections.register(client_id, addr);
+
+        db.stats.connect();
+        assert_eq!(db.stats.active_connections.load(Ordering::Relaxed), 1);
+        assert!(db.tracking.exists(client_id));
+        assert!(db.connections.meta(client_id).is_some());
+
+        let cleanup = ConnectionCleanup {
+            db: db.clone(),
+            client_id,
+            metrics: None,
+        };
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = cleanup;
+            drop(meta); // release our own Arc so the registry's is the only one left
+            panic!("simulated connection task panic");
+        }));
+        assert!(result.is_err(), "the panic should have propagated");
+
+        // The guard's Drop must have run despite the unwind.
+        assert!(
+            !db.tracking.exists(client_id),
+            "tracking registry entry must be cleaned up after a panic"
+        );
+        assert!(
+            db.connections.meta(client_id).is_none(),
+            "connection registry entry must be cleaned up after a panic"
+        );
+        assert_eq!(
+            db.stats.active_connections.load(Ordering::Relaxed),
+            0,
+            "active_connections must be decremented after a panic"
+        );
     }
 }

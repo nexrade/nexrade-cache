@@ -110,13 +110,26 @@ impl TrackingRegistry {
                 self.enabled_count.fetch_sub(1, Ordering::Relaxed);
             }
         }
-        for set in g.key_index.values_mut() {
+        // `retain` drops the key entry entirely once its set is empty,
+        // instead of leaving a permanent empty-set behind — otherwise any
+        // key this client ever read (and nobody subsequently wrote) leaks
+        // in `key_index` for the life of the server.
+        g.key_index.retain(|_, set| {
             set.remove(&client_id);
-        }
+            !set.is_empty()
+        });
     }
 
     pub fn exists(&self, client_id: u64) -> bool {
         self.inner.read().clients.contains_key(&client_id)
+    }
+
+    /// Number of keys currently tracked in `key_index`. Test-only —
+    /// exposed to assert that `disable`/`unregister` don't leak empty-set
+    /// entries (see the regression tests below).
+    #[cfg(test)]
+    fn key_index_len(&self) -> usize {
+        self.inner.read().key_index.len()
     }
 
     /// `CLIENT TRACKING ON ...`.
@@ -143,9 +156,12 @@ impl TrackingRegistry {
             state.enabled = false;
             state.opts = TrackingOptions::default();
         }
-        for set in g.key_index.values_mut() {
+        // See `unregister`'s comment — `retain` drops now-empty key
+        // entries instead of leaking them.
+        g.key_index.retain(|_, set| {
             set.remove(&client_id);
-        }
+            !set.is_empty()
+        });
     }
 
     pub fn is_enabled(&self, client_id: u64) -> bool {
@@ -460,5 +476,70 @@ mod tests {
         reg.track_read(1, &[b"foo"]);
         reg.on_write(&[b"foo"], 999);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn disable_without_a_write_does_not_leak_key_index_entry() {
+        // Regression test: a client reads a key, then disables tracking
+        // (or disconnects) without that key ever being written. Before the
+        // fix, `disable`/`unregister` only removed the client id from each
+        // key's HashSet, leaving a permanent empty-set entry behind.
+        let reg = TrackingRegistry::new();
+        let (tx, _rx) = mpsc::channel(8);
+        reg.register(1, tx);
+        reg.enable(1, TrackingOptions::default()).unwrap();
+        reg.track_read(1, &[b"foo", b"bar"]);
+        assert_eq!(reg.key_index_len(), 2, "both keys should be tracked");
+
+        reg.disable(1);
+        assert_eq!(
+            reg.key_index_len(),
+            0,
+            "key_index must not retain empty-set entries after disable()"
+        );
+    }
+
+    #[test]
+    fn unregister_without_a_write_does_not_leak_key_index_entry() {
+        // Same scenario as above, but for the disconnect path.
+        let reg = TrackingRegistry::new();
+        let (tx, _rx) = mpsc::channel(8);
+        reg.register(1, tx);
+        reg.enable(1, TrackingOptions::default()).unwrap();
+        reg.track_read(1, &[b"foo"]);
+        assert_eq!(reg.key_index_len(), 1);
+
+        reg.unregister(1);
+        assert_eq!(
+            reg.key_index_len(),
+            0,
+            "key_index must not retain empty-set entries after unregister()"
+        );
+    }
+
+    #[test]
+    fn disable_only_drops_entries_that_become_empty() {
+        // A key tracked by two clients must survive one of them disabling —
+        // only the entry should shrink, not disappear, until the last
+        // tracking client is gone.
+        let reg = TrackingRegistry::new();
+        let (tx1, _rx1) = mpsc::channel(8);
+        let (tx2, mut rx2) = mpsc::channel(8);
+        reg.register(1, tx1);
+        reg.register(2, tx2);
+        reg.enable(1, TrackingOptions::default()).unwrap();
+        reg.enable(2, TrackingOptions::default()).unwrap();
+        reg.track_read(1, &[b"shared"]);
+        reg.track_read(2, &[b"shared"]);
+        assert_eq!(reg.key_index_len(), 1);
+
+        reg.disable(1);
+        assert_eq!(
+            reg.key_index_len(),
+            1,
+            "entry must survive while client 2 still tracks it"
+        );
+        reg.on_write(&[b"shared"], 999);
+        assert!(rx2.try_recv().is_ok(), "client 2 should still be notified");
     }
 }

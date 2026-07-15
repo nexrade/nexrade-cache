@@ -24,6 +24,41 @@ use crate::connection::Connection;
 #[cfg(feature = "tls")]
 use crate::stream::Stream;
 
+/// Spawn `conn.run()` as its own task, plus a thin supervisor task that
+/// awaits its `JoinHandle` solely to detect and log a panic. Needed
+/// because the release profile is `panic = "unwind"` (see Cargo.toml) —
+/// Tokio isolates a panicking task instead of crashing the process, but a
+/// discarded `JoinHandle` means the panic would otherwise vanish with zero
+/// trace in the logs. Isolation itself needs no code here; it's a
+/// property of `tokio::spawn` once unwinding is enabled.
+fn spawn_connection(conn: Connection, addr: std::net::SocketAddr) {
+    tokio::spawn(async move {
+        if let Err(e) = tokio::spawn(async move { conn.run().await }).await {
+            if e.is_panic() {
+                error!("connection task for {} panicked: {:?}", addr, e);
+            }
+        }
+    });
+}
+
+/// Same idea as `spawn_connection`, generalized for the handful of
+/// long-running background tasks (tick loop, replication, shutdown relay)
+/// that also currently discard their `JoinHandle`. Logging only — no
+/// auto-restart, since a panicked background task's state may need
+/// resynchronization that this helper has no way to know about.
+fn spawn_supervised<F>(name: &'static str, fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(e) = tokio::spawn(fut).await {
+            if e.is_panic() {
+                error!("{} task panicked: {:?}", name, e);
+            }
+        }
+    });
+}
+
 pub struct Listener {
     pub db: Db,
     pub config: ServerConfig,
@@ -132,14 +167,14 @@ impl Listener {
         let db_clone = self.db.clone();
         let metrics_clone = self.metrics.clone();
         let hz = self.config.hz;
-        tokio::spawn(async move {
+        spawn_supervised("background-tick", async move {
             run_background_tasks(db_clone, hz, metrics_clone).await;
         });
 
         // Spawn replication background task (replica→primary handshake + streaming).
         let db_repl = self.db.clone();
         let our_port = self.config.port;
-        tokio::spawn(async move {
+        spawn_supervised("replication", async move {
             run_replication_task(db_repl, our_port).await;
         });
 
@@ -158,7 +193,7 @@ impl Listener {
         // accept loop via a `watch` channel instead.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let db_shutdown = db.clone();
-        tokio::spawn(async move {
+        spawn_supervised("shutdown-relay", async move {
             tokio::select! {
                 _ = await_shutdown_signal() => {
                     info!("received shutdown signal (OS) — shutting down");
@@ -234,9 +269,7 @@ impl Listener {
                                 function_registry.clone(),
                                 metrics.clone(),
                             );
-                            tokio::spawn(async move {
-                                conn.run().await;
-                            });
+                            spawn_connection(conn, addr);
                         }
                         Err(e) => {
                             error!("accept error: {}", e);
@@ -332,7 +365,7 @@ async fn run_tls_accept_loop(
                                 function_registry,
                                 metrics,
                             );
-                            conn.run().await;
+                            spawn_connection(conn, addr);
                         });
                     }
                     Err(e) => {
@@ -442,6 +475,23 @@ async fn run_background_tasks(db: Db, hz: u32, metrics: Option<Metrics>) {
             if let Some(ref mut w) = *db.aof_writer.lock() {
                 if let Err(e) = w.fsync() {
                     error!("AOF fsync error: {}", e);
+                }
+            }
+        }
+
+        // ── AOF "no" periodic flush (not fsync) ─────────────────────────────
+        // `appendfsync no` intentionally skips fsync — the OS decides when to
+        // persist. But `AofWriter::append` only writes into an in-process
+        // `BufWriter`, which never even reaches the kernel until `flush()` is
+        // called. Without this tick, a `kill -9` or panic (not just an OS
+        // crash) can lose data that real Redis's `no` policy would already
+        // have handed to the kernel via `write(2)`. This flush (no fsync)
+        // restores that "hands it to the OS at least once a second" property
+        // without paying `EverySec`'s fsync durability cost.
+        if aof_sync == AofSync::No && ticks % hz.max(1) as u64 == 0 {
+            if let Some(ref mut w) = *db.aof_writer.lock() {
+                if let Err(e) = w.flush() {
+                    error!("AOF flush error: {}", e);
                 }
             }
         }

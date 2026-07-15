@@ -32,7 +32,7 @@ use nexrade_server::Listener;
 #[derive(Parser, Debug)]
 #[command(
     name = "nexrade-cache",
-    version = "0.2.0",
+    version = env!("CARGO_PKG_VERSION"),
     author = "Nexrade Contributors",
     about = "High-performance Redis-compatible cache — with TLS, Lua, WASM, plugins, and built-in metrics"
 )]

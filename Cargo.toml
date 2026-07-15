@@ -85,5 +85,4 @@ bincode = { version = "2", features = ["serde"] }
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
 strip = true

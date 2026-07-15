@@ -8,6 +8,15 @@ on:
 permissions:
   contents: write   # needed to create GitHub Releases
 
+# Serialize runs per-tag instead of cancelling in-progress ones — a release
+# run uploads real artifacts and creates a GitHub Release, so cancelling it
+# mid-flight (as CI does) could leave a half-published release behind. If a
+# tag is deleted and re-pushed quickly, the second run just queues after the
+# first finishes instead of racing it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
