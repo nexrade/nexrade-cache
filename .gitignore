@@ -43,3 +43,7 @@ lcov.info
 # Benchmarks
 *-bench.csv
 bench-comparison.md
+
+# Python
+__pycache__/
+*.pyc

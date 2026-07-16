@@ -437,6 +437,216 @@ async fn block_filters_wakeup_by_requested_key() {
     }
 }
 
+// ── RESP2-shape preconditions for the ZSET RESP3 pairing fix ────────────────
+//
+// `Connection::upgrade_to_resp3` (nexrade-server/src/connection.rs) nests
+// ZRANGE*/ZPOPMIN/ZPOPMAX/ZUNION/ZINTER/ZDIFF's flat [member, score, ...]
+// array into [[member, score], ...] pairs under RESP3, driven by a
+// WITHSCORES/COUNT hint computed from the original request args (not
+// guessed from response shape). These tests only exercise the dispatcher
+// directly (`dispatch_with_addr`, no RESP3 upgrade applied) — they pin
+// down that the RESP2 shape these commands produce is exactly what the
+// upgrade function expects as its input: a flat, even-length array when
+// scores are present, and nothing to nest when they aren't. See
+// `nexrade-server/tests/resp3_zset_shapes.rs` for the end-to-end RESP3
+// wire-shape assertions.
+
+#[tokio::test]
+async fn zrange_withscores_is_flat_even_array_at_dispatch_level() {
+    let db = Db::default();
+    run(
+        &db,
+        vec![
+            str_arg("ZADD"),
+            str_arg("z"),
+            str_arg("1"),
+            str_arg("a"),
+            str_arg("2"),
+            str_arg("b"),
+        ],
+    )
+    .await;
+    let r = run(
+        &db,
+        vec![
+            str_arg("ZRANGE"),
+            str_arg("z"),
+            str_arg("0"),
+            str_arg("-1"),
+            str_arg("WITHSCORES"),
+        ],
+    )
+    .await;
+    if let Resp::Array(Some(items)) = r {
+        // [a, 1, b, 2] — flat, even, never pre-nested by the command layer.
+        assert_eq!(items.len(), 4);
+        assert!(items.iter().all(|i| matches!(i, Resp::BulkString(Some(_)))));
+    } else {
+        panic!("expected flat Array from ZRANGE WITHSCORES, got {:?}", r);
+    }
+}
+
+#[tokio::test]
+async fn zrange_without_withscores_is_flat_member_only_array() {
+    let db = Db::default();
+    run(
+        &db,
+        vec![
+            str_arg("ZADD"),
+            str_arg("z"),
+            str_arg("1"),
+            str_arg("a"),
+            str_arg("2"),
+            str_arg("b"),
+        ],
+    )
+    .await;
+    let r = run(
+        &db,
+        vec![str_arg("ZRANGE"), str_arg("z"), str_arg("0"), str_arg("-1")],
+    )
+    .await;
+    if let Resp::Array(Some(items)) = r {
+        // Members only, no scores — the precondition upgrade_to_resp3 relies
+        // on the WITHSCORES hint (not response shape) to avoid nesting this.
+        assert_eq!(items.len(), 2);
+    } else {
+        panic!("expected Array from ZRANGE, got {:?}", r);
+    }
+}
+
+#[tokio::test]
+async fn zpopmin_no_count_returns_flat_member_score_pair() {
+    let db = Db::default();
+    run(
+        &db,
+        vec![
+            str_arg("ZADD"),
+            str_arg("z"),
+            str_arg("1"),
+            str_arg("a"),
+            str_arg("2"),
+            str_arg("b"),
+        ],
+    )
+    .await;
+    let r = run(&db, vec![str_arg("ZPOPMIN"), str_arg("z")]).await;
+    if let Resp::Array(Some(items)) = r {
+        // [member, score] — exactly 2 items regardless of COUNT being
+        // absent; the COUNT-presence hint (not this length) decides nesting.
+        assert_eq!(items.len(), 2);
+    } else {
+        panic!("expected Array from ZPOPMIN, got {:?}", r);
+    }
+}
+
+#[tokio::test]
+async fn zpopmin_with_count_returns_flat_alternating_array() {
+    let db = Db::default();
+    run(
+        &db,
+        vec![
+            str_arg("ZADD"),
+            str_arg("z"),
+            str_arg("1"),
+            str_arg("a"),
+            str_arg("2"),
+            str_arg("b"),
+        ],
+    )
+    .await;
+    let r = run(&db, vec![str_arg("ZPOPMIN"), str_arg("z"), str_arg("1")]).await;
+    if let Resp::Array(Some(items)) = r {
+        // Still flat at the dispatch level even with COUNT — nesting is
+        // purely a connection-layer RESP3 concern, driven by the fact that
+        // COUNT was explicitly passed (args.len() >= 3), not response shape.
+        assert_eq!(items.len(), 2);
+    } else {
+        panic!("expected Array from ZPOPMIN with COUNT, got {:?}", r);
+    }
+}
+
+#[tokio::test]
+async fn zunion_without_withscores_is_flat_member_only_even_count() {
+    let db = Db::default();
+    run(
+        &db,
+        vec![
+            str_arg("ZADD"),
+            str_arg("z1"),
+            str_arg("1"),
+            str_arg("a"),
+            str_arg("2"),
+            str_arg("b"),
+        ],
+    )
+    .await;
+    run(
+        &db,
+        vec![str_arg("ZADD"), str_arg("z2"), str_arg("3"), str_arg("c")],
+    )
+    .await;
+    // 3 members total (a, b, c) is odd, so pick a case with an even member
+    // count to reproduce the exact shape the pre-fix parity guess mishandled.
+    run(
+        &db,
+        vec![str_arg("ZADD"), str_arg("z2"), str_arg("4"), str_arg("d")],
+    )
+    .await;
+    let r = run(
+        &db,
+        vec![
+            str_arg("ZUNION"),
+            str_arg("2"),
+            str_arg("z1"),
+            str_arg("z2"),
+        ],
+    )
+    .await;
+    if let Resp::Array(Some(items)) = r {
+        // 4 members (a, b, c, d), no WITHSCORES — even length, but must not
+        // be treated as [member, score, ...] pairs. The RESP3 upgrade must
+        // key off the absence of WITHSCORES in the request, not this parity.
+        assert_eq!(items.len(), 4);
+        assert!(items.iter().all(|i| matches!(i, Resp::BulkString(Some(_)))));
+    } else {
+        panic!("expected flat Array from ZUNION, got {:?}", r);
+    }
+}
+
+#[tokio::test]
+async fn zunion_with_withscores_is_flat_alternating_array() {
+    let db = Db::default();
+    run(
+        &db,
+        vec![str_arg("ZADD"), str_arg("z1"), str_arg("1"), str_arg("a")],
+    )
+    .await;
+    run(
+        &db,
+        vec![str_arg("ZADD"), str_arg("z2"), str_arg("2"), str_arg("b")],
+    )
+    .await;
+    let r = run(
+        &db,
+        vec![
+            str_arg("ZUNION"),
+            str_arg("2"),
+            str_arg("z1"),
+            str_arg("z2"),
+            str_arg("WITHSCORES"),
+        ],
+    )
+    .await;
+    if let Resp::Array(Some(items)) = r {
+        // [a, 1, b, 2] — flat at dispatch level; nesting happens only in
+        // upgrade_to_resp3, driven by the WITHSCORES token in the request.
+        assert_eq!(items.len(), 4);
+    } else {
+        panic!("expected flat Array from ZUNION WITHSCORES, got {:?}", r);
+    }
+}
+
 // Suppress unused warnings for the Entry/DataType import that's referenced
 // indirectly via the dispatcher's signatures.
 #[allow(dead_code)]
