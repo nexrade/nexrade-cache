@@ -263,41 +263,43 @@ pub(crate) async fn start_server(config: ServerConfig) -> Result<()> {
     Ok(())
 }
 
-/// Used by the Windows service thread: start the server with default config.
-#[cfg(windows)]
-pub(crate) async fn run_server_default() -> Result<()> {
-    init_tracing();
-    let config = ServerConfig::default();
-    start_server(config).await
-}
-
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // ── Windows service control ──────────────────────────────────────────────
-    #[cfg(windows)]
-    {
-        if cli.install_service {
-            return windows_svc::install_service();
-        }
-        if cli.uninstall_service {
-            return windows_svc::uninstall_service();
-        }
-        if cli.service {
-            // Hand control to the SCM dispatcher; this blocks until the
-            // service is stopped.
-            return windows_svc::run_as_service();
-        }
-    }
-
-    // Setup logging
+    // Setup logging (env vars only here; init_tracing() happens below on
+    // every path, including the Windows-service one, so log output is
+    // consistent regardless of how the process was launched).
     if cli.log_json {
         std::env::set_var("NEXRADE_LOG_JSON", "1");
     }
     if !cli.log_level.is_empty() {
         std::env::set_var("RUST_LOG", &cli.log_level);
     }
+
+    // ── Windows service control ──────────────────────────────────────────────
+    #[cfg(windows)]
+    {
+        if cli.install_service {
+            // Bake the --config path (if any) into the service's launch
+            // command so it's re-applied on every SCM-triggered start,
+            // including after a machine reboot — see `install_service`.
+            return windows_svc::install_service(cli.config.as_deref());
+        }
+        if cli.uninstall_service {
+            return windows_svc::uninstall_service();
+        }
+        if cli.service {
+            // Running under the SCM: build the config exactly like a
+            // normal run does (respecting whatever --config path the SCM
+            // launch command carries), then hand control to the SCM
+            // dispatcher — this call blocks until the service is stopped.
+            init_tracing();
+            let config = config_from_cli(&cli)?;
+            return windows_svc::run_as_service(config);
+        }
+    }
+
     init_tracing();
 
     // Enable ANSI escape codes on Windows

@@ -37,15 +37,9 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-bench-
+          shared-key: bench-compile
 
       - name: Compile benchmarks (no run)
         run: cargo bench -p nexrade-core --no-run
@@ -62,15 +56,9 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-bench-run-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-bench-run-
+          shared-key: bench-run
 
       # Shorter measurement time keeps CI under 5 minutes while still
       # producing statistically valid results (criterion runs ≥100 samples).

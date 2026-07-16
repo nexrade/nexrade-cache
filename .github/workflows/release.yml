@@ -102,13 +102,14 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo
-        uses: actions/cache@v5
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: release-${{ matrix.target }}
+          # Each target builds a distinct set of artifacts (cross-compiled
+          # or native) that shouldn't be shared across targets, but the
+          # crates.io registry/git-deps download is identical for all of
+          # them — rust-cache still caches those globally, cutting a real
+          # chunk of time off cold-starts across the whole release matrix.
 
       # Native build (no cross-compilation needed)
       - name: Build (native)
@@ -208,14 +209,9 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo
-        uses: actions/cache@v5
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin
-            target
-          key: linux-pkg-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: release-pkg-linux-${{ matrix.arch }}
 
       - name: Install cross
         if: matrix.cross == true
@@ -289,15 +285,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache Cargo registry + cargo-wix binary
-        uses: actions/cache@v5
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin/cargo-wix.exe
-            target
-          key: windows-msi-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}-wix039
+          shared-key: windows-msi-${{ matrix.arch }}
 
       - name: Install WiX Toolset v3
         run: |

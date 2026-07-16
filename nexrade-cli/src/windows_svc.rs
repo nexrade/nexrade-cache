@@ -16,9 +16,11 @@
 #![cfg(windows)]
 
 use std::ffi::OsString;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use nexrade_core::db::ServerConfig;
 use windows_service::{
     define_windows_service,
     service::{
@@ -39,12 +41,30 @@ const SERVICE_DESCRIPTION: &str = "High-performance Redis-compatible cache serve
 
 /// Install nexrade-cache as an auto-start Windows service.
 /// Must be run with Administrator privileges.
-pub fn install_service() -> Result<()> {
+///
+/// `config_path` is the value the user passed via `--config` (if any) at
+/// install time. It's baked into the service's launch arguments so every
+/// SCM-triggered start — including after a reboot, when nobody is around to
+/// pass `--config` again — loads the same config file instead of silently
+/// falling back to defaults.
+pub fn install_service(config_path: Option<&str>) -> Result<()> {
     let manager =
         ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)
             .context("open SCM (are you running as Administrator?)")?;
 
     let exe = std::env::current_exe().context("could not determine exe path")?;
+
+    let mut launch_arguments = vec![OsString::from("--service")];
+    if let Some(path) = config_path {
+        // Resolve to an absolute path now, at install time, while we still
+        // know the caller's working directory — the SCM always launches
+        // services with an unrelated CWD (typically `C:\Windows\System32`),
+        // so a relative path baked in here would silently fail to resolve.
+        let abs = std::fs::canonicalize(path)
+            .with_context(|| format!("config file not found: {path}"))?;
+        launch_arguments.push(OsString::from("--config"));
+        launch_arguments.push(abs.into_os_string());
+    }
 
     let info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
@@ -53,7 +73,7 @@ pub fn install_service() -> Result<()> {
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: exe,
-        launch_arguments: vec![OsString::from("--service")],
+        launch_arguments,
         dependencies: vec![],
         account_name: None, // LocalSystem
         account_password: None,
@@ -140,10 +160,25 @@ pub fn uninstall_service() -> Result<()> {
 
 // ─── Run as service ───────────────────────────────────────────────────────────
 
+/// Config the service should start with, stashed here because the
+/// `define_windows_service!`-generated entry point below has a fixed
+/// `fn(Vec<OsString>)` signature (mandated by the SCM callback ABI) and can't
+/// take extra parameters. `run_as_service` sets this immediately before
+/// handing control to the dispatcher, so `service_main` always finds it
+/// populated by the time the SCM invokes it.
+static SERVICE_CONFIG: OnceLock<ServerConfig> = OnceLock::new();
+
 /// Entry point when the process is launched by the SCM (`--service` flag).
 /// Hands control to the Windows service dispatcher which will call
 /// [`ffi_service_main`] on a dedicated thread.
-pub fn run_as_service() -> Result<()> {
+///
+/// `config` is the `ServerConfig` already resolved from `--config`/CLI flags
+/// by the caller (same resolution path as a normal foreground run), so the
+/// service honors the same config file on every SCM-triggered start.
+pub fn run_as_service(config: ServerConfig) -> Result<()> {
+    SERVICE_CONFIG
+        .set(config)
+        .map_err(|_| anyhow::anyhow!("run_as_service called more than once"))?;
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
         .context("service dispatcher failed — is this process started by the SCM?")?;
     Ok(())
@@ -154,12 +189,19 @@ pub fn run_as_service() -> Result<()> {
 define_windows_service!(ffi_service_main, service_main);
 
 fn service_main(_arguments: Vec<OsString>) {
-    if let Err(e) = run_service() {
+    // Populated by `run_as_service` just before the dispatcher call that
+    // leads here; absent only if the SCM somehow invoked this entry point
+    // without going through `run_as_service` first.
+    let Some(config) = SERVICE_CONFIG.get() else {
+        eprintln!("service error: no config set before service dispatch");
+        return;
+    };
+    if let Err(e) = run_service(config.clone()) {
         eprintln!("service error: {e:#}");
     }
 }
 
-fn run_service() -> Result<()> {
+fn run_service(config: ServerConfig) -> Result<()> {
     // Channel used to signal the service to stop.
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 
@@ -195,12 +237,12 @@ fn run_service() -> Result<()> {
 
     // Start the tokio runtime + server on a background thread so this thread
     // remains available for SCM control events.
-    let server_thread = std::thread::spawn(|| {
+    let server_thread = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("tokio runtime");
-        rt.block_on(crate::run_server_default())
+        rt.block_on(crate::start_server(config))
             .expect("server exited with error");
     });
 

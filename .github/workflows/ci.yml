@@ -59,15 +59,14 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache Cargo registry
-        uses: actions/cache@v5
+      # Swatinem/rust-cache replaces the old hand-rolled actions/cache block:
+      # it auto-prunes stale incremental-compilation fingerprints (which the
+      # old `target`-directory cache let grow unbounded across months of
+      # runs, slowing every restore) and skips saving on cache-hit, so it's
+      # both faster to restore and doesn't bloat the cache indefinitely.
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-clippy-
+          key: clippy
 
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -84,21 +83,15 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-
+          key: test
 
+      # `--workspace --all-features` already exercises nexrade-core (and
+      # every other crate); a separate `cargo test --package nexrade-core`
+      # run added nothing but a second full test-suite execution.
       - name: Run all tests
         run: cargo test --workspace --all-features
-
-      - name: Run nexrade-core tests (verbose)
-        run: cargo test --package nexrade-core -- --nocapture
 
   # ─── Security audit ─────────────────────────────────────────────────────────
   # Removed standalone cargo-audit job — cargo-deny (below) covers advisory
@@ -121,20 +114,15 @@ jobs:
           components: llvm-tools-preview
 
       - name: Cache Cargo
-        uses: actions/cache@v5
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin/cargo-llvm-cov
-            target
-          key: ${{ runner.os }}-cargo-cov-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: coverage
+          cache-bin: false
 
       - name: Install cargo-llvm-cov
-        run: |
-          if ! command -v cargo-llvm-cov &>/dev/null; then
-            cargo install cargo-llvm-cov --locked
-          fi
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
 
       - name: Generate coverage report
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
@@ -158,16 +146,14 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache Cargo
-        uses: actions/cache@v5
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin/cargo-fuzz
-            target
-          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: fuzz
 
       - name: Install cargo-fuzz
+        # cargo-fuzz isn't in taiki-e/install-action's prebuilt-binary
+        # manifest, so unlike cargo-llvm-cov above this still has to build
+        # from source — but rust-cache above now covers the build cache too.
         run: |
           if ! command -v cargo-fuzz &>/dev/null; then
             cargo +nightly install cargo-fuzz --locked
@@ -199,34 +185,32 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo
-        uses: actions/cache@v5
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-smoke-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-smoke-
+          shared-key: smoke-${{ matrix.os }}
 
-      - name: Build release binary
-        run: cargo build --release --package nexrade-cache
+      # Debug build, not --release: a smoke test only needs the binary to
+      # run, and skipping lto/codegen-units=1 (the release profile) cuts
+      # this build from ~3-4 min to well under 1 min on a cold cache.
+      - name: Build debug binary
+        run: cargo build --package nexrade-cache
 
       - name: Smoke test — PING/PONG (Linux)
         if: runner.os != 'Windows'
         run: |
-          ./target/release/nexrade-cache --port 16399 &
+          ./target/debug/nexrade-cache --port 16399 &
           SERVER_PID=$!
           sleep 1
-          ./target/release/nexrade-cli -p 16399 PING
+          ./target/debug/nexrade-cli -p 16399 PING
           kill $SERVER_PID 2>/dev/null || true
 
       - name: Smoke test — PING/PONG (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $job = Start-Job { & "$env:GITHUB_WORKSPACE\target\release\nexrade-cache.exe" --port 16399 }
+          $job = Start-Job { & "$env:GITHUB_WORKSPACE\target\debug\nexrade-cache.exe" --port 16399 }
           Start-Sleep -Seconds 2
-          $result = & "$env:GITHUB_WORKSPACE\target\release\nexrade-cli.exe" -p 16399 PING
+          $result = & "$env:GITHUB_WORKSPACE\target\debug\nexrade-cli.exe" -p 16399 PING
           Write-Host "CLI result: $result"
           Stop-Job $job; Remove-Job $job
 
@@ -263,14 +247,9 @@ jobs:
         uses: dtolnay/rust-toolchain@1.87.0
 
       - name: Cache Cargo
-        uses: actions/cache@v5
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-msrv-
+          shared-key: msrv
 
       - name: Build (MSRV)
         run: cargo build --workspace

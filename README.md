@@ -647,6 +647,12 @@ All crates are independent. Use `nexrade-core` as a pure library, add `nexrade-s
 nexrade-cache.exe --install-service
 Start-Service nexrade-cache
 
+# Install with a config file — the path is resolved to absolute and baked
+# into the service's launch command, so every SCM-triggered start (including
+# after a reboot) loads the same config instead of falling back to defaults
+nexrade-cache.exe --install-service --config C:\nexrade\nexrade.toml
+Start-Service nexrade-cache
+
 # Uninstall
 nexrade-cache.exe --uninstall-service
 ```
