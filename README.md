@@ -93,7 +93,10 @@ redis-cli get foo
 
 ## Configuration
 
-All settings can be set via config file, CLI flags, or environment variables.
+All settings can be set via config file, CLI flags, or environment
+variables. Precedence is **config file < explicit CLI flag < built-in
+default fallback** — a value set in the file is only overridden when you
+actually pass the matching flag or env var.
 
 ```toml
 # nexrade.toml
@@ -124,8 +127,11 @@ port    = 9091
 ```
 
 ```sh
+# Preview the fully-resolved config without starting the server
+nexrade-cache --config nexrade.toml --print-config
+
 # CLI flags override the config file
-nexrade-cache --port 6380 --requirepass secret
+nexrade-cache --config nexrade.toml --port 6380 --requirepass secret
 
 # Environment variables
 NEXRADE_PORT=6380 NEXRADE_REQUIREPASS=secret nexrade-cache
