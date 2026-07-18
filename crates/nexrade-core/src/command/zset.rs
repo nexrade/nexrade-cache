@@ -127,7 +127,6 @@ pub async fn cmd_zadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
 
     let mut added = 0i64;
     let mut changed = 0i64;
-    let mut mutated = false;
 
     while i + 1 < args.len() {
         let (score, _) = parse_score_bound(get_str(args, i, "ZADD")?)?;
@@ -160,14 +159,14 @@ pub async fn cmd_zadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
         let is_new = zset.insert(member, score);
         if is_new {
             added += 1;
-            mutated = true;
         } else if existing_score.map(|old| old != score).unwrap_or(false) {
             changed += 1;
-            mutated = true;
         }
     }
 
-    if mutated {
+    // `added`/`changed` already track every successful insert — no separate
+    // mutated flag. Wake BZMPOP only when the zset actually changed.
+    if added > 0 || changed > 0 {
         // Release the shard lock before waking waiters so they can re-acquire.
         drop(store_db);
         db.notify_zset_waiters();
@@ -1157,11 +1156,11 @@ pub async fn cmd_bzmpop(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
             std::time::Duration::from_secs_f64(timeout_secs)
         };
         // Wait on the dedicated zset notify so ZADD / ZINCRBY / Z*STORE actually
-        // wake us. list_notify only fires on list/stream pushes.
+        // wake us. list_chan only fires on list/stream pushes.
         match tokio::time::timeout(dur, async {
             let _parked = db.park_zset_waiter();
             loop {
-                db.zset_notify.notified().await;
+                db.zset_chan.notified().await;
                 if let Some(resp) = zmpop_attempt(db, db_index, &keys, min, count)? {
                     return Ok::<Resp, NexradeError>(resp);
                 }

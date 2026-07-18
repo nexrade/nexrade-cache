@@ -499,7 +499,7 @@ async fn blocking_pop(
                     }
                 }
             }
-            db.list_notify.notified().await;
+            db.list_chan.notified().await;
         }
     })
     .await;
@@ -655,7 +655,7 @@ pub async fn cmd_blmpop(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
         match tokio::time::timeout(dur, async {
             let _parked = db.park_list_waiter();
             loop {
-                db.list_notify.notified().await;
+                db.list_chan.notified().await;
                 if let Some(resp) = lmpop_attempt(db, db_index, &keys, left, count)? {
                     return Ok::<Resp, NexradeError>(resp);
                 }

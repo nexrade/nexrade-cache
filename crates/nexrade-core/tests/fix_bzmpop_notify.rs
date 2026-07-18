@@ -1,5 +1,5 @@
 //! Regression: BZMPOP must wake when a producer runs ZADD / ZINCRBY on the
-//! watched key. Before the fix BZMPOP waited on `list_notify`, which only
+//! watched key. Before the fix BZMPOP waited on `list_chan`, which only
 //! fires on list/stream pushes — pure zset producers never unblocked the
 //! waiter.
 
@@ -34,7 +34,7 @@ async fn bzmpop_wakes_on_zadd() {
     let waiter =
         tokio::spawn(async move { run(&waiter_db, cmd(&["BZMPOP", "5", "1", "zq", "MIN"])).await });
 
-    // Give the waiter a moment to park on zset_notify.
+    // Give the waiter a moment to park on zset_chan.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Producer: ZADD should notify and unblock the waiter.

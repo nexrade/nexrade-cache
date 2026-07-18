@@ -29,26 +29,14 @@ pub struct Db {
     pub pubsub: PubSub,
     pub config: Arc<Mutex<ServerConfig>>,
     pub stats: Arc<Stats>,
-    /// Notify waiting BLPOP/BRPOP callers when a new item is pushed.
-    pub list_notify: Arc<Notify>,
-    /// Number of tasks currently parked on `list_notify`. Producers skip
-    /// `notify_waiters` when this is 0 (the common redis-benchmark case).
-    pub list_waiters: Arc<AtomicUsize>,
-    /// Notify waiting BLMOVE callers.
+    /// Blocking wait channel for BLPOP/BRPOP/BLMPOP.
+    pub list_chan: Arc<WaiterChannel>,
+    /// Notify waiting BLMOVE callers (reserved; not yet wired).
     pub move_notify: Arc<Notify>,
-    /// Notify waiting XREAD/XREADGROUP BLOCK callers when a new entry is
-    /// appended to a stream. Single global notification is enough because
-    /// stream keys are already sharded — the wakeup is filtered by key in the
-    /// caller's re-check loop.
-    pub stream_notify: Arc<Notify>,
-    /// Number of tasks currently parked on `stream_notify`.
-    pub stream_waiters: Arc<AtomicUsize>,
-    /// Notify waiting BZMPOP / BZPOP* callers when a sorted-set gains members
-    /// (ZADD / ZINCRBY / Z*STORE). Distinct from `list_notify` so a pure
-    /// zset producer actually wakes the waiter.
-    pub zset_notify: Arc<Notify>,
-    /// Number of tasks currently parked on `zset_notify`.
-    pub zset_waiters: Arc<AtomicUsize>,
+    /// Blocking wait channel for XREAD/XREADGROUP BLOCK.
+    pub stream_chan: Arc<WaiterChannel>,
+    /// Blocking wait channel for BZMPOP (distinct so pure zset producers wake).
+    pub zset_chan: Arc<WaiterChannel>,
     /// Monotonically increasing client ID counter.
     pub next_client_id: Arc<AtomicU64>,
     /// AOF writer — shared across all connections (None if AOF is disabled).
@@ -124,13 +112,10 @@ impl Db {
             pubsub: PubSub::new(),
             config: Arc::new(Mutex::new(config)),
             stats: Arc::new(Stats::default()),
-            list_notify: Arc::new(Notify::new()),
-            list_waiters: Arc::new(AtomicUsize::new(0)),
+            list_chan: Arc::new(WaiterChannel::new()),
             move_notify: Arc::new(Notify::new()),
-            stream_notify: Arc::new(Notify::new()),
-            stream_waiters: Arc::new(AtomicUsize::new(0)),
-            zset_notify: Arc::new(Notify::new()),
-            zset_waiters: Arc::new(AtomicUsize::new(0)),
+            stream_chan: Arc::new(WaiterChannel::new()),
+            zset_chan: Arc::new(WaiterChannel::new()),
             next_client_id: Arc::new(AtomicU64::new(1)),
             #[cfg(not(target_arch = "wasm32"))]
             aof_writer: Arc::new(Mutex::new(None)),
@@ -155,64 +140,95 @@ impl Db {
         self.store.db_count
     }
 
-    /// Wake list waiters only if at least one BLPOP/BRPOP/BLMPOP is parked.
-    /// Avoids the Notify bookkeeping on every LPUSH under redis-benchmark
-    /// (zero waiters is the overwhelmingly common case).
+    /// Wake list waiters (BLPOP/BRPOP/BLMPOP) — no-op if none parked.
     #[inline]
     pub fn notify_list_waiters(&self) {
-        if self.list_waiters.load(Ordering::Relaxed) > 0 {
-            self.list_notify.notify_waiters();
-        }
+        self.list_chan.notify_if_waiting();
     }
 
-    /// Wake stream waiters only if at least one XREAD/XREADGROUP BLOCK is parked.
+    /// Wake stream waiters (XREAD/XREADGROUP BLOCK) — no-op if none parked.
     #[inline]
     pub fn notify_stream_waiters(&self) {
-        if self.stream_waiters.load(Ordering::Relaxed) > 0 {
-            self.stream_notify.notify_waiters();
-        }
+        self.stream_chan.notify_if_waiting();
     }
 
-    /// Wake zset waiters only if at least one BZMPOP is parked.
+    /// Wake zset waiters (BZMPOP) — no-op if none parked.
     #[inline]
     pub fn notify_zset_waiters(&self) {
-        if self.zset_waiters.load(Ordering::Relaxed) > 0 {
-            self.zset_notify.notify_waiters();
-        }
+        self.zset_chan.notify_if_waiting();
     }
 
-    /// RAII: increments a waiter counter for the duration of a blocking wait.
-    /// Drop decrements so producers see an accurate count.
-    pub fn park_list_waiter(&self) -> WaiterGuard {
-        WaiterGuard::new(&self.list_waiters)
+    /// RAII: bumps the list waiter count for the life of a blocking wait.
+    pub fn park_list_waiter(&self) -> WaiterGuard<'_> {
+        self.list_chan.park()
     }
 
-    pub fn park_stream_waiter(&self) -> WaiterGuard {
-        WaiterGuard::new(&self.stream_waiters)
+    pub fn park_stream_waiter(&self) -> WaiterGuard<'_> {
+        self.stream_chan.park()
     }
 
-    pub fn park_zset_waiter(&self) -> WaiterGuard {
-        WaiterGuard::new(&self.zset_waiters)
+    pub fn park_zset_waiter(&self) -> WaiterGuard<'_> {
+        self.zset_chan.park()
     }
 }
 
-/// RAII guard that bumps a waiter counter for the life of a blocking wait.
-/// Drop is the only way the counter goes down, so early returns / timeouts
-/// can't leak a permanently-inflated count.
-pub struct WaiterGuard {
-    counter: Arc<AtomicUsize>,
+/// A blocking-wait rendezvous: a `Notify` plus a waiter count so producers
+/// can skip the notify call when nobody is parked. One type covers list /
+/// stream / zset — only the channel instance differs.
+pub struct WaiterChannel {
+    notify: Notify,
+    waiters: AtomicUsize,
 }
 
-impl WaiterGuard {
-    fn new(counter: &Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
+impl WaiterChannel {
+    pub fn new() -> Self {
         Self {
-            counter: Arc::clone(counter),
+            notify: Notify::new(),
+            waiters: AtomicUsize::new(0),
         }
+    }
+
+    /// Wake every parked waiter, or no-op if the count is zero.
+    #[inline]
+    pub fn notify_if_waiting(&self) {
+        if self.waiters.load(Ordering::Relaxed) > 0 {
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// Subscribe to the next wake. Callers typically hold a `WaiterGuard`
+    /// for the duration of the wait so the producer-side count stays honest.
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+
+    /// RAII: bumps `waiters` for the life of the returned guard.
+    pub fn park(&self) -> WaiterGuard<'_> {
+        WaiterGuard::new(&self.waiters)
     }
 }
 
-impl Drop for WaiterGuard {
+impl Default for WaiterChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RAII guard that bumps a waiter count for the life of a blocking wait.
+/// Drop is the only way the count goes down, so early returns / timeouts
+/// can't leak a permanently-inflated count. Borrows the atomic (no Arc clone).
+pub struct WaiterGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl<'a> WaiterGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for WaiterGuard<'_> {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Relaxed);
     }

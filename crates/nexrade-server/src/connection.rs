@@ -626,16 +626,19 @@ impl Connection {
     /// ACL's default-user `nopass` must not bypass it (that was a second auth
     /// hole: `requirepass = "default"` + `AUTH default anything` succeeded).
     fn authenticate_as(&mut self, user: &str, pass: &str) -> Resp {
-        let requirepass = self.db.config.lock().requirepass.clone();
-
+        // Compare requirepass under the config lock (no String clone). Drop
+        // the lock before the ACL path so we never hold it across a users lock.
         if user == "default" {
-            if let Some(ref expected) = requirepass {
+            let cfg = self.db.config.lock();
+            if let Some(ref expected) = cfg.requirepass {
                 if pass == expected.as_str() {
+                    drop(cfg);
                     self.set_authenticated("default");
                     return Resp::ok();
                 }
                 return Resp::error("WRONGPASS invalid username-password pair or user is disabled");
             }
+            // requirepass unset — fall through to ACL for default.
         }
 
         match self.db.acl.authenticate(user, pass) {
@@ -647,7 +650,8 @@ impl Connection {
                 // Prefer WRONGPASS (Redis 6+ ACL shape). The legacy "no
                 // password is set" message only applies when the user truly
                 // does not exist and requirepass is unset.
-                if requirepass.is_none() && self.db.acl.get_user(user).is_none() {
+                let no_requirepass = self.db.config.lock().requirepass.is_none();
+                if no_requirepass && self.db.acl.get_user(user).is_none() {
                     Resp::error("ERR Client sent AUTH, but no password is set")
                 } else {
                     Resp::error("WRONGPASS invalid username-password pair or user is disabled")

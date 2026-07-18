@@ -425,7 +425,7 @@ pub async fn cmd_xread(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
         match tokio::time::timeout(timeout_dur, async {
             let _parked = db.park_stream_waiter();
             loop {
-                db.stream_notify.notified().await;
+                db.stream_chan.notified().await;
                 let snap = snapshot()?;
                 if has_entries(&snap) {
                     return Ok::<Resp, NexradeError>(snap);
@@ -901,7 +901,7 @@ pub async fn cmd_xreadgroup(db: &Db, args: &[Resp], db_index: usize) -> Result<R
         match tokio::time::timeout(timeout_dur, async {
             let _parked = db.park_stream_waiter();
             loop {
-                db.stream_notify.notified().await;
+                db.stream_chan.notified().await;
                 let snap = read_once(&key_specs)?;
                 if has_entries(&snap) {
                     return Ok::<Resp, NexradeError>(snap);
