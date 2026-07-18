@@ -17,14 +17,19 @@ pub async fn cmd_set(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
         return Err(NexradeError::WrongArity("set".to_string()));
     }
 
-    // Use the Bytes-backed getter for the key (cheap refcount clone)
-    // since `write_for` only needs a borrowed slice. The value still
-    // needs a Vec<u8> because the Entry stores an owned DataType::String.
+    // Use Bytes for both key and value — SET is a refcount bump into the
+    // store instead of a full Vec copy. The Entry holds `DataType::String(Bytes)`.
     let key = match args.get(1).and_then(|a| a.as_bytes()) {
         Some(b) => b.clone(),
         None => return Err(NexradeError::WrongArity("set".to_string())),
     };
-    let value = get_bytes_vec(args, 2, "SET")?;
+    // Compact copy — do NOT refcount-clone the RESP buffer slice.
+    // Cloned Bytes from the parser pin the whole pipeline-batch buffer
+    // until the key is overwritten, which kills pipelined SET throughput.
+    let value = match args.get(2).and_then(|a| a.as_bytes()) {
+        Some(b) => Bytes::copy_from_slice(b),
+        None => return Err(NexradeError::WrongArity("set".to_string())),
+    };
 
     let mut expiry: Option<Expiry> = None;
     let mut nx = false;
@@ -128,7 +133,7 @@ pub async fn cmd_set(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     let old_value = if get {
         match store_db.get(&key) {
             Some(e) => match e.value.as_string_bytes() {
-                Some(v) => Some(Resp::bulk(Bytes::from(v))),
+                Some(v) => Some(Resp::bulk(v)),
                 None => return Err(NexradeError::WrongType),
             },
             None => Some(Resp::null()),
@@ -246,13 +251,16 @@ pub async fn cmd_get(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     if args.len() != 2 {
         return Err(NexradeError::WrongArity("get".to_string()));
     }
-    let key = get_bytes_vec(args, 1, "GET")?;
-    let store_db = db.store.db(db_index).read_for(&key);
+    let key = match args.get(1).and_then(|a| a.as_bytes()) {
+        Some(b) => b,
+        None => return Err(NexradeError::WrongArity("get".to_string())),
+    };
+    let store_db = db.store.db(db_index).read_for(key);
 
-    match store_db.get_ro(&key) {
+    match store_db.get_ro(key) {
         None => Ok(Resp::null()),
         Some(e) => match e.value.as_string_bytes() {
-            Some(v) => Ok(Resp::bulk(Bytes::from(v))),
+            Some(v) => Ok(Resp::bulk(v)),
             None => Err(NexradeError::WrongType),
         },
     }
@@ -263,13 +271,13 @@ pub async fn cmd_getset(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
         return Err(NexradeError::WrongArity("getset".to_string()));
     }
     let key = get_bytes_vec(args, 1, "GETSET")?;
-    let value = get_bytes_vec(args, 2, "GETSET")?;
+    let value = Bytes::copy_from_slice(&crate::command::get_bytes(args, 2, "GETSET")?);
 
     let mut store_db = db.store.db(db_index).write_for(&key);
     let old = match store_db.get(&key) {
         None => Resp::null(),
         Some(e) => match e.value.as_string_bytes() {
-            Some(v) => Resp::bulk(Bytes::from(v)),
+            Some(v) => Resp::bulk(v),
             None => return Err(NexradeError::WrongType),
         },
     };
@@ -287,7 +295,7 @@ pub async fn cmd_getdel(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
     match store_db.remove(&key) {
         None => Ok(Resp::null()),
         Some(e) => match e.value.as_string_bytes() {
-            Some(v) => Ok(Resp::bulk(Bytes::from(v))),
+            Some(v) => Ok(Resp::bulk(v)),
             None => Err(NexradeError::WrongType),
         },
     }
@@ -303,7 +311,7 @@ pub async fn cmd_getex(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
     let old = match store_db.get(&key) {
         None => return Ok(Resp::null()),
         Some(e) => match e.value.as_string_bytes() {
-            Some(v) => Bytes::from(v),
+            Some(v) => v,
             None => return Err(NexradeError::WrongType),
         },
     };
@@ -384,7 +392,7 @@ pub async fn cmd_mset(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     while i + 1 < args.len() {
         let key = get_bytes_vec(args, i, "MSET")?;
         let val = get_bytes_vec(args, i + 1, "MSET")?;
-        pairs.push((key, Entry::new(DataType::String(val))));
+        pairs.push((key, Entry::new(DataType::String(Bytes::from(val)))));
         i += 2;
     }
     sdb.mset(pairs);
@@ -402,7 +410,7 @@ pub async fn cmd_msetnx(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
     while i + 1 < args.len() {
         let key = get_bytes_vec(args, i, "MSETNX")?;
         let val = get_bytes_vec(args, i + 1, "MSETNX")?;
-        pairs.push((key, Entry::new(DataType::String(val))));
+        pairs.push((key, Entry::new(DataType::String(Bytes::from(val)))));
         i += 2;
     }
     let ok = sdb.msetnx(pairs);
@@ -420,7 +428,7 @@ pub async fn cmd_mget(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
         let val = match sdb.read_for(&key).get_ro(&key) {
             None => Resp::null(),
             Some(e) => match e.value.as_string_bytes() {
-                Some(v) => Resp::bulk(Bytes::from(v)),
+                Some(v) => Resp::bulk(v),
                 None => Resp::null(),
             },
         };
@@ -439,7 +447,7 @@ pub async fn cmd_setnx(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
     if store_db.contains_key(&key) {
         return Ok(Resp::int(0));
     }
-    store_db.insert(key, Entry::new(DataType::String(val)));
+    store_db.insert(key, Entry::new(DataType::String(Bytes::from(val))));
     Ok(Resp::int(1))
 }
 
@@ -461,7 +469,7 @@ pub async fn cmd_setex(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
     store_db.insert(
         key,
         Entry::with_expiry(
-            DataType::String(val),
+            DataType::String(Bytes::from(val)),
             Expiry::from_duration(Duration::from_secs(secs as u64)),
         ),
     );
@@ -486,7 +494,7 @@ pub async fn cmd_psetex(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
     store_db.insert(
         key,
         Entry::with_expiry(
-            DataType::String(val),
+            DataType::String(Bytes::from(val)),
             Expiry::from_duration(Duration::from_millis(ms as u64)),
         ),
     );
@@ -564,7 +572,10 @@ pub async fn cmd_incrbyfloat(db: &Db, args: &[Resp], db_index: usize) -> Result<
     // Format like Redis (strip trailing zeros)
     let s = format_float(new_val);
     let resp = Resp::bulk_str(s.clone());
-    store_db.insert(key, Entry::new(DataType::String(s.into_bytes())));
+    store_db.insert(
+        key,
+        Entry::new(DataType::String(Bytes::from(s.into_bytes()))),
+    );
     Ok(resp)
 }
 
@@ -592,8 +603,10 @@ pub async fn cmd_append(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
     match store_db.get_mut(&key) {
         Some(e) => match &mut e.value {
             DataType::String(v) => {
-                v.extend_from_slice(&val);
-                let len = v.len() as i64;
+                let mut owned = v.to_vec();
+                owned.extend_from_slice(&val);
+                let len = owned.len() as i64;
+                e.value = DataType::String(Bytes::from(owned));
                 Ok(Resp::int(len))
             }
             // APPEND always demotes an int-encoded key to a raw String —
@@ -601,17 +614,17 @@ pub async fn cmd_append(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
             // in place). Build the concatenated bytes and replace the entry.
             DataType::Int(cell) => {
                 let mut buf = itoa::Buffer::new();
-                let mut v = buf.format(cell.load()).as_bytes().to_vec();
-                v.extend_from_slice(&val);
-                let len = v.len() as i64;
-                e.value = DataType::String(v);
+                let mut owned = buf.format(cell.load()).as_bytes().to_vec();
+                owned.extend_from_slice(&val);
+                let len = owned.len() as i64;
+                e.value = DataType::String(Bytes::from(owned));
                 Ok(Resp::int(len))
             }
             _ => Err(NexradeError::WrongType),
         },
         None => {
             let len = val.len() as i64;
-            store_db.insert(key, Entry::new(DataType::String(val)));
+            store_db.insert(key, Entry::new(DataType::String(Bytes::from(val))));
             Ok(Resp::int(len))
         }
     }
@@ -687,7 +700,7 @@ pub async fn cmd_setrange(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
     let mut bytes = match store_db.get(&key) {
         None => vec![],
         Some(e) => match e.value.as_string_bytes() {
-            Some(v) => v,
+            Some(v) => v.to_vec(),
             None => return Err(NexradeError::WrongType),
         },
     };
@@ -698,7 +711,7 @@ pub async fn cmd_setrange(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
     }
     bytes[offset..end].copy_from_slice(&patch);
     let len = bytes.len() as i64;
-    store_db.insert(key, Entry::new(DataType::String(bytes)));
+    store_db.insert(key, Entry::new(DataType::String(Bytes::from(bytes))));
     Ok(Resp::int(len))
 }
 

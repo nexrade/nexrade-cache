@@ -167,9 +167,8 @@ pub async fn cmd_pfmerge(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp
             // Take the existing bytes (if any) out so we can rebuild with
             // the merged register values, then assign back as HyperLogLog.
             let existing: Option<Vec<u8>> = match &mut entry.value {
-                DataType::HyperLogLog(v) | DataType::String(v) if v.len() == HLL_REGISTERS => {
-                    Some(std::mem::take(v))
-                }
+                DataType::HyperLogLog(v) if v.len() == HLL_REGISTERS => Some(std::mem::take(v)),
+                DataType::String(s) if s.len() == HLL_REGISTERS => Some(s.to_vec()),
                 DataType::HyperLogLog(_) | DataType::String(_) => None,
                 _ => return Err(NexradeError::WrongType),
             };

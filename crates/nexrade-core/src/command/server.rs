@@ -1127,7 +1127,92 @@ pub async fn cmd_acl(db: &Db, args: &[Resp], authenticated_user: &str) -> Result
 }
 
 pub async fn cmd_reset() -> Result<Resp> {
+    // Connection-layer state (MULTI/WATCH/AUTH/SELECT/tracking/pubsub) is
+    // cleared by `Connection::handle_reset`. The dispatch-table arm is only
+    // reached for non-connection callers (tests / WASM); return the Redis
+    // reply shape either way.
     Ok(Resp::SimpleString("RESET".to_string()))
+}
+
+/// `TIME` — return the server's notion of time as `[unix_secs, microseconds]`.
+pub async fn cmd_time() -> Result<Resp> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let dur = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        Ok(Resp::array(vec![
+            Resp::bulk_str(dur.as_secs().to_string()),
+            Resp::bulk_str(dur.subsec_micros().to_string()),
+        ]))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Ok(Resp::array(vec![Resp::bulk_str("0"), Resp::bulk_str("0")]))
+    }
+}
+
+/// `ROLE` — report this instance's replication role.
+///
+/// Primary shape: `["master", offset, [[host, port, offset], ...]]`
+/// Replica shape: `["slave", host, port, state, offset]`
+pub async fn cmd_role(db: &Db) -> Result<Resp> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        match db.replication.current_role() {
+            ReplicationRole::Primary => {
+                let offset = db.replication.replication_offset.load(Ordering::Relaxed) as i64;
+                let replicas = db.replication.connected_replicas.read();
+                let slave_list: Vec<Resp> = replicas
+                    .iter()
+                    .map(|r| {
+                        let host = r.addr.ip().to_string();
+                        let port = r.addr.port().to_string();
+                        Resp::array(vec![
+                            Resp::bulk_str(host),
+                            Resp::bulk_str(port),
+                            Resp::bulk_str(r.offset.to_string()),
+                        ])
+                    })
+                    .collect();
+                Ok(Resp::array(vec![
+                    Resp::bulk_str("master"),
+                    Resp::int(offset),
+                    Resp::array(slave_list),
+                ]))
+            }
+            ReplicationRole::Replica => {
+                let (host, port) = db
+                    .replication
+                    .replica_of
+                    .read()
+                    .clone()
+                    .unwrap_or_else(|| ("?".to_string(), 0));
+                let state = if db.replication.primary_link_up.load(Ordering::Relaxed) {
+                    "connected"
+                } else {
+                    "connect"
+                };
+                let offset = db.replication.replication_offset.load(Ordering::Relaxed) as i64;
+                Ok(Resp::array(vec![
+                    Resp::bulk_str("slave"),
+                    Resp::bulk_str(host),
+                    Resp::int(port as i64),
+                    Resp::bulk_str(state),
+                    Resp::int(offset),
+                ]))
+            }
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = db;
+        Ok(Resp::array(vec![
+            Resp::bulk_str("master"),
+            Resp::int(0),
+            Resp::array(vec![]),
+        ]))
+    }
 }
 
 // ── Replication commands ──────────────────────────────────────────────────────

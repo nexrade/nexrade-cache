@@ -353,7 +353,16 @@ impl Connection {
                     break 'outer;
                 }
 
-                let start = Instant::now();
+                // Skip Instant::now() entirely when both metrics and slowlog are off —
+                // `Instant::now()` is ~20 ns on Linux even when unused. On a
+                // 100 ns hot path that's a 20 % tax for nothing.
+                let need_timing =
+                    self.metrics.is_some() || self.db.slowlog.threshold_us() != u64::MAX;
+                let start = if need_timing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 // Capture just the arg count — `args` itself is moved
                 // into dispatch below, but for slowlog we only need
                 // the length.
@@ -443,6 +452,12 @@ impl Connection {
                 } else if cmd_name == "QUIT" {
                     quit = true;
                     Resp::ok()
+                } else if cmd_name == "RESET" {
+                    // Redis RESET: clear transaction, watches, auth (re-auth
+                    // required if requirepass is set), SELECT 0, tracking,
+                    // reply mode, and pubsub. Reply is the simple string
+                    // "RESET" (not OK).
+                    self.handle_reset()
                 } else if cmd_name == "EVAL" {
                     self.handle_eval(&args).await
                 } else if cmd_name == "EVALSHA" {
@@ -504,7 +519,7 @@ impl Connection {
                 had_commands = true;
 
                 // Record metrics and slow log.
-                let elapsed = start.elapsed();
+                let elapsed = start.map(|s| s.elapsed()).unwrap_or_default();
                 if let Some(ref m) = self.metrics {
                     let is_error = matches!(&response, Resp::Error(_));
                     // Cache the per-command metric handles across
@@ -522,8 +537,8 @@ impl Connection {
                     };
                     Metrics::record_with_handles(handles, elapsed.as_secs_f64(), is_error);
                 }
-                let sl = &self.db.slowlog;
-                if elapsed.as_micros() as u64 >= sl.threshold_us() {
+                if elapsed.as_micros() as u64 >= self.db.slowlog.threshold_us() {
+                    let sl = &self.db.slowlog;
                     // Slow path: `args` was moved into dispatch above and
                     // already dropped, so we synthesize a minimal
                     // representation from the parts we still have.
@@ -540,7 +555,9 @@ impl Connection {
                     resp3_nest_pairs,
                 );
 
-                response.write_to_for_version(&mut self.write_buf, self.resp_version);
+                // Owned write: Resp::Raw (LRANGE etc.) moves its Bytes into
+                // the SegBuf with no refcount bump.
+                response.write_to_for_version_owned(&mut self.write_buf, self.resp_version);
 
                 if quit {
                     break 'inner;
@@ -580,59 +597,70 @@ impl Connection {
     // ── Authentication ────────────────────────────────────────────────────────
 
     async fn handle_auth(&mut self, args: &[Resp]) -> Resp {
-        // AUTH <password>                    (legacy single-password)
-        // AUTH <user> <password>              (ACL form, Redis 6+)
-        let user = args.get(1).and_then(|a| a.as_str()).unwrap_or("default");
-        let pass = if args.len() >= 3 {
-            args.get(2).and_then(|a| a.as_str()).unwrap_or("")
+        // AUTH <password>           → user = "default" (Redis legacy form)
+        // AUTH <user> <password>    → ACL form (Redis 6+)
+        //
+        // Previously the single-arg form set `user = args[1]` (the password
+        // string), so a successful `AUTH s3cret` left `authenticated_user =
+        // "s3cret"` and every later command failed ACL with UnknownUser.
+        let (user, pass) = if args.len() >= 3 {
+            (
+                args.get(1).and_then(|a| a.as_str()).unwrap_or("default"),
+                args.get(2).and_then(|a| a.as_str()).unwrap_or(""),
+            )
+        } else if args.len() == 2 {
+            (
+                "default",
+                args.get(1).and_then(|a| a.as_str()).unwrap_or(""),
+            )
         } else {
-            args.get(1).and_then(|a| a.as_str()).unwrap_or("")
+            return Resp::error("ERR wrong number of arguments for 'auth' command");
         };
 
-        // First, try the ACL form. If ACL doesn't have the user (e.g.
-        // `default` with no password), fall back to legacy `requirepass`.
-        match self.db.acl.authenticate(user, pass) {
-            Ok(()) => {
-                self.authenticated = true;
-                self.authenticated_user = user.to_string();
-                if let Some(m) = self.meta.as_ref() {
-                    m.write().user = user.to_string();
+        self.authenticate_as(user, pass)
+    }
+
+    /// Shared AUTH logic for `AUTH` and `HELLO … AUTH`.
+    ///
+    /// When `requirepass` is set it is authoritative for the `default` user —
+    /// ACL's default-user `nopass` must not bypass it (that was a second auth
+    /// hole: `requirepass = "default"` + `AUTH default anything` succeeded).
+    fn authenticate_as(&mut self, user: &str, pass: &str) -> Resp {
+        let requirepass = self.db.config.lock().requirepass.clone();
+
+        if user == "default" {
+            if let Some(ref expected) = requirepass {
+                if pass == expected.as_str() {
+                    self.set_authenticated("default");
+                    return Resp::ok();
                 }
-                return Resp::ok();
-            }
-            Err(_) => {
-                // Fall through to legacy single-password check.
+                return Resp::error("WRONGPASS invalid username-password pair or user is disabled");
             }
         }
 
-        // Legacy path: global requirepass. Used when ACL has no user / no
-        // password for the requested user.
-        let config = self.db.config.lock();
-        match &config.requirepass {
-            None => {
-                // If ACL has the user but auth failed, surface that error.
-                if self.db.acl.get_user(user).is_some() {
-                    Resp::error("WRONGPASS invalid username-password pair or user is disabled")
-                } else {
+        match self.db.acl.authenticate(user, pass) {
+            Ok(()) => {
+                self.set_authenticated(user);
+                Resp::ok()
+            }
+            Err(_) => {
+                // Prefer WRONGPASS (Redis 6+ ACL shape). The legacy "no
+                // password is set" message only applies when the user truly
+                // does not exist and requirepass is unset.
+                if requirepass.is_none() && self.db.acl.get_user(user).is_none() {
                     Resp::error("ERR Client sent AUTH, but no password is set")
-                }
-            }
-            Some(expected) => {
-                // AUTH <pass>           (legacy): user is "default".
-                // AUTH <user> <pass>     (ACL form): user must exist; pass
-                //                         must match legacy pass when no ACL
-                //                         password is configured.
-                if pass == expected.as_str() {
-                    self.authenticated = true;
-                    self.authenticated_user = user.to_string();
-                    if let Some(m) = self.meta.as_ref() {
-                        m.write().user = user.to_string();
-                    }
-                    Resp::ok()
                 } else {
                     Resp::error("WRONGPASS invalid username-password pair or user is disabled")
                 }
             }
+        }
+    }
+
+    fn set_authenticated(&mut self, user: &str) {
+        self.authenticated = true;
+        self.authenticated_user = user.to_string();
+        if let Some(m) = self.meta.as_ref() {
+            m.write().user = user.to_string();
         }
     }
 
@@ -856,6 +884,45 @@ impl Connection {
     fn handle_unwatch(&mut self) -> Resp {
         self.transaction.unwatch();
         Resp::ok()
+    }
+
+    /// Redis `RESET`: clear per-connection state so a pooled client can be
+    /// safely reused. Reply is the simple string `"RESET"` (not OK).
+    fn handle_reset(&mut self) -> Resp {
+        // Drop any queued MULTI/EXEC and WATCHed keys.
+        self.transaction.discard();
+        self.transaction.unwatch();
+
+        // SELECT 0
+        self.db_index = 0;
+        if let Some(m) = self.meta.as_ref() {
+            m.write().db_index = 0;
+        }
+
+        // Disable CLIENT TRACKING for this connection.
+        self.db.tracking.disable(self.client_id);
+
+        // Drop pub/sub subscriptions (channel + pattern). The broker only
+        // tracks per-channel counts, not client ids.
+        for ch in self.subscriptions.drain(..) {
+            self.db.pubsub.unsubscribe(&ch);
+        }
+        for pat in self.pattern_subscriptions.drain(..) {
+            self.db.pubsub.unsubscribe(&pat);
+        }
+
+        // Re-auth required when requirepass is set; otherwise stay as default.
+        let requires_auth = self.db.config.lock().requirepass.is_some();
+        self.authenticated = !requires_auth;
+        self.authenticated_user = "default".to_string();
+        if let Some(m) = self.meta.as_ref() {
+            let mut g = m.write();
+            g.user = "default".to_string();
+            g.name.clear();
+        }
+
+        // RESP version stays as negotiated (Redis keeps it).
+        Resp::SimpleString("RESET".to_string())
     }
 
     // ── Pub/Sub ───────────────────────────────────────────────────────────────
@@ -1505,22 +1572,38 @@ impl Connection {
             return Resp::error("NOPROTO unsupported protocol version".to_string());
         }
 
-        // AUTH inside HELLO
-        if let Some(auth_arg) = args.get(2).and_then(|a| a.as_str()) {
-            if auth_arg.eq_ignore_ascii_case("AUTH") {
-                let password = args.get(4).and_then(|a| a.as_str()).unwrap_or("");
-                let cfg = self.db.config.lock();
-                match &cfg.requirepass {
-                    None => {}
-                    Some(pass) if pass == password => {
-                        self.authenticated = true;
-                    }
-                    _ => {
-                        return Resp::error(
-                            "WRONGPASS invalid username-password pair or user is disabled",
-                        )
+        // AUTH inside HELLO — Redis form is `HELLO <proto> AUTH <user> <pass>`
+        // (and optionally SETNAME …). Use the same path as AUTH so requirepass
+        // and ACL agree, and so `authenticated_user` is actually set.
+        let mut i = 2;
+        while i < args.len() {
+            let opt = match args[i].as_str() {
+                Some(s) => s,
+                None => {
+                    i += 1;
+                    continue;
+                }
+            };
+            if opt.eq_ignore_ascii_case("AUTH") {
+                let user = args
+                    .get(i + 1)
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("default");
+                let pass = args.get(i + 2).and_then(|a| a.as_str()).unwrap_or("");
+                let resp = self.authenticate_as(user, pass);
+                if matches!(resp, Resp::Error(_)) {
+                    return resp;
+                }
+                i += 3;
+            } else if opt.eq_ignore_ascii_case("SETNAME") {
+                if let Some(name) = args.get(i + 1).and_then(|a| a.as_str()) {
+                    if let Some(m) = self.meta.as_ref() {
+                        m.write().name = name.to_string();
                     }
                 }
+                i += 2;
+            } else {
+                i += 1;
             }
         }
 

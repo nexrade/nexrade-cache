@@ -510,57 +510,63 @@ Operations that touch multiple keys acquire shard locks in a **deterministic sor
 
 ## Performance
 
-Measured with `redis-benchmark` against Redis 7.4.1 on the same machine (loopback, no TLS).
+Measured with `redis-benchmark` against **Redis 7.0.15** on the same machine
+(loopback, no TLS, no persistence). nexrade-cache **0.2.3** release build with
+jemalloc (Linux/macOS). Methodology matches the tables below:
+`-c 50 -n 100000 -q` (no pipeline) and `-c 50 -n 1000000 -P 50 -q` (pipelined).
 
-**No pipelining** (`-c 50 -n 100000 -q` — the shape most real client traffic takes):
-nexrade-cache **beats Redis on every commonly-used command**, typically 5-13% faster with
-lower p99 latency:
+**No pipelining** (`-c 50 -n 100000 -q` — the shape most real client traffic
+takes). nexrade-cache **beats Redis on every common single-key command**,
+typically **+7–13%** with lower p50 latency:
 
-| Command | nexrade-cache | Redis 7.4.1 | Delta |
+| Command | nexrade-cache | Redis 7.0.15 | Delta |
 |---------|:---:|:---:|:---:|
-| PING | 240K rps | 220K rps | **+9%** |
-| SET | 243K rps | 229K rps | **+6%** |
-| GET | 241K rps | 223K rps | **+8%** |
-| INCR | 245K rps | 226K rps | **+8%** |
-| HSET | 243K rps | 232K rps | **+5%** |
-| ZADD | 246K rps | 230K rps | **+7%** |
-| SADD | 245K rps | 230K rps | **+7%** |
-| MSET (10 keys) | 250K rps | 275K rps | -9% |
-| LRANGE_600 | 40K rps | 41K rps | -2% |
+| PING | 236K rps | 211K rps | **+12%** |
+| SET | 239K rps | 215K rps | **+11%** |
+| GET | 234K rps | 209K rps | **+12%** |
+| INCR | 239K rps | 212K rps | **+13%** |
+| LPUSH | 236K rps | 214K rps | **+11%** |
+| SADD | 235K rps | 213K rps | **+10%** |
+| HSET | 239K rps | 218K rps | **+10%** |
+| ZADD | 238K rps | 221K rps | **+7%** |
+| MSET (10 keys) | 244K rps | 276K rps | −12% |
+| LRANGE_100 | 134K rps | 176K rps | −24% |
+| LRANGE_600 | 37K rps | 49K rps | −23% |
 
-**Pipelined** (`-P 50 -c 50` — many in-flight commands per connection): the gap against
-Redis has been closed from 6.5× down to **~1.0-1.1×** on the common write commands,
-with several now at parity or ahead:
+**Pipelined** (`-P 50 -c 50 -n 1000000 -q` — many in-flight commands per
+connection). Most hot commands are **at parity or ahead**; several read-side
+commands pull well ahead of Redis:
 
-| Command | nexrade-cache | Redis 7.4.1 | Gap |
+| Command | nexrade-cache | Redis 7.0.15 | Delta |
 |---------|:---:|:---:|:---:|
-| GET | 3.9-4.0M rps | 4.2M rps | 1.0-1.1× |
-| HSET | 3.0M rps | 3.0M rps | ~parity |
-| SET | ~3.1-3.2M rps | 3.4M rps | ~1.1× |
-| LPUSH | 2.2-3.1M rps | 3.0-3.1M rps | 1.0-1.4× |
-| ZADD | 2.1-3.5M rps | 2.9M rps | 0.8-1.4× (nexrade ahead at the high end) |
-| INCR (single-key) | ~3.2-4.2M rps | 4.17M rps | ~1.0-1.3× |
-| MSET (fixed-key) | edges ahead of Redis | — | nexrade wins |
+| PING | 8.8M rps | 4.1M rps | **+111%** |
+| SET | 3.29M rps | 3.30M rps | ~parity |
+| GET | 5.9M rps | 4.2M rps | **+39%** |
+| INCR | 5.6M rps | 4.0M rps | **+39%** |
+| LPUSH | 2.7M rps | 3.1M rps | −12% |
+| SADD | 4.6M rps | 3.9M rps | **+18%** |
+| HSET | 3.9M rps | 3.1M rps | **+26%** |
+| ZADD | 3.2M rps | 2.8M rps | **+13%** |
+| LRANGE_100 | 371K rps | 322K rps | **+15%** |
+| LRANGE_600 | 53K rps | 54K rps | ~parity |
+| MSET (10 keys) | 1.14M rps | 0.81M rps | **+41%** |
 
-The single-key `INCR` contention gap (previously ~4.5× under heavy same-key
-concurrency) is now closed via an atomic CAS fast path that skips the shard's
-exclusive write lock entirely once a key is promoted to an integer
-representation. The one gap still open going into a future release is
-pipelined `MSET` against a *randomized* keyspace (each call's keys land on
-different, disjoint shard sets) — nexrade-cache still trails Redis there by
-roughly 1.7-1.8×, since acquiring several shard locks atomically is a
-structural cost real Redis's single-threaded event loop doesn't pay. Closing
-that further needs a full per-shard deferred-queue design, not a smaller
-patch. The numbers above come from atomic mirrors for the replica-role,
-maxmemory, `CLIENT TRACKING`, and
-per-command metrics-handle checks, a single-lookup entry API for
-string/list/hash/set/zset writes, a try-lock-all-with-backoff rewrite for
-MSET/MSETNX, a multi-threaded Tokio runtime, and per-batch (not per-command)
-connection metadata refresh.
+### Remaining gaps (structural, not “one more micro-opt”)
+
+| Gap | Why |
+|-----|-----|
+| Non-pipe `LRANGE` (~−20%) | Redis short lists are often a contiguous **listpack**; we store `VecDeque<Bytes>` and frame each element as its own bulk string. Closing this needs a list-encoding change, not more serialize polish. Pipelined LRANGE is already at/above Redis. |
+| Pipelined `LPUSH` (~−12%) | Multi-threaded shard lock vs Redis’s single-threaded push loop. |
+| Non-pipe `MSET` (~−12%) | Multi-shard try-lock cost that Redis’s single-thread loop doesn’t pay. Pipelined fixed-key MSET is **ahead**. |
+
+The old single-key `INCR` contention gap (previously ~4.5× under heavy same-key
+concurrency) is closed via an atomic CAS fast path that skips the shard’s
+exclusive write lock once a key is promoted to an integer representation.
 
 ### Hot-path optimisations
 
-Beyond single-thread throughput, the storage layer avoids the big constant-factor sources of overhead:
+Beyond single-thread throughput, the storage and connection layers avoid the
+big constant-factor sources of overhead:
 
 | Path | Before | After |
 |------|--------|-------|
@@ -573,8 +579,15 @@ Beyond single-thread throughput, the storage layer avoids the big constant-facto
 | `INCR`/`DECR`/`INCRBY`/`DECRBY` on a promoted key | Exclusive shard write-lock every call | `AtomicIntCell` read-lock CAS fast path; write-lock only for creation/promotion/expiry |
 | `INCR`/`INCRBY`/`DECR`/`DECRBY` integer formatting | `i64::to_string()` (heap-allocating) | `itoa::Buffer` (stack, no allocation) |
 | `MSET`/`MSETNX` shard acquisition | Sequential blocking `write()` per shard (convoy stalls under pipelining) | `try_write` sweep with backoff-and-retry; never holds a shard hostage while waiting on another |
+| `LPUSH` / `XADD` / `ZADD` waiter wake | Always `Notify::notify_waiters` | Atomic waiter count; notify only when someone is parked |
+| ACL check on unrestricted `default` | Users `RwLock` + HashMap every command | Single atomic “open ACL” load |
+| Key extraction for tracking/ACL | Always allocate `Vec<Vec<u8>>` of touched keys | Skipped when ACL is open and no client has TRACKING enabled |
+| `DataType::String` storage | `Vec<u8>` copy on every `SET` | `Bytes` with compact `copy_from_slice` (no parser-buffer pin) |
+| `LRANGE` reply buffer | Allocate+free multi-KB `BytesMut` per call | Thread-local buffer reused via `split().freeze()`; static empty `*0\r\n`; owned `Resp::Raw` write |
+| Global allocator (Linux/macOS) | System allocator | `tikv-jemallocator` (matches Redis) |
 
-See `crates/nexrade-core/tests/perf_tier2.rs` for the benchmark suite; the `estimated_memory_bytes()` × 10k call cost went from O(10M) entries to ~9 ms total.
+See `crates/nexrade-core/tests/perf_tier2.rs` for the micro-benchmark suite; the
+`estimated_memory_bytes()` × 10k call cost went from O(10M) entries to ~9 ms total.
 
 ---
 

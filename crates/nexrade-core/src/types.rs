@@ -117,8 +117,11 @@ impl<'de> Deserialize<'de> for AtomicIntCell {
 /// All supported Redis-compatible data types.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum DataType {
-    /// Plain string (or binary blob)
-    String(Vec<u8>),
+    /// Plain string (or binary blob). Stored as `Bytes` so SET/GET can
+    /// share the RESP parser's buffer via a refcount bump instead of a
+    /// full `Vec<u8>` copy on every write (matches how `List` already
+    /// stores elements).
+    String(Bytes),
     /// Integer fast-path representation — created only by `INCR`/`DECR`/
     /// `INCRBY`/`DECRBY` on a vacant key or an existing integer-valued
     /// `String`. Any command that writes a string value directly (`SET`,
@@ -170,18 +173,15 @@ impl Clone for DataType {
 
 impl DataType {
     /// Render this value's string-representable bytes, if it has one.
-    /// `String` returns its bytes directly (clone); `Int` formats the
-    /// current atomic value via `itoa` (no `to_string()` allocation +
-    /// re-validate). Every other variant returns `None` — callers should
-    /// treat that as `WrongType`, mirroring what a bare
-    /// `DataType::String(v) => ..., _ => Err(WrongType)` match already did
-    /// before `Int` existed.
-    pub fn as_string_bytes(&self) -> Option<Vec<u8>> {
+    /// `String` returns a refcount-bumped `Bytes` (O(1)); `Int` formats the
+    /// current atomic value via `itoa`. Every other variant returns `None` —
+    /// callers should treat that as `WrongType`.
+    pub fn as_string_bytes(&self) -> Option<Bytes> {
         match self {
             DataType::String(v) => Some(v.clone()),
             DataType::Int(cell) => {
                 let mut buf = itoa::Buffer::new();
-                Some(buf.format(cell.load()).as_bytes().to_vec())
+                Some(Bytes::copy_from_slice(buf.format(cell.load()).as_bytes()))
             }
             _ => None,
         }

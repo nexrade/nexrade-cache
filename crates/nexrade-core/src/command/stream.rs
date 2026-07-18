@@ -153,7 +153,7 @@ pub async fn cmd_xadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     // re-check inside their wait loop filters by key, so cross-stream
     // wakeups are harmless.
     #[cfg(not(target_arch = "wasm32"))]
-    db.stream_notify.notify_waiters();
+    db.notify_stream_waiters();
 
     Ok(Resp::bulk_str(id))
 }
@@ -423,6 +423,7 @@ pub async fn cmd_xread(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
     {
         let timeout_dur = std::time::Duration::from_millis(block_ms.unwrap());
         match tokio::time::timeout(timeout_dur, async {
+            let _parked = db.park_stream_waiter();
             loop {
                 db.stream_notify.notified().await;
                 let snap = snapshot()?;
@@ -898,6 +899,7 @@ pub async fn cmd_xreadgroup(db: &Db, args: &[Resp], db_index: usize) -> Result<R
     {
         let timeout_dur = std::time::Duration::from_millis(block_ms.unwrap());
         match tokio::time::timeout(timeout_dur, async {
+            let _parked = db.park_stream_waiter();
             loop {
                 db.stream_notify.notified().await;
                 let snap = read_once(&key_specs)?;
@@ -1074,4 +1076,484 @@ pub async fn cmd_xpending(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
             _ => Err(NexradeError::WrongType),
         },
     }
+}
+
+// ── XINFO ──────────────────────────────────────────────────────────────────────
+
+pub async fn cmd_xinfo(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    // XINFO STREAM key | XINFO GROUPS key | XINFO CONSUMERS key group
+    if args.len() < 2 {
+        return Err(NexradeError::WrongArity("xinfo".to_string()));
+    }
+    let sub = get_str(args, 1, "XINFO")?.to_uppercase();
+    match sub.as_str() {
+        "STREAM" => xinfo_stream(db, args, db_index).await,
+        "GROUPS" => xinfo_groups(db, args, db_index).await,
+        "CONSUMERS" => xinfo_consumers(db, args, db_index).await,
+        "HELP" => Ok(Resp::array(vec![
+            Resp::bulk_str("XINFO <subcommand> [<arg> ...]. Subcommands are:"),
+            Resp::bulk_str("STREAM <key>"),
+            Resp::bulk_str("GROUPS <key>"),
+            Resp::bulk_str("CONSUMERS <key> <group>"),
+        ])),
+        _ => Err(NexradeError::Generic(format!(
+            "ERR unknown XINFO subcommand or wrong number of arguments for '{}'",
+            sub
+        ))),
+    }
+}
+
+/// `NOGROUP` reply matching Redis's wording for a missing group under a
+/// known stream key.
+fn nogroup_err(key: &[u8], group: &[u8]) -> NexradeError {
+    NexradeError::Generic(format!(
+        "NOGROUP No such consumer group '{}' for key name '{}'",
+        String::from_utf8_lossy(group),
+        String::from_utf8_lossy(key)
+    ))
+}
+
+fn no_such_key_err() -> NexradeError {
+    NexradeError::Generic("ERR no such key".to_string())
+}
+
+async fn xinfo_stream(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    if args.len() < 3 {
+        return Err(NexradeError::WrongArity("XINFO STREAM".to_string()));
+    }
+    let key = get_bytes_vec(args, 2, "XINFO STREAM")?;
+    let store_db = db.store.db(db_index).read_for(&key);
+    match store_db.get_ro(&key) {
+        None => Err(no_such_key_err()),
+        Some(e) => match &e.value {
+            DataType::Stream(s) => {
+                let first = s.entries.first().map(format_stream_entry);
+                let last = s.entries.last().map(format_stream_entry);
+                let last_id = s
+                    .entries
+                    .last()
+                    .map(|e| e.id.clone())
+                    .unwrap_or_else(|| "0-0".to_string());
+                Ok(Resp::array(vec![
+                    Resp::bulk_str("length"),
+                    Resp::int(s.entries.len() as i64),
+                    Resp::bulk_str("last-generated-id"),
+                    Resp::bulk_str(last_id.clone()),
+                    Resp::bulk_str("max-deleted-entry-id"),
+                    Resp::bulk_str("0-0"),
+                    Resp::bulk_str("entries-added"),
+                    Resp::int(s.entries.len() as i64),
+                    Resp::bulk_str("groups"),
+                    Resp::int(s.groups.len() as i64),
+                    Resp::bulk_str("first-entry"),
+                    first.unwrap_or_else(Resp::null),
+                    Resp::bulk_str("last-entry"),
+                    last.unwrap_or_else(Resp::null),
+                ]))
+            }
+            _ => Err(NexradeError::WrongType),
+        },
+    }
+}
+
+async fn xinfo_groups(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    if args.len() < 3 {
+        return Err(NexradeError::WrongArity("XINFO GROUPS".to_string()));
+    }
+    let key = get_bytes_vec(args, 2, "XINFO GROUPS")?;
+    let store_db = db.store.db(db_index).read_for(&key);
+    match store_db.get_ro(&key) {
+        None => Err(no_such_key_err()),
+        Some(e) => match &e.value {
+            DataType::Stream(s) => {
+                let groups: Vec<Resp> = s
+                    .groups
+                    .values()
+                    .map(|g| {
+                        Resp::array(vec![
+                            Resp::bulk_str("name"),
+                            Resp::bulk(Bytes::from(g.name.clone())),
+                            Resp::bulk_str("consumers"),
+                            Resp::int(g.consumers.len() as i64),
+                            Resp::bulk_str("pending"),
+                            Resp::int(g.pending.len() as i64),
+                            Resp::bulk_str("last-delivered-id"),
+                            Resp::bulk_str(g.last_delivered_id.clone()),
+                            Resp::bulk_str("entries-read"),
+                            Resp::null(),
+                            Resp::bulk_str("lag"),
+                            Resp::null(),
+                        ])
+                    })
+                    .collect();
+                Ok(Resp::array(groups))
+            }
+            _ => Err(NexradeError::WrongType),
+        },
+    }
+}
+
+async fn xinfo_consumers(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    if args.len() < 4 {
+        return Err(NexradeError::WrongArity("XINFO CONSUMERS".to_string()));
+    }
+    let key = get_bytes_vec(args, 2, "XINFO CONSUMERS")?;
+    let group = get_bytes_vec(args, 3, "XINFO CONSUMERS")?;
+    let now = now_ms();
+    let store_db = db.store.db(db_index).read_for(&key);
+    match store_db.get_ro(&key) {
+        None => Err(no_such_key_err()),
+        Some(e) => match &e.value {
+            DataType::Stream(s) => {
+                let g = s
+                    .groups
+                    .get(&group)
+                    .ok_or_else(|| nogroup_err(&key, &group))?;
+                // Idle time for a consumer is derived from the most recent
+                // delivery timestamp across its pending entries (Redis tracks
+                // a dedicated seen-time; we approximate from pending state,
+                // which is the only per-consumer time this model records).
+                let consumers: Vec<Resp> = g
+                    .consumers
+                    .values()
+                    .map(|c| {
+                        let last_seen = g
+                            .pending
+                            .values()
+                            .filter(|p| p.consumer == c.name)
+                            .map(|p| p.delivery_time_ms)
+                            .max();
+                        let idle = last_seen.map(|t| now.saturating_sub(t)).unwrap_or(0);
+                        Resp::array(vec![
+                            Resp::bulk_str("name"),
+                            Resp::bulk(Bytes::from(c.name.clone())),
+                            Resp::bulk_str("pending"),
+                            Resp::int(c.pending_ids.len() as i64),
+                            Resp::bulk_str("idle"),
+                            Resp::int(idle as i64),
+                            Resp::bulk_str("inactive"),
+                            Resp::int(idle as i64),
+                        ])
+                    })
+                    .collect();
+                Ok(Resp::array(consumers))
+            }
+            _ => Err(NexradeError::WrongType),
+        },
+    }
+}
+
+// ── XCLAIM ─────────────────────────────────────────────────────────────────────
+
+pub async fn cmd_xclaim(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    // XCLAIM key group consumer min-idle-time id [id ...]
+    //   [IDLE ms] [TIME ms-unix] [RETRYCOUNT n] [FORCE] [JUSTID]
+    if args.len() < 6 {
+        return Err(NexradeError::WrongArity("xclaim".to_string()));
+    }
+    let key = get_bytes_vec(args, 1, "XCLAIM")?;
+    let group = get_bytes_vec(args, 2, "XCLAIM")?;
+    let consumer = get_bytes_vec(args, 3, "XCLAIM")?;
+    let min_idle = get_i64(args, 4, "XCLAIM")?.max(0) as u64;
+
+    // Collect id args until the first option token.
+    let mut ids: Vec<String> = Vec::new();
+    let mut idx = 5;
+    while idx < args.len() {
+        let s = get_str(args, idx, "XCLAIM")?;
+        if StreamId::parse(s).is_some() {
+            ids.push(s.to_string());
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+
+    let mut set_idle: Option<u64> = None;
+    let mut set_time: Option<u64> = None;
+    let mut set_retry: Option<u64> = None;
+    let mut force = false;
+    let mut justid = false;
+    while idx < args.len() {
+        let opt = get_str(args, idx, "XCLAIM")?.to_uppercase();
+        match opt.as_str() {
+            "IDLE" => {
+                set_idle = Some(get_i64(args, idx + 1, "XCLAIM")?.max(0) as u64);
+                idx += 2;
+            }
+            "TIME" => {
+                set_time = Some(get_i64(args, idx + 1, "XCLAIM")?.max(0) as u64);
+                idx += 2;
+            }
+            "RETRYCOUNT" => {
+                set_retry = Some(get_i64(args, idx + 1, "XCLAIM")?.max(0) as u64);
+                idx += 2;
+            }
+            "FORCE" => {
+                force = true;
+                idx += 1;
+            }
+            "JUSTID" => {
+                justid = true;
+                idx += 1;
+            }
+            "LASTID" => {
+                idx += 2;
+            }
+            _ => return Err(NexradeError::SyntaxError),
+        }
+    }
+
+    let now = now_ms();
+    let mut store_db = db.store.db(db_index).write_for(&key);
+    let e = match store_db.get_mut(&key) {
+        None => return Err(nogroup_err(&key, &group)),
+        Some(e) => e,
+    };
+    let s = match &mut e.value {
+        DataType::Stream(s) => s,
+        _ => return Err(NexradeError::WrongType),
+    };
+    // Snapshot which ids exist and their entries (a claimed-but-deleted entry
+    // is dropped from the PEL, matching Redis).
+    let existing: std::collections::HashSet<String> =
+        s.entries.iter().map(|e| e.id.clone()).collect();
+    let entry_by_id: std::collections::HashMap<String, StreamEntry> = s
+        .entries
+        .iter()
+        .map(|e| (e.id.clone(), e.clone()))
+        .collect();
+
+    let g = s
+        .groups
+        .get_mut(&group)
+        .ok_or_else(|| nogroup_err(&key, &group))?;
+
+    g.consumers
+        .entry(consumer.clone())
+        .or_insert_with(|| Consumer {
+            name: consumer.clone(),
+            pending_ids: vec![],
+        });
+
+    let mut claimed: Vec<Resp> = Vec::new();
+    for id in &ids {
+        let existing_pending = g.pending.get(id).cloned();
+        let is_pending = existing_pending.is_some();
+
+        // Without FORCE, only already-pending entries can be claimed.
+        if !is_pending && !force {
+            continue;
+        }
+        // FORCE requires the entry to still exist in the stream.
+        if !is_pending && !existing.contains(id) {
+            continue;
+        }
+        // Pending but the underlying entry was deleted: drop from the PEL.
+        if is_pending && !existing.contains(id) {
+            if let Some(p) = g.pending.remove(id) {
+                if let Some(c) = g.consumers.get_mut(&p.consumer) {
+                    c.pending_ids.retain(|pid| pid != id);
+                }
+            }
+            continue;
+        }
+
+        // Enforce min-idle-time against the current pending record.
+        if let Some(ref p) = existing_pending {
+            let idle = now.saturating_sub(p.delivery_time_ms);
+            if idle < min_idle {
+                continue;
+            }
+        }
+
+        let delivery_time_ms = match (set_time, set_idle) {
+            (Some(t), _) => t,
+            (None, Some(i)) => now.saturating_sub(i),
+            (None, None) => now,
+        };
+        let base_retry = existing_pending
+            .as_ref()
+            .map(|p| p.delivery_count)
+            .unwrap_or(0);
+        let delivery_count = match set_retry {
+            Some(r) => r,
+            None if justid => base_retry,
+            None => base_retry + 1,
+        };
+
+        // Reassign ownership.
+        if let Some(ref p) = existing_pending {
+            if let Some(prev) = g.consumers.get_mut(&p.consumer) {
+                prev.pending_ids.retain(|pid| pid != id);
+            }
+        }
+        g.pending.insert(
+            id.clone(),
+            PendingEntry {
+                consumer: consumer.clone(),
+                delivery_time_ms,
+                delivery_count,
+            },
+        );
+        if let Some(c) = g.consumers.get_mut(&consumer) {
+            if !c.pending_ids.iter().any(|pid| pid == id) {
+                c.pending_ids.push(id.clone());
+            }
+        }
+
+        if justid {
+            claimed.push(Resp::bulk_str(id.clone()));
+        } else if let Some(entry) = entry_by_id.get(id) {
+            claimed.push(format_stream_entry(entry));
+        }
+    }
+
+    Ok(Resp::array(claimed))
+}
+
+// ── XAUTOCLAIM ─────────────────────────────────────────────────────────────────
+
+pub async fn cmd_xautoclaim(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    // XAUTOCLAIM key group consumer min-idle-time start [COUNT n] [JUSTID]
+    if args.len() < 6 {
+        return Err(NexradeError::WrongArity("xautoclaim".to_string()));
+    }
+    let key = get_bytes_vec(args, 1, "XAUTOCLAIM")?;
+    let group = get_bytes_vec(args, 2, "XAUTOCLAIM")?;
+    let consumer = get_bytes_vec(args, 3, "XAUTOCLAIM")?;
+    let min_idle = get_i64(args, 4, "XAUTOCLAIM")?.max(0) as u64;
+    let start_str = get_str(args, 5, "XAUTOCLAIM")?;
+    let start = if start_str == "-" || start_str == "0" {
+        StreamId::MIN
+    } else {
+        StreamId::parse(start_str).ok_or_else(|| {
+            NexradeError::Generic(
+                "ERR Invalid stream ID specified as stream command argument".to_string(),
+            )
+        })?
+    };
+
+    let mut count = 100usize;
+    let mut justid = false;
+    let mut idx = 6;
+    while idx < args.len() {
+        let opt = get_str(args, idx, "XAUTOCLAIM")?.to_uppercase();
+        match opt.as_str() {
+            "COUNT" => {
+                count = get_i64(args, idx + 1, "XAUTOCLAIM")?.max(1) as usize;
+                idx += 2;
+            }
+            "JUSTID" => {
+                justid = true;
+                idx += 1;
+            }
+            _ => return Err(NexradeError::SyntaxError),
+        }
+    }
+
+    let now = now_ms();
+    let mut store_db = db.store.db(db_index).write_for(&key);
+    let e = match store_db.get_mut(&key) {
+        None => return Err(nogroup_err(&key, &group)),
+        Some(e) => e,
+    };
+    let s = match &mut e.value {
+        DataType::Stream(s) => s,
+        _ => return Err(NexradeError::WrongType),
+    };
+    let existing: std::collections::HashSet<String> =
+        s.entries.iter().map(|e| e.id.clone()).collect();
+    let entry_by_id: std::collections::HashMap<String, StreamEntry> = s
+        .entries
+        .iter()
+        .map(|e| (e.id.clone(), e.clone()))
+        .collect();
+
+    let g = s
+        .groups
+        .get_mut(&group)
+        .ok_or_else(|| nogroup_err(&key, &group))?;
+    g.consumers
+        .entry(consumer.clone())
+        .or_insert_with(|| Consumer {
+            name: consumer.clone(),
+            pending_ids: vec![],
+        });
+
+    // Iterate the PEL in id order from `start`, claiming up to `count`.
+    let mut pel_ids: Vec<String> = g
+        .pending
+        .keys()
+        .filter(|id| StreamId::parse(id).map(|p| p >= start).unwrap_or(false))
+        .cloned()
+        .collect();
+    pel_ids.sort_by_key(|id| StreamId::parse(id).unwrap_or(StreamId::MIN));
+
+    let mut claimed: Vec<Resp> = Vec::new();
+    let mut deleted: Vec<Resp> = Vec::new();
+    let mut cursor = StreamId::MIN.to_wire();
+
+    for id in pel_ids {
+        if claimed.len() >= count {
+            // Next call resumes from this id.
+            cursor = id;
+            break;
+        }
+        let p = match g.pending.get(&id) {
+            Some(p) => p.clone(),
+            None => continue,
+        };
+
+        // Entry deleted from the stream: prune from PEL, report as deleted.
+        if !existing.contains(&id) {
+            if let Some(prev) = g.consumers.get_mut(&p.consumer) {
+                prev.pending_ids.retain(|pid| pid != &id);
+            }
+            g.pending.remove(&id);
+            deleted.push(Resp::bulk_str(id.clone()));
+            continue;
+        }
+
+        let idle = now.saturating_sub(p.delivery_time_ms);
+        if idle < min_idle {
+            continue;
+        }
+
+        // Reassign to the claiming consumer.
+        if let Some(prev) = g.consumers.get_mut(&p.consumer) {
+            prev.pending_ids.retain(|pid| pid != &id);
+        }
+        let delivery_count = if justid {
+            p.delivery_count
+        } else {
+            p.delivery_count + 1
+        };
+        g.pending.insert(
+            id.clone(),
+            PendingEntry {
+                consumer: consumer.clone(),
+                delivery_time_ms: now,
+                delivery_count,
+            },
+        );
+        if let Some(c) = g.consumers.get_mut(&consumer) {
+            if !c.pending_ids.iter().any(|pid| pid == &id) {
+                c.pending_ids.push(id.clone());
+            }
+        }
+
+        if justid {
+            claimed.push(Resp::bulk_str(id.clone()));
+        } else if let Some(entry) = entry_by_id.get(&id) {
+            claimed.push(format_stream_entry(entry));
+        }
+    }
+
+    // Reply: [next-cursor, claimed-entries, deleted-ids].
+    Ok(Resp::array(vec![
+        Resp::bulk_str(cursor),
+        Resp::array(claimed),
+        Resp::array(deleted),
+    ]))
 }

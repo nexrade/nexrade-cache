@@ -119,11 +119,15 @@ pub async fn cmd_zadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
         let old = zset.score(&member).unwrap_or(0.0);
         let new_score = old + delta;
         zset.insert(member, new_score);
+        // Drop the shard lock before notifying waiters.
+        drop(store_db);
+        db.notify_zset_waiters();
         return Ok(Resp::bulk_str(format_float(new_score)));
     }
 
     let mut added = 0i64;
     let mut changed = 0i64;
+    let mut mutated = false;
 
     while i + 1 < args.len() {
         let (score, _) = parse_score_bound(get_str(args, i, "ZADD")?)?;
@@ -156,9 +160,17 @@ pub async fn cmd_zadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
         let is_new = zset.insert(member, score);
         if is_new {
             added += 1;
+            mutated = true;
         } else if existing_score.map(|old| old != score).unwrap_or(false) {
             changed += 1;
+            mutated = true;
         }
+    }
+
+    if mutated {
+        // Release the shard lock before waking waiters so they can re-acquire.
+        drop(store_db);
+        db.notify_zset_waiters();
     }
 
     Ok(Resp::int(if ch { added + changed } else { added }))
@@ -238,6 +250,9 @@ pub async fn cmd_zincrby(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp
     let old = zset.score(&member).unwrap_or(0.0);
     let new_score = old + delta;
     zset.insert(member, new_score);
+    drop(store_db);
+    // Score change (or new member) must wake BZMPOP waiters.
+    db.notify_zset_waiters();
     Ok(Resp::bulk_str(format_float(new_score)))
 }
 
@@ -984,6 +999,10 @@ pub async fn cmd_zunionstore(db: &Db, args: &[Resp], db_index: usize) -> Result<
     let sdb = db.store.db(db_index);
     let mut dst_shard = sdb.write_for(&dst);
     dst_shard.insert(dst, Entry::new(DataType::ZSet(result)));
+    drop(dst_shard);
+    if count > 0 {
+        db.notify_zset_waiters();
+    }
     Ok(Resp::int(count))
 }
 
@@ -1026,6 +1045,10 @@ pub async fn cmd_zinterstore(db: &Db, args: &[Resp], db_index: usize) -> Result<
     let sdb = db.store.db(db_index);
     let mut dst_shard = sdb.write_for(&dst);
     dst_shard.insert(dst, Entry::new(DataType::ZSet(result)));
+    drop(dst_shard);
+    if count > 0 {
+        db.notify_zset_waiters();
+    }
     Ok(Resp::int(count))
 }
 
@@ -1133,12 +1156,12 @@ pub async fn cmd_bzmpop(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
         } else {
             std::time::Duration::from_secs_f64(timeout_secs)
         };
-        // ZMPOP is rare enough that we just poll on the generic list_notify.
-        // For better semantics, we'd want a dedicated zset notify, but list_notify
-        // wakes on any data change which is acceptable here.
+        // Wait on the dedicated zset notify so ZADD / ZINCRBY / Z*STORE actually
+        // wake us. list_notify only fires on list/stream pushes.
         match tokio::time::timeout(dur, async {
+            let _parked = db.park_zset_waiter();
             loop {
-                db.list_notify.notified().await;
+                db.zset_notify.notified().await;
                 if let Some(resp) = zmpop_attempt(db, db_index, &keys, min, count)? {
                     return Ok::<Resp, NexradeError>(resp);
                 }
@@ -1286,6 +1309,10 @@ pub async fn cmd_zdiffstore(db: &Db, args: &[Resp], db_index: usize) -> Result<R
     let sdb = db.store.db(db_index);
     let mut dst_shard = sdb.write_for(&dst);
     dst_shard.insert(dst, Entry::new(DataType::ZSet(result)));
+    drop(dst_shard);
+    if count > 0 {
+        db.notify_zset_waiters();
+    }
     Ok(Resp::int(count))
 }
 
@@ -1491,6 +1518,10 @@ pub async fn cmd_zrangestore(db: &Db, args: &[Resp], db_index: usize) -> Result<
     }
     let count = new_z.len() as i64;
     dst_shard.insert(dst, Entry::new(DataType::ZSet(new_z)));
+    drop(dst_shard);
+    if count > 0 {
+        db.notify_zset_waiters();
+    }
 
     Ok(Resp::int(count))
 }

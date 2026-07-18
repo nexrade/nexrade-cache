@@ -1,5 +1,6 @@
 //! Tests for the AOF rewrite, stream ID comparison, and HLL commands.
 
+use bytes::Bytes;
 use std::collections::HashMap;
 
 use nexrade_core::command::hll;
@@ -296,7 +297,7 @@ fn build_db_with_all_types() -> Db {
         let mut g = shard.write_for(b"a_string");
         g.insert(
             b"a_string".to_vec(),
-            Entry::new(DataType::String(b"hello".to_vec())),
+            Entry::new(DataType::String(Bytes::from_static(b"hello"))),
         );
     }
     // Bitmap.
@@ -486,8 +487,9 @@ async fn aof_rewrite_round_trip_all_types() {
     {
         let bitmap_guard = shard.read_for(b"a_bitmap");
         let bitmap = bitmap_guard.get_ro(b"a_bitmap").unwrap();
-        let bitmap_bytes = match &bitmap.value {
-            DataType::String(v) | DataType::Bitmap(v) => v.clone(),
+        let bitmap_bytes: Vec<u8> = match &bitmap.value {
+            DataType::String(v) => v.to_vec(),
+            DataType::Bitmap(v) => v.clone(),
             _ => panic!("wrong type for replay bitmap"),
         };
         assert_eq!(bitmap_bytes, vec![0b10100000, 0b00000001, 0, 0]);
@@ -498,7 +500,8 @@ async fn aof_rewrite_round_trip_all_types() {
         let hll_guard = shard.read_for(b"a_hll");
         let hll_entry = hll_guard.get_ro(b"a_hll").unwrap();
         match &hll_entry.value {
-            DataType::HyperLogLog(v) | DataType::String(v) => v.clone(),
+            DataType::HyperLogLog(v) => v.clone(),
+            DataType::String(v) => v.to_vec(),
             _ => panic!("wrong type for replay hll"),
         }
     };

@@ -31,6 +31,9 @@ pub struct Db {
     pub stats: Arc<Stats>,
     /// Notify waiting BLPOP/BRPOP callers when a new item is pushed.
     pub list_notify: Arc<Notify>,
+    /// Number of tasks currently parked on `list_notify`. Producers skip
+    /// `notify_waiters` when this is 0 (the common redis-benchmark case).
+    pub list_waiters: Arc<AtomicUsize>,
     /// Notify waiting BLMOVE callers.
     pub move_notify: Arc<Notify>,
     /// Notify waiting XREAD/XREADGROUP BLOCK callers when a new entry is
@@ -38,6 +41,14 @@ pub struct Db {
     /// stream keys are already sharded — the wakeup is filtered by key in the
     /// caller's re-check loop.
     pub stream_notify: Arc<Notify>,
+    /// Number of tasks currently parked on `stream_notify`.
+    pub stream_waiters: Arc<AtomicUsize>,
+    /// Notify waiting BZMPOP / BZPOP* callers when a sorted-set gains members
+    /// (ZADD / ZINCRBY / Z*STORE). Distinct from `list_notify` so a pure
+    /// zset producer actually wakes the waiter.
+    pub zset_notify: Arc<Notify>,
+    /// Number of tasks currently parked on `zset_notify`.
+    pub zset_waiters: Arc<AtomicUsize>,
     /// Monotonically increasing client ID counter.
     pub next_client_id: Arc<AtomicU64>,
     /// AOF writer — shared across all connections (None if AOF is disabled).
@@ -114,8 +125,12 @@ impl Db {
             config: Arc::new(Mutex::new(config)),
             stats: Arc::new(Stats::default()),
             list_notify: Arc::new(Notify::new()),
+            list_waiters: Arc::new(AtomicUsize::new(0)),
             move_notify: Arc::new(Notify::new()),
             stream_notify: Arc::new(Notify::new()),
+            stream_waiters: Arc::new(AtomicUsize::new(0)),
+            zset_notify: Arc::new(Notify::new()),
+            zset_waiters: Arc::new(AtomicUsize::new(0)),
             next_client_id: Arc::new(AtomicU64::new(1)),
             #[cfg(not(target_arch = "wasm32"))]
             aof_writer: Arc::new(Mutex::new(None)),
@@ -138,6 +153,68 @@ impl Db {
 
     pub fn db_count(&self) -> usize {
         self.store.db_count
+    }
+
+    /// Wake list waiters only if at least one BLPOP/BRPOP/BLMPOP is parked.
+    /// Avoids the Notify bookkeeping on every LPUSH under redis-benchmark
+    /// (zero waiters is the overwhelmingly common case).
+    #[inline]
+    pub fn notify_list_waiters(&self) {
+        if self.list_waiters.load(Ordering::Relaxed) > 0 {
+            self.list_notify.notify_waiters();
+        }
+    }
+
+    /// Wake stream waiters only if at least one XREAD/XREADGROUP BLOCK is parked.
+    #[inline]
+    pub fn notify_stream_waiters(&self) {
+        if self.stream_waiters.load(Ordering::Relaxed) > 0 {
+            self.stream_notify.notify_waiters();
+        }
+    }
+
+    /// Wake zset waiters only if at least one BZMPOP is parked.
+    #[inline]
+    pub fn notify_zset_waiters(&self) {
+        if self.zset_waiters.load(Ordering::Relaxed) > 0 {
+            self.zset_notify.notify_waiters();
+        }
+    }
+
+    /// RAII: increments a waiter counter for the duration of a blocking wait.
+    /// Drop decrements so producers see an accurate count.
+    pub fn park_list_waiter(&self) -> WaiterGuard {
+        WaiterGuard::new(&self.list_waiters)
+    }
+
+    pub fn park_stream_waiter(&self) -> WaiterGuard {
+        WaiterGuard::new(&self.stream_waiters)
+    }
+
+    pub fn park_zset_waiter(&self) -> WaiterGuard {
+        WaiterGuard::new(&self.zset_waiters)
+    }
+}
+
+/// RAII guard that bumps a waiter counter for the life of a blocking wait.
+/// Drop is the only way the counter goes down, so early returns / timeouts
+/// can't leak a permanently-inflated count.
+pub struct WaiterGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl WaiterGuard {
+    fn new(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self {
+            counter: Arc::clone(counter),
+        }
+    }
+}
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

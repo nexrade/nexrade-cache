@@ -1,7 +1,5 @@
 //! Generic key command handlers.
 
-use std::time::Duration;
-
 use bytes::Bytes;
 
 use crate::command::{get_bytes_vec, get_i64, get_str};
@@ -9,6 +7,22 @@ use crate::db::Db;
 use crate::error::{NexradeError, Result};
 use crate::expiry::Expiry;
 use crate::resp::Resp;
+
+/// Current unix time in milliseconds. Mirrors `expiry::system_now_ms` (which
+/// is private to that module) so the EXPIRE family can resolve relative
+/// timeouts and detect past deadlines without a lossy cast.
+#[cfg(not(target_arch = "wasm32"))]
+fn now_unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn now_unix_ms() -> u128 {
+    0
+}
 
 pub async fn cmd_del(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     if args.len() < 2 {
@@ -97,20 +111,18 @@ async fn set_expire(
     let key = get_bytes_vec(args, 1, cmd)?;
     let val = get_i64(args, 2, cmd)?;
 
-    // Relative expire with non-positive timeout is an error (matches Redis 7+).
-    if !absolute && val <= 0 {
-        return Err(NexradeError::Generic(format!(
-            "invalid expire time in '{}'",
-            cmd.to_lowercase()
-        )));
-    }
-    // Absolute timestamp must be positive.
-    if absolute && val < 0 {
-        return Err(NexradeError::Generic(format!(
-            "invalid expire time in '{}'",
-            cmd.to_lowercase()
-        )));
-    }
+    // Resolve to an absolute unix-millisecond deadline, kept signed so a
+    // negative relative timeout or a past absolute timestamp stays negative
+    // (a lossy `as u64` cast would wrap it into the far future). Redis does
+    // NOT reject a non-positive timeout or a past timestamp: it deletes the
+    // key instead (see the past-deadline handling below), so there is no
+    // early "invalid expire time" error here.
+    let unit_ms: i128 = if millis { 1 } else { 1000 };
+    let target_ms: i128 = if absolute {
+        (val as i128) * unit_ms
+    } else {
+        (now_unix_ms() as i128) + (val as i128) * unit_ms
+    };
 
     // Parse conditional options: NX | XX | GT | LT (Redis 7.0+).
     let mut nx = false;
@@ -147,18 +159,6 @@ async fn set_expire(
         return Err(NexradeError::SyntaxError);
     }
 
-    let expiry = if absolute {
-        if millis {
-            Expiry::from_ms(val as u64)
-        } else {
-            Expiry::from_secs(val as u64)
-        }
-    } else if millis {
-        Expiry::from_duration(Duration::from_millis(val as u64))
-    } else {
-        Expiry::from_duration(Duration::from_secs(val as u64))
-    };
-
     let mut store_db = db.store.db(db_index).write_for(&key);
 
     // Key must exist for any expire command to apply. Return 0 immediately
@@ -168,12 +168,16 @@ async fn set_expire(
         Some(e) => e,
     };
 
-    let current_expiry_ms: Option<u64> = entry
+    // Current expiry as a signed ms deadline; `None` means the key is
+    // persistent, which GT/LT must treat as an *infinite* TTL (Redis docs:
+    // "A non-volatile key is treated as an infinite TTL for the purpose of
+    // GT/LT").
+    let current_expiry_ms: Option<i128> = entry
         .expiry
         .as_ref()
-        .map(|e| e.expires_at_ms.min(u64::MAX as u128) as u64);
+        .map(|e| e.expires_at_ms.min(i128::MAX as u128) as i128);
 
-    // Evaluate conditional flags.
+    // Evaluate conditional flags against the new target deadline.
     if nx && current_expiry_ms.is_some() {
         return Ok(Resp::int(0));
     }
@@ -182,13 +186,11 @@ async fn set_expire(
     }
     if gt {
         match current_expiry_ms {
-            None => {
-                // No existing expiry: GT condition is always met (the new
-                // expiry strictly reduces the key's lifetime to a definite
-                // value).
-            }
+            // Persistent key = infinite TTL. A finite new expiry is never
+            // greater than infinity, so GT never applies here.
+            None => return Ok(Resp::int(0)),
             Some(cur) => {
-                if expiry.expires_at_ms.min(u64::MAX as u128) as u64 <= cur {
+                if target_ms <= cur {
                     return Ok(Resp::int(0));
                 }
             }
@@ -196,15 +198,29 @@ async fn set_expire(
     }
     if lt {
         match current_expiry_ms {
-            None => return Ok(Resp::int(0)),
+            // Persistent key = infinite TTL. Any finite new expiry is less
+            // than infinity, so LT always applies here.
+            None => {}
             Some(cur) => {
-                if expiry.expires_at_ms.min(u64::MAX as u128) as u64 >= cur {
+                if target_ms >= cur {
                     return Ok(Resp::int(0));
                 }
             }
         }
     }
 
+    // A resolved deadline at or before now means "delete immediately" — a
+    // non-positive relative timeout or an absolute timestamp in the past.
+    // Redis deletes the key (emitting a `del`, not `expired`) and still
+    // returns 1. Only reached once the NX/XX/GT/LT condition has passed.
+    if target_ms <= now_unix_ms() as i128 {
+        store_db.remove(&key);
+        return Ok(Resp::int(1));
+    }
+
+    // Clamp the (now strictly-positive) deadline back into the unsigned
+    // millisecond domain the store uses.
+    let expiry = Expiry::from_ms(target_ms.min(u64::MAX as i128) as u64);
     store_db.set_expiry(&key, Some(expiry));
     Ok(Resp::int(1))
 }

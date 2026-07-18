@@ -6,6 +6,7 @@ use crate::error::{NexradeError, Result};
 use crate::resp::Resp;
 use crate::store::Entry;
 use crate::types::DataType;
+use bytes::Bytes;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -23,7 +24,8 @@ fn ensure_bitmap(bits: &mut Vec<u8>, byte_idx: usize) {
 /// the borrowed form immediately anyway.
 fn get_bitmap_bytes(entry: &Entry) -> Result<Vec<u8>> {
     match &entry.value {
-        DataType::String(v) | DataType::Bitmap(v) => Ok(v.clone()),
+        DataType::String(v) => Ok(v.to_vec()),
+        DataType::Bitmap(v) => Ok(v.clone()),
         DataType::Int(cell) => Ok(cell.load().to_string().into_bytes()),
         _ => Err(NexradeError::WrongType),
     }
@@ -58,12 +60,24 @@ pub async fn cmd_setbit(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
     // `Vec<u8>` uniformly. No-op for every other variant.
     if let Some(entry) = store_db.get_mut(&key) {
         if let DataType::Int(cell) = &entry.value {
-            entry.value = DataType::String(cell.load().to_string().into_bytes());
+            entry.value = DataType::String(Bytes::from(cell.load().to_string().into_bytes()));
         }
     }
     let old_bit = match store_db.get_mut(&key) {
         Some(entry) => match &mut entry.value {
-            DataType::String(v) | DataType::Bitmap(v) => {
+            DataType::String(s) => {
+                let mut bits = s.to_vec();
+                ensure_bitmap(&mut bits, byte_idx);
+                let old = (bits[byte_idx] >> bit_pos) & 1;
+                if value == 1 {
+                    bits[byte_idx] |= 1 << bit_pos;
+                } else {
+                    bits[byte_idx] &= !(1 << bit_pos);
+                }
+                entry.value = DataType::String(Bytes::from(bits));
+                old as i64
+            }
+            DataType::Bitmap(v) => {
                 ensure_bitmap(v, byte_idx);
                 let old = (v[byte_idx] >> bit_pos) & 1;
                 if value == 1 {
@@ -393,7 +407,8 @@ pub async fn cmd_bitfield(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
                 // can't operate directly on the atomic representation.
                 if let Some(entry) = store_db.get_mut(&key) {
                     if let DataType::Int(cell) = &entry.value {
-                        entry.value = DataType::String(cell.load().to_string().into_bytes());
+                        entry.value =
+                            DataType::String(Bytes::from(cell.load().to_string().into_bytes()));
                     }
                 }
                 let old_val = match store_db.get_mut(&key) {
@@ -405,7 +420,18 @@ pub async fn cmd_bitfield(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
                         0i64
                     }
                     Some(entry) => match &mut entry.value {
-                        DataType::String(v) | DataType::Bitmap(v) => {
+                        DataType::String(s) => {
+                            let mut v = s.to_vec();
+                            let byte_len = (bit_offset + bits).div_ceil(8);
+                            if v.len() < byte_len {
+                                v.resize(byte_len, 0);
+                            }
+                            let old = read_bitfield(&v, bit_offset, bits, signed);
+                            write_bitfield(&mut v, bit_offset, bits, signed, new_val, overflow);
+                            entry.value = DataType::String(Bytes::from(v));
+                            old
+                        }
+                        DataType::Bitmap(v) => {
                             let byte_len = (bit_offset + bits).div_ceil(8);
                             if v.len() < byte_len {
                                 v.resize(byte_len, 0);
@@ -427,7 +453,8 @@ pub async fn cmd_bitfield(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
                 // Same Int-cell demotion as BITFIELD SET above.
                 if let Some(entry) = store_db.get_mut(&key) {
                     if let DataType::Int(cell) = &entry.value {
-                        entry.value = DataType::String(cell.load().to_string().into_bytes());
+                        entry.value =
+                            DataType::String(Bytes::from(cell.load().to_string().into_bytes()));
                     }
                 }
                 let new_val = match store_db.get_mut(&key) {
@@ -444,7 +471,24 @@ pub async fn cmd_bitfield(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
                         }
                     }
                     Some(entry) => match &mut entry.value {
-                        DataType::String(v) | DataType::Bitmap(v) => {
+                        DataType::String(s) => {
+                            let mut v = s.to_vec();
+                            let byte_len = (bit_offset + bits).div_ceil(8);
+                            if v.len() < byte_len {
+                                v.resize(byte_len, 0);
+                            }
+                            let cur = read_bitfield(&v, bit_offset, bits, signed);
+                            let out =
+                                if let Some(r) = overflow_add(cur, incr, bits, signed, overflow) {
+                                    write_bitfield(&mut v, bit_offset, bits, signed, r, overflow);
+                                    Some(r)
+                                } else {
+                                    None
+                                };
+                            entry.value = DataType::String(Bytes::from(v));
+                            out
+                        }
+                        DataType::Bitmap(v) => {
                             let byte_len = (bit_offset + bits).div_ceil(8);
                             if v.len() < byte_len {
                                 v.resize(byte_len, 0);

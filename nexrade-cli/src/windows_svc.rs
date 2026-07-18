@@ -236,8 +236,11 @@ fn run_service(config: ServerConfig) -> Result<()> {
         .context("set StartPending")?;
 
     // Start the tokio runtime + server on a background thread so this thread
-    // remains available for SCM control events.
-    let server_thread = std::thread::spawn(move || {
+    // remains available for SCM control events. The handle is intentionally
+    // dropped (the thread runs detached): `start_server` -> `listener.run()`
+    // loops for the life of the process and has no graceful-shutdown hook, so
+    // there is nothing to join on at stop time — see the stop handling below.
+    std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -263,25 +266,13 @@ fn run_service(config: ServerConfig) -> Result<()> {
     // Wait for stop signal from SCM.
     let _ = stop_rx.recv();
 
-    // Report StopPending.
-    let stop_pending = ServiceStatus {
-        service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::StopPending,
-        controls_accepted: ServiceControlAccept::empty(),
-        exit_code: ServiceExitCode::Win32(0),
-        checkpoint: 1,
-        wait_hint: Duration::from_secs(5),
-        process_id: None,
-    };
-    status_handle
-        .set_service_status(stop_pending)
-        .context("set StopPending")?;
-
-    // Give the server thread a moment; it will exit when the tokio runtime
-    // is dropped or when the TCP listener is closed.
-    let _ = server_thread.join();
-
-    // Report Stopped.
+    // Report Stopped immediately. We do NOT try to join the server thread:
+    // `listener.run()` never returns on its own, so joining here would hang
+    // the service in STOP_PENDING forever (SCM then refuses both further
+    // stops — error 1061 — and any restart — error 1056). Reporting Stopped
+    // and then terminating the process is the correct shutdown for a service
+    // whose workload has no cooperative-cancellation path: the OS reclaims
+    // the listener sockets and tokio runtime on exit.
     let stopped = ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Stopped,
@@ -295,5 +286,9 @@ fn run_service(config: ServerConfig) -> Result<()> {
         .set_service_status(stopped)
         .context("set Stopped")?;
 
-    Ok(())
+    // Terminate now that SCM has been told we're stopped. Returning would also
+    // work (the detached server thread does not keep the process alive past
+    // `main`), but an explicit exit removes any ambiguity and guarantees the
+    // listener's port is released promptly for the next start.
+    std::process::exit(0);
 }

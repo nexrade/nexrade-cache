@@ -21,6 +21,7 @@
 //! - `>password` — set the password (clears any existing one).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
@@ -666,6 +667,11 @@ pub struct AclManager {
 struct AclManagerInner {
     users: RwLock<HashMap<String, AclUser>>,
     log: parking_lot::Mutex<Vec<AclLogEntry>>,
+    /// True when the only configured user is unrestricted `default`
+    /// (enabled, all_commands, all_keys, no command/key rules). Lets the
+    /// dispatch hot path skip the users RwLock entirely — the common case
+    /// for redis-benchmark and deployments that never touch ACL.
+    open: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -683,8 +689,30 @@ impl AclManager {
             inner: Arc::new(AclManagerInner {
                 users: RwLock::new(users),
                 log: parking_lot::Mutex::new(Vec::new()),
+                open: AtomicBool::new(true),
             }),
         }
+    }
+
+    /// Fast path: ACL has only unrestricted `default`. Single atomic load.
+    #[inline]
+    pub fn is_open(&self) -> bool {
+        self.inner.open.load(Ordering::Relaxed)
+    }
+
+    /// Recompute the `open` flag from the current user table. Called after
+    /// every mutating ACL op. Holds the users lock (caller already does).
+    fn recompute_open_locked(users: &HashMap<String, AclUser>, open: &AtomicBool) {
+        let is_open = matches!(
+            users.get("default"),
+            Some(u) if users.len() == 1
+                && u.enabled
+                && u.all_commands
+                && u.all_keys
+                && u.command_rules.is_empty()
+                && u.key_patterns.is_empty()
+        );
+        open.store(is_open, Ordering::Relaxed);
     }
 
     /// Authenticate `(user, password)` and return `Ok(())` on success.
@@ -708,6 +736,11 @@ impl AclManager {
     /// checked; commands that don't operate on a key are always allowed
     /// by this check).
     pub fn check_permission(&self, user: &str, cmd: &str, keys: &[&[u8]]) -> Result<(), AclError> {
+        // Unrestricted-default fast path: no lock, no HashMap. Safe because
+        // `open` is recomputed under the users write-lock after every mutate.
+        if self.is_open() && user == "default" {
+            return Ok(());
+        }
         let users = self.inner.users.read();
         let u = users
             .get(user)
@@ -767,7 +800,9 @@ impl AclManager {
             .entry(name.to_string())
             .or_insert_with(|| AclUser::new(name));
         user.apply_rules(rules)?;
-        Ok(user.clone())
+        let cloned = user.clone();
+        Self::recompute_open_locked(&users, &self.inner.open);
+        Ok(cloned)
     }
 
     /// Delete a user. Returns `true` if the user existed.
@@ -778,10 +813,15 @@ impl AclManager {
             let mut users = self.inner.users.write();
             users.remove(name);
             users.insert("default".to_string(), AclUser::default_user());
+            Self::recompute_open_locked(&users, &self.inner.open);
             return true;
         }
         let mut users = self.inner.users.write();
-        users.remove(name).is_some()
+        let removed = users.remove(name).is_some();
+        if removed {
+            Self::recompute_open_locked(&users, &self.inner.open);
+        }
+        removed
     }
 
     /// Render a user's rule list in `ACL LIST` format (one space-separated

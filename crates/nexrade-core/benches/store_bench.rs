@@ -5,6 +5,7 @@
 //!
 //! HTML reports are written to `target/criterion/`.
 
+use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use nexrade_core::store::{Entry, ShardedDatabase};
 use nexrade_core::types::DataType;
@@ -15,7 +16,7 @@ use std::thread;
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn string_entry(value: &[u8]) -> Entry {
-    Entry::new(DataType::String(value.to_vec()))
+    Entry::new(DataType::String(Bytes::copy_from_slice(value)))
 }
 
 /// Build a key from a u64 — small, cache-friendly.

@@ -103,7 +103,7 @@ pub fn is_write_command(cmd: &str) -> bool {
         // Server
         | "FLUSHDB" | "FLUSHALL"
         // Stream
-        | "XADD" | "XTRIM" | "XDEL" | "XGROUP" | "XREADGROUP" | "XACK"
+        | "XADD" | "XTRIM" | "XDEL" | "XGROUP" | "XREADGROUP" | "XACK" | "XCLAIM" | "XAUTOCLAIM"
         // Bitmap
         | "SETBIT" | "BITOP" | "BITFIELD"
         // Geo
@@ -206,11 +206,12 @@ pub async fn dispatch_tracked(
         );
     }
 
-    // Track which keys this call touches, before `args` is consumed by
-    // dispatch, so we can update the tracking registry afterward AND
-    // pass them to dispatch_inner for the ACL permission check (no
-    // second extract_keys call inside the inner function).
-    let touched_keys: Vec<Vec<u8>> = if !is_flush {
+    // Key extraction is only needed when:
+    //   * ACL is not fully open (must pass keys into check_permission), or
+    //   * CLIENT TRACKING is enabled for someone (must feed on_write/track_read).
+    // Under redis-benchmark neither is true — skip the Vec allocation.
+    let need_keys = !is_flush && (!db.acl.is_open() || db.tracking.enabled_count() > 0);
+    let touched_keys: Vec<Vec<u8>> = if need_keys {
         extract_keys(cmd, &args)
             .into_iter()
             .map(|k| k.to_vec())
@@ -493,6 +494,8 @@ async fn dispatch_inner(
         "LATENCY" => server::cmd_latency(&args).await,
         "ACL" => server::cmd_acl(db, &args, authenticated_user).await,
         "RESET" => server::cmd_reset().await,
+        "TIME" => server::cmd_time().await,
+        "ROLE" => server::cmd_role(db).await,
         "CLIENT" => server::cmd_client(db, &args, client_id).await,
         "CLUSTER" => server::cmd_cluster(db, &args).await,
         "HELLO" => server::cmd_hello(&args).await,
@@ -519,6 +522,9 @@ async fn dispatch_inner(
         "XREADGROUP" => stream::cmd_xreadgroup(db, &args, db_index).await,
         "XACK" => stream::cmd_xack(db, &args, db_index).await,
         "XPENDING" => stream::cmd_xpending(db, &args, db_index).await,
+        "XINFO" => stream::cmd_xinfo(db, &args, db_index).await,
+        "XCLAIM" => stream::cmd_xclaim(db, &args, db_index).await,
+        "XAUTOCLAIM" => stream::cmd_xautoclaim(db, &args, db_index).await,
 
         // --- Bitmap commands ---
         "SETBIT" => bit::cmd_setbit(db, &args, db_index).await,
@@ -589,9 +595,11 @@ fn extract_keys<'a>(cmd: &str, args: &'a [Resp]) -> Vec<&'a [u8]> {
         | "ZREVRANGE" | "ZREVRANGEBYSCORE" | "ZRANK" | "ZREVRANK" | "ZPOPMIN" | "ZPOPMAX"
         | "ZRANDMEMBER" | "ZSCAN" | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "PFADD"
         | "PFCOUNT" | "PFMERGE" | "GEOADD" | "GEOPOS" | "GEODIST" | "GEOHASH" | "XADD" | "XLEN"
-        | "XRANGE" | "XREVRANGE" | "XTRIM" | "XDEL" | "XGROUP" | "XACK" | "XPENDING" | "WAIT" => {
-            &[(1, 0, Some(1))]
-        }
+        | "XRANGE" | "XREVRANGE" | "XTRIM" | "XDEL" | "XGROUP" | "XACK" | "XPENDING" | "XCLAIM"
+        | "XAUTOCLAIM" | "WAIT" => &[(1, 0, Some(1))],
+
+        // XINFO STREAM|GROUPS|CONSUMERS <key> — key is at index 2.
+        "XINFO" => &[(2, 0, Some(1))],
 
         // Multi-key commands: take every remaining key position.
         "DEL" | "UNLINK" | "EXISTS" => &[(1, 1, None)],

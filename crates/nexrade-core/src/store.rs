@@ -1471,7 +1471,7 @@ mod tests {
     fn test_expiry() {
         let mut db = Database::new();
         let entry = Entry::with_expiry(
-            DataType::String(b"val".to_vec()),
+            DataType::String(Bytes::from_static(b"val")),
             Expiry::from_duration(Duration::from_millis(1)),
         );
         db.insert(b"key".to_vec(), entry);
@@ -1797,7 +1797,7 @@ mod tests {
     // ── helpers ───────────────────────────────────────────────────────────────
 
     fn str_entry(v: &[u8]) -> Entry {
-        Entry::new(DataType::String(v.to_vec()))
+        Entry::new(DataType::String(Bytes::copy_from_slice(v)))
     }
 
     fn set_entry(members: &[&[u8]]) -> Entry {

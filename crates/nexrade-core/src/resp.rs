@@ -253,22 +253,47 @@ impl Resp {
                 }
             }
             Resp::Raw(bytes) => {
+                // Clone is a refcount bump when shared; prefer
+                // `write_to_for_version_owned` when the caller can move.
                 buf.push_raw(bytes.clone());
             }
         }
     }
 
+    /// Like `write_to_for_version` but consumes `self`, so a `Resp::Raw`
+    /// moves its `Bytes` into the SegBuf with no refcount bump. Hot path
+    /// for LRANGE (and any other command that pre-serializes).
+    pub fn write_to_for_version_owned(self, buf: &mut SegBuf, version: u8) {
+        match self {
+            Resp::Raw(bytes) => {
+                buf.push_raw(bytes);
+            }
+            other => other.write_to_for_version(buf, version),
+        }
+    }
+
     /// Serialize a bulk-string array directly into `buf`, without allocating
     /// an intermediate `Vec<Resp>`.
+    ///
+    /// Callers that already know the exact payload size (e.g. LRANGE after
+    /// summing element lengths) should `with_capacity` / `reserve` first —
+    /// this function only reserves when remaining capacity is clearly
+    /// insufficient, so a pre-sized buffer is not grown a second time.
     pub(crate) fn write_bulk_array_into(
         buf: &mut BytesMut,
-        iter: impl ExactSizeIterator<Item = impl AsRef<[u8]>> + Clone,
+        iter: impl ExactSizeIterator<Item = impl AsRef<[u8]>>,
     ) {
         let count = iter.len();
-        let data_bytes: usize = iter.clone().map(|e| e.as_ref().len()).sum();
-        // 23 bytes covers worst-case array header (*<20 digits>\r\n).
-        // 14 bytes per element covers worst-case framing ($<10 digits>\r\n\r\n).
-        buf.reserve(23 + count * 14 + data_bytes);
+        // Tight lower bound: array header + per-elem framing for 1-digit
+        // lengths ($N\r\n\r\n = 5) + zero payload. Real payload is written
+        // on top; BytesMut grows amortised if the estimate is short.
+        // Skip the reserve entirely when the caller already sized us.
+        let min_needed = 4 + count * 8; // "*N\r\n" + "$n\r\n\r\n" rough
+        if buf.capacity().saturating_sub(buf.len()) < min_needed {
+            // Conservative fallback for callers that didn't pre-size:
+            // 14 framing + 64 typical small element under redis-benchmark.
+            buf.reserve(23 + count * (14 + 64));
+        }
 
         buf.put_u8(b'*');
         put_usize(buf, count);
@@ -371,9 +396,17 @@ fn put_i64(buf: &mut BytesMut, n: i64) {
 }
 
 /// Write a usize to `buf` without heap allocation.
+///
+/// Fast path for the common small lengths that dominate redis-benchmark
+/// LRANGE / HGETALL / SMEMBERS framing (element counts and short bulk
+/// lengths fit in a few digits). `itoa` is ~2× the hand-rolled loop for
+/// these sizes and avoids the signed-abs branch of `put_i64`.
 #[inline]
 fn put_usize(buf: &mut BytesMut, n: usize) {
-    put_i64(buf, n as i64);
+    // usize → u64 is lossless on every platform we care about (and on
+    // 32-bit, u64 still covers the full range).
+    let mut itoa_buf = itoa::Buffer::new();
+    buf.put_slice(itoa_buf.format(n as u64).as_bytes());
 }
 
 /// Segmented write buffer that supports zero-copy for pre-serialized `Bytes`.

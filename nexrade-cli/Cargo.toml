@@ -71,6 +71,12 @@ serde = { workspace = true }
 toml = { workspace = true }
 config = { workspace = true }
 
+# Match Redis's allocator on Linux/macOS: jemalloc reduces fragmentation and
+# speeds up the alloc-heavy LRANGE / pipeline-buffer paths. Windows and
+# WASM keep the system allocator.
+[target.'cfg(all(not(windows), not(target_arch = "wasm32")))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console"] }

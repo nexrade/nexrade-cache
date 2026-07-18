@@ -1013,7 +1013,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-cache"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1023,6 +1023,7 @@ dependencies = [
  "nexrade-plugin",
  "nexrade-server",
  "serde",
+ "tikv-jemallocator",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
@@ -1033,7 +1034,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "atoi",
@@ -1061,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-lua"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1077,7 +1078,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-metrics"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "nexrade-core",
@@ -1090,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-plugin"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1103,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-server"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1128,7 +1129,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-tls"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1142,7 +1143,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-wasm"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -1820,6 +1821,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tikv-jemalloc-sys"
+version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]

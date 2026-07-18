@@ -55,7 +55,8 @@ async fn push(
     if args.len() < 3 {
         return Err(NexradeError::WrongArity(cmd.to_string()));
     }
-    let key = get_bytes_vec(args, 1, cmd)?;
+    // Borrow key as Bytes (refcount) — write_for only needs &[u8].
+    let key = get_bytes(args, 1, cmd)?;
     let mut store_db = db.store.db(db_index).write_for(&key);
 
     if only_if_exists && !store_db.contains_key(&key) {
@@ -64,8 +65,11 @@ async fn push(
 
     let list = get_or_create_list(&mut store_db, &key)?;
     for i in 2..args.len() {
-        // Reuse the Bytes already in the parsed RESP — clone is a refcount bump.
-        let val = get_bytes(args, i, cmd)?;
+        // Compact copy into a dedicated allocation. Refcount-cloning the
+        // RESP parse buffer would pin the whole pipeline batch in memory
+        // for the lifetime of the list element — catastrophic under
+        // redis-benchmark LPUSH.
+        let val = Bytes::copy_from_slice(&get_bytes(args, i, cmd)?);
         if left {
             list.push_front(val);
         } else {
@@ -75,8 +79,8 @@ async fn push(
     let len = list.len() as i64;
     drop(store_db);
 
-    // Notify blocking pop waiters
-    db.list_notify.notify_waiters();
+    // Notify blocking pop waiters (no-op when nobody is parked).
+    db.notify_list_waiters();
 
     Ok(Resp::int(len))
 }
@@ -156,18 +160,31 @@ pub async fn cmd_llen(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     }
 }
 
+/// Pre-serialized RESP empty array — shared, zero-alloc empty LRANGE.
+static EMPTY_ARRAY: &[u8] = b"*0\r\n";
+
+// Thread-local serialize buffer for LRANGE. `split().freeze()` returns the
+// payload while leaving capacity on the local buffer for the next call —
+// under redis-benchmark LRANGE_N this eliminates a multi-KB allocate+free
+// per request (the main non-pipe cost vs Redis).
+thread_local! {
+    static LRANGE_BUF: std::cell::RefCell<bytes::BytesMut> =
+        std::cell::RefCell::new(bytes::BytesMut::with_capacity(8192));
+}
+
 pub async fn cmd_lrange(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     if args.len() != 4 {
         return Err(NexradeError::WrongArity("lrange".to_string()));
     }
-    let key = get_bytes_vec(args, 1, "LRANGE")?;
+    // Key as Bytes — avoid Vec allocation on the hot read path.
+    let key = get_bytes(args, 1, "LRANGE")?;
     let start = get_i64(args, 2, "LRANGE")?;
     let stop = get_i64(args, 3, "LRANGE")?;
 
     let store_db = db.store.db(db_index).read_for(&key);
 
     match store_db.get_ro(&key) {
-        None => Ok(Resp::array(vec![])),
+        None => Ok(Resp::Raw(Bytes::from_static(EMPTY_ARRAY))),
         Some(e) => match &e.value {
             DataType::List(list) => {
                 let len = list.len() as isize;
@@ -175,13 +192,34 @@ pub async fn cmd_lrange(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
                 let stop = normalize_idx(stop as isize, len);
 
                 if start >= list.len() || start > stop {
-                    return Ok(Resp::array(vec![]));
+                    return Ok(Resp::Raw(Bytes::from_static(EMPTY_ARRAY)));
                 }
                 let stop = stop.min(list.len() - 1);
 
-                let mut buf = bytes::BytesMut::new();
-                Resp::write_bulk_array_into(&mut buf, list.range(start..=stop));
-                Ok(Resp::Raw(buf.freeze()))
+                // Size without a second walk: framing + a conservative
+                // per-element payload budget. redis-benchmark LRANGE uses
+                // 1–3 byte elements; real apps with large elements grow
+                // amortised via BytesMut. Skipping the pre-sum walk is the
+                // main remaining CPU win on the non-pipe path.
+                let count = stop - start + 1;
+                // "*N\r\n" (~8) + per-elem "$n\r\n" + "\r\n" (~8) + ~8 data
+                let need = 8 + count * 24;
+
+                // Hold the read lock while serializing so concurrent
+                // LPUSH/LPOP can't race the view we sized against.
+                let raw = LRANGE_BUF.with(|cell| {
+                    let mut buf = cell.borrow_mut();
+                    buf.clear();
+                    let cap = buf.capacity();
+                    if cap < need {
+                        buf.reserve(need - cap);
+                    }
+                    Resp::write_bulk_array_into(&mut buf, list.range(start..=stop));
+                    // split() returns the written front and keeps capacity
+                    // on `buf` for the next LRANGE on this worker thread.
+                    buf.split().freeze()
+                });
+                Ok(Resp::Raw(raw))
             }
             _ => Err(NexradeError::WrongType),
         },
@@ -365,7 +403,7 @@ pub async fn cmd_lmove(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
         .lmove_atomic(&src, dst, from_left, to_left)
     {
         Some(val) => {
-            db.list_notify.notify_waiters();
+            db.notify_list_waiters();
             Ok(Resp::bulk(val))
         }
         None => Ok(Resp::null()),
@@ -381,7 +419,7 @@ pub async fn cmd_rpoplpush(db: &Db, args: &[Resp], db_index: usize) -> Result<Re
     let dst = get_bytes_vec(args, 2, "RPOPLPUSH")?;
     match db.store.db(db_index).lmove_atomic(&src, dst, false, true) {
         Some(val) => {
-            db.list_notify.notify_waiters();
+            db.notify_list_waiters();
             Ok(Resp::bulk(val))
         }
         None => Ok(Resp::null()),
@@ -436,6 +474,7 @@ async fn blocking_pop(
     };
 
     let result = timeout(dur, async {
+        let _parked = db.park_list_waiter();
         loop {
             {
                 let sdb = db.store.db(db_index);
@@ -614,6 +653,7 @@ pub async fn cmd_blmpop(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
             std::time::Duration::from_secs_f64(timeout_secs)
         };
         match tokio::time::timeout(dur, async {
+            let _parked = db.park_list_waiter();
             loop {
                 db.list_notify.notified().await;
                 if let Some(resp) = lmpop_attempt(db, db_index, &keys, left, count)? {

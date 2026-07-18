@@ -18,6 +18,12 @@
 //! nexrade-cache --uninstall-service
 //! ```
 
+// Match Redis's allocator on non-Windows hosts. Gives measurable wins on
+// LRANGE (large buffer allocs) and pipelined write batches.
+#[cfg(all(not(windows), not(target_arch = "wasm32")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[cfg(windows)]
 mod windows_svc;
 
@@ -345,14 +351,25 @@ fn load_config_file(path: &str) -> Result<ServerConfig> {
     if let Some(max_clients) = toml_val.get("max_clients").and_then(|v| v.as_integer()) {
         config.max_clients = max_clients as usize;
     }
-    if let Some(maxmem) = toml_val.get("maxmemory").and_then(|v| v.as_integer()) {
+    // Accept both `maxmemory` (Redis spelling) and `max_memory` (example
+    // config / snake_case). Prefer the Redis spelling if both are present.
+    let maxmem = toml_val
+        .get("maxmemory")
+        .or_else(|| toml_val.get("max_memory"))
+        .and_then(|v| v.as_integer());
+    if let Some(maxmem) = maxmem {
         config.max_memory = if maxmem <= 0 {
             None
         } else {
             Some(maxmem as usize)
         };
     }
-    if let Some(policy) = toml_val.get("maxmemory_policy").and_then(|v| v.as_str()) {
+    // Same for the policy key: `maxmemory_policy` or `max_memory_policy`.
+    if let Some(policy) = toml_val
+        .get("maxmemory_policy")
+        .or_else(|| toml_val.get("max_memory_policy"))
+        .and_then(|v| v.as_str())
+    {
         config.maxmemory_policy = policy.parse().unwrap_or_default();
     }
     if let Some(hz) = toml_val.get("hz").and_then(|v| v.as_integer()) {

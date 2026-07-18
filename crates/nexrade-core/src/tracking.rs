@@ -190,6 +190,13 @@ impl TrackingRegistry {
         }
     }
 
+    /// Number of clients currently tracking. Lock-free so dispatch can skip
+    /// key extraction when nobody is tracking (the common case).
+    #[inline]
+    pub fn enabled_count(&self) -> usize {
+        self.enabled_count.load(Ordering::Relaxed)
+    }
+
     /// Record that `client_id` read `keys` — call after a successful read
     /// when tracking applies. No-op for BCAST clients (they don't need
     /// per-key bookkeeping) or when OPTIN/OPTOUT mode excludes this read.
