@@ -342,7 +342,9 @@ mod tests {
         db.acl.setuser("reader", &["+get", "~*"]).unwrap();
         db.store.db(0).write_for(b"k").insert(
             b"k".to_vec(),
-            nexrade_core::store::Entry::new(nexrade_core::types::DataType::String(b"v".to_vec())),
+            nexrade_core::store::Entry::new(nexrade_core::types::DataType::String(
+                bytes::Bytes::from_static(b"v"),
+            )),
         );
 
         let r = e
