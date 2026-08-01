@@ -1,0 +1,114 @@
+# nexrade-cache — production **cache** profile
+#
+# Use this when nexrade-cache is a cache, not a system of record: app data
+# lives elsewhere (Postgres/MySQL/S3/...), and losing the cache's contents
+# on crash or restart is acceptable (the app repopulates on miss).
+#
+# For a general-purpose / durability-leaning setup (RDB + AOF, no memory
+# cap), see nexrade.example.toml instead. See also docs/roadmap.md and
+# docs/compat-matrix.md before adopting either profile in production.
+#
+# Start with:
+#   nexrade-cache --config nexrade.cache.toml
+
+# ─── Network ─────────────────────────────────────────────────────────────────
+
+# Bind to all interfaces only if this host is reachable exclusively from
+# trusted networks (VPC, service mesh). For anything internet-facing, put
+# nexrade-cache behind a private network / security group and keep
+# requirepass set below.
+bind = "0.0.0.0"
+port = 6379
+
+databases = 16
+max_clients = 10000
+
+# Set this if the port is reachable from outside a fully trusted network.
+# requirepass = "change-me"
+
+loglevel = "notice"
+hz = 10
+
+# ─── Memory: the part that actually makes this a "cache" ───────────────────
+#
+# A cache without a memory cap is just an unbounded process that happens to
+# support eviction commands it never calls. Set both of these.
+
+# Example: 4 GiB. Size to headroom below your container/host memory limit —
+# leave room for connection buffers, Lua VM, and RSS overhead beyond the
+# live dataset (see `mem_fragmentation_ratio` in INFO memory).
+max_memory = 4294967296
+
+# allkeys-lru: evict any key, oldest-accessed first — the standard cache
+# policy. Use volatile-lru instead only if some keys must never be evicted
+# regardless of memory pressure (set no TTL on those; TTL'd keys evict first
+# under volatile-lru, so keys without TTL are effectively pinned — verify
+# that's what you want before relying on it).
+maxmemory_policy = "allkeys-lru"
+
+# ─── Persistence: usually OFF for a pure cache ──────────────────────────────
+#
+# Cache semantics: a cold start with an empty dataset is correct behavior,
+# not a disaster. Skipping RDB/AOF removes fsync latency from the write
+# path and disk I/O from the ops surface entirely.
+#
+# Keep persistence ON instead if:
+#   - warm-restart matters (avoid a cold-cache stampede after deploys), or
+#   - "cache" here still means "expensive to fully rebuild" (e.g. computed
+#     aggregates, not simple DB row mirrors) — see nexrade.example.toml's
+#     [persistence] section for the RDB + AOF everysec settings to reuse.
+
+[persistence]
+rdb_path = ""
+aof_path = ""
+
+# ─── TLS ─────────────────────────────────────────────────────────────────────
+
+[tls]
+enabled = false
+port = 6380
+# cert = "cert.pem"
+# key  = "key.pem"
+
+# ─── Metrics / Observability ────────────────────────────────────────────────
+#
+# Keep these on in production — `used_memory`, `evicted_keys` (via INFO
+# stats), and `mem_fragmentation_ratio` are what tell you the maxmemory
+# cap above is sized correctly instead of thrashing on eviction.
+
+[metrics]
+enabled = true
+port = 9091
+
+# ─── Lua scripting ───────────────────────────────────────────────────────────
+
+[lua]
+time_limit_ms = 5000
+
+# ─── Slow log ────────────────────────────────────────────────────────────────
+
+[slowlog]
+log_slower_than = 10000
+max_len = 128
+
+# ─── Dual-encoding thresholds ────────────────────────────────────────────────
+#
+# Defaults match Redis listpack thresholds and are almost always right for
+# cache workloads (short hashes/sets/lists/zsets stay in the compact
+# encoding). Only override if MEMORY USAGE / OBJECT ENCODING shows your
+# actual key shapes promoting to the large encoding more than expected.
+
+# list_max_listpack_entries = 512
+# hash_max_listpack_entries = 512
+# set_max_listpack_entries = 512
+# zset_max_listpack_entries = 128
+
+# ─── Advanced ────────────────────────────────────────────────────────────────
+
+tcp_backlog = 511
+
+# Idle connection timeout (seconds). 0 disables — fine for a cache behind a
+# connection-pooled client (redis-py ConnectionPool, go-redis, etc.) that
+# manages its own pool lifecycle; set a positive value here only if you
+# expect long-lived idle connections from misbehaving clients.
+timeout = 0

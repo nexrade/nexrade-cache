@@ -127,7 +127,7 @@ async fn eviction_under_pressure_uses_sample_lru() {
         if db
             .store
             .evict_if_needed(&MaxMemoryPolicy::AllKeysLru, 1_024 * 1_024)
-            == 0
+            .is_empty()
         {
             break;
         }

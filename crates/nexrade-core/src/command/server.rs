@@ -8,12 +8,15 @@ use crate::conn_registry::{format_client_list_line, CLIENT_FLAG_NO_EVICT};
 use crate::db::unix_secs;
 use crate::db::Db;
 use crate::error::{NexradeError, Result};
+use crate::hash_data::{hash_thresholds, set_hash_thresholds};
+use crate::list_data::{list_thresholds, set_list_thresholds};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::persistence::Snapshot;
-#[cfg(not(target_arch = "wasm32"))]
 use crate::replication::ReplicationRole;
 use crate::resp::Resp;
+use crate::set_data::{set_set_thresholds, set_thresholds};
 use crate::store::glob_match;
+use crate::zset_data::{set_zset_thresholds, zset_thresholds};
 
 pub async fn cmd_ping(args: &[Resp]) -> Result<Resp> {
     if args.len() == 1 {
@@ -79,15 +82,16 @@ fn aof_rewrite_status_str(code: u8) -> &'static str {
     }
 }
 
-/// `aof_last_write_status` — Redis reports `ok` whenever AOF is enabled
-/// (since failed writes propagate as `ERR` to the connected client at
-/// write time). Reporting `err` here when AOF is off keeps the field
-/// honest about whether any AOF path is even active.
-fn aof_last_write_status(aof_enabled: bool) -> &'static str {
-    if aof_enabled {
-        "ok"
-    } else {
-        "err"
+/// `aof_last_write_status` — `ok` when AOF is enabled and the last append
+/// (or ALWAYS fsync) succeeded; `err` when AOF is disabled or the last
+/// write failed.
+fn aof_last_write_status(db: &Db) -> &'static str {
+    if !db.stats.aof_enabled.load(Ordering::Relaxed) {
+        return "err";
+    }
+    match db.stats.aof_last_write_status.load(Ordering::Relaxed) {
+        0 => "ok",
+        _ => "err",
     }
 }
 
@@ -103,22 +107,39 @@ pub async fn cmd_info(db: &Db, args: &[Resp]) -> Result<Resp> {
     if section == "all" || section == "server" {
         info.push_str("# Server\r\n");
         info.push_str("redis_version:7.0.0\r\n");
+        // redis-py / go-redis / jedis probe these for capability hints.
+        info.push_str("redis_mode:standalone\r\n");
         // Use the package version that was compiled in, so `INFO server`
         // can never drift from the workspace version at release time.
         info.push_str(&format!(
             "nexrade_version:{}\r\n",
             env!("CARGO_PKG_VERSION")
         ));
+        // Stable per-process id (cluster node id is also stable across
+        // restarts; process_id is the OS pid for this run).
+        info.push_str(&format!("process_id:{}\r\n", std::process::id()));
+        info.push_str(&format!("run_id:{}\r\n", db.cluster_node_id));
+        #[cfg(target_os = "linux")]
         info.push_str("os:Linux\r\n");
+        #[cfg(target_os = "macos")]
+        info.push_str("os:Darwin\r\n");
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        info.push_str("os:unknown\r\n");
         info.push_str("arch_bits:64\r\n");
         info.push_str("multiplexing_api:epoll\r\n");
         info.push_str("atomicvar_api:atomic-builtin\r\n");
         let cfg = db.config.lock();
         info.push_str(&format!("tcp_port:{}\r\n", cfg.port));
         info.push_str(&format!("uptime_in_seconds:{}\r\n", db.stats.uptime_secs()));
+        info.push_str(&format!(
+            "uptime_in_days:{}\r\n",
+            db.stats.uptime_secs() / 86_400
+        ));
         info.push_str(&format!("hz:{}\r\n", cfg.hz));
+        info.push_str(&format!("configured_hz:{}\r\n", cfg.hz));
         drop(cfg);
         info.push_str("executable:nexrade\r\n");
+        info.push_str("config_file:\r\n");
         info.push_str("\r\n");
     }
 
@@ -191,6 +212,20 @@ pub async fn cmd_info(db: &Db, args: &[Resp]) -> Result<Resp> {
             1.0
         };
         info.push_str(&format!("mem_fragmentation_ratio:{:.2}\r\n", frag_ratio));
+        // Peak = current for now (we don't track a high-water mark yet).
+        info.push_str(&format!("used_memory_peak:{}\r\n", mem));
+        let maxmem = db.max_memory_limit.load(Ordering::Relaxed);
+        info.push_str(&format!("maxmemory:{}\r\n", maxmem));
+        info.push_str("\r\n");
+    }
+
+    if section == "all" || section == "cpu" {
+        info.push_str("# CPU\r\n");
+        let (user, sys) = crate::resource::process_cpu_seconds();
+        info.push_str(&format!("used_cpu_sys:{:.6}\r\n", sys));
+        info.push_str(&format!("used_cpu_user:{:.6}\r\n", user));
+        info.push_str("used_cpu_sys_children:0.000000\r\n");
+        info.push_str("used_cpu_user_children:0.000000\r\n");
         info.push_str("\r\n");
     }
 
@@ -229,13 +264,79 @@ pub async fn cmd_info(db: &Db, args: &[Resp]) -> Result<Resp> {
         ));
         info.push_str(&format!(
             "aof_last_write_status:{}\r\n",
-            aof_last_write_status(db.stats.aof_enabled.load(Ordering::Relaxed))
+            aof_last_write_status(db)
         ));
+        info.push_str(&format!(
+            "aof_write_failed:{}\r\n",
+            db.stats.aof_failed.load(Ordering::Relaxed) as u8
+        ));
+        info.push_str(&format!(
+            "aof_last_write_error_time:{}\r\n",
+            db.stats.aof_failed_time.load(Ordering::Relaxed)
+        ));
+        if let Some(error) = db.stats.aof_failed_msg.lock().as_deref() {
+            info.push_str(&format!("aof_last_write_error:{}\r\n", error));
+        }
         info.push_str("\r\n");
     }
     #[cfg(target_arch = "wasm32")]
     if section == "all" || section == "persistence" {
         info.push_str("# Persistence\r\nloading:0\r\naof_enabled:0\r\n\r\n");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if section == "all" || section == "health" {
+        let report = crate::health::health_report(db);
+        info.push_str("# Health\r\n");
+        info.push_str(&format!("live:{}\r\n", report.live as u8));
+        info.push_str(&format!("ready:{}\r\n", report.ready as u8));
+        info.push_str(&format!("phase:{}\r\n", report.phase.as_str()));
+        info.push_str(&format!(
+            "persistence_mode:{}\r\n",
+            report.persistence.persistence_mode
+        ));
+        info.push_str(&format!(
+            "active_background_job:{}\r\n",
+            match report.active_background_job {
+                crate::health::ActiveBackgroundJob::None => "none",
+                crate::health::ActiveBackgroundJob::Bgsave => "bgsave",
+                crate::health::ActiveBackgroundJob::AofRewrite => "aof_rewrite",
+            }
+        ));
+        if let Some(age) = report.persistence.snapshot_age_seconds {
+            info.push_str(&format!("snapshot_age_seconds:{}\r\n", age));
+        } else {
+            info.push_str("snapshot_age_seconds:\r\n");
+        }
+        info.push_str(&format!("replication_role:{}\r\n", report.replication.role));
+        info.push_str(&format!(
+            "replication_primary_link_status:{}\r\n",
+            report.replication.primary_link_status
+        ));
+        info.push_str(&format!(
+            "replication_connected_replicas:{}\r\n",
+            report.replication.connected_replicas
+        ));
+        info.push_str(&format!(
+            "replication_max_offset_lag:{}\r\n",
+            report.replication.max_replica_offset_lag
+        ));
+        if report.reasons.is_empty() {
+            info.push_str("readiness_reasons:0\r\n");
+        } else {
+            info.push_str(&format!("readiness_reasons:{}\r\n", report.reasons.len()));
+            for r in &report.reasons {
+                let code = serde_json::to_value(r.code)
+                    .ok()
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "unknown".to_string());
+                info.push_str(&format!(
+                    "readiness_reason:{}\r\nreadiness_reason_message:{}\r\n",
+                    code, r.message
+                ));
+            }
+        }
+        info.push_str("\r\n");
     }
 
     if section == "all" || section == "keyspace" {
@@ -264,13 +365,24 @@ pub async fn cmd_info(db: &Db, args: &[Resp]) -> Result<Resp> {
                 info.push_str("role:master\r\n");
                 let replicas = repl.connected_replicas.read();
                 info.push_str(&format!("connected_slaves:{}\r\n", replicas.len()));
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
                 for (i, r) in replicas.iter().enumerate() {
+                    // 0.8.0: lag = seconds since last ACK (0 if never/fresh).
+                    let lag_s = if r.last_ack_ms == 0 || now_ms <= r.last_ack_ms {
+                        0
+                    } else {
+                        (now_ms - r.last_ack_ms) / 1000
+                    };
                     info.push_str(&format!(
-                        "slave{}:ip={},port={},state=online,offset={},lag=0\r\n",
+                        "slave{}:ip={},port={},state=online,offset={},lag={}\r\n",
                         i,
                         r.addr.ip(),
                         r.addr.port(),
                         r.offset,
+                        lag_s,
                     ));
                 }
                 drop(replicas);
@@ -347,6 +459,69 @@ pub async fn cmd_config(db: &Db, args: &[Resp]) -> Result<Resp> {
                 .map(|(s, c)| format!("{} {}", s, c))
                 .collect::<Vec<_>>()
                 .join(" ");
+            let appendfsync_str = {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    match cfg.persistence.aof_sync {
+                        crate::persistence::AofSync::Always => "always",
+                        crate::persistence::AofSync::EverySec => "everysec",
+                        crate::persistence::AofSync::No => "no",
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    "everysec"
+                }
+            };
+            let rdb_path_str = {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    cfg.persistence
+                        .rdb_path
+                        .as_deref()
+                        .unwrap_or("nexrade.rdb")
+                        .to_string()
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    "nexrade.rdb".to_string()
+                }
+            };
+            let aof_path_str = {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    cfg.persistence
+                        .aof_path
+                        .as_deref()
+                        .unwrap_or("appendonly.aof")
+                        .to_string()
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    "appendonly.aof".to_string()
+                }
+            };
+            // `dir` / `dbfilename` derived from rdb_path for Redis-compat probes.
+            let (dir_str, dbfilename_str) = {
+                let p = std::path::Path::new(&rdb_path_str);
+                let dir = p
+                    .parent()
+                    .and_then(|d| d.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(".")
+                    .to_string();
+                let file = p
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("nexrade.rdb")
+                    .to_string();
+                (dir, file)
+            };
+            let lt = list_thresholds();
+            let ht = hash_thresholds();
+            let st = set_thresholds();
+            let zt = zset_thresholds();
+            let notify_str = cfg.notify_keyspace_events.as_str();
             let pairs: &[(&str, &dyn std::fmt::Display)] = &[
                 ("bind", &cfg.bind as &dyn std::fmt::Display),
                 ("port", &cfg.port),
@@ -362,7 +537,28 @@ pub async fn cmd_config(db: &Db, args: &[Resp]) -> Result<Resp> {
                 ("requirepass", &requirepass_str),
                 ("activerehashing", &"yes"),
                 ("appendonly", &appendonly_str),
+                ("appendfsync", &appendfsync_str),
+                ("appendfilename", &aof_path_str),
+                ("dir", &dir_str),
+                ("dbfilename", &dbfilename_str),
                 ("save", &save_str),
+                ("list-max-listpack-entries", &lt.max_entries),
+                ("list-max-listpack-size", &lt.max_size),
+                ("list-max-listpack-value", &lt.max_elem),
+                ("list-demote-entries", &lt.demote_entries),
+                ("hash-max-listpack-entries", &ht.max_entries),
+                ("hash-max-listpack-size", &ht.max_size),
+                ("hash-max-listpack-value", &ht.max_value),
+                ("hash-demote-entries", &ht.demote_entries),
+                ("set-max-listpack-entries", &st.max_entries),
+                ("set-max-listpack-size", &st.max_size),
+                ("set-max-listpack-value", &st.max_value),
+                ("set-demote-entries", &st.demote_entries),
+                ("zset-max-listpack-entries", &zt.max_entries),
+                ("zset-max-listpack-size", &zt.max_size),
+                ("zset-max-listpack-value", &zt.max_value),
+                ("zset-demote-entries", &zt.demote_entries),
+                ("notify-keyspace-events", &notify_str),
             ];
             let mut result = Vec::new();
             for (key, val) in pairs {
@@ -436,6 +632,255 @@ pub async fn cmd_config(db: &Db, args: &[Resp]) -> Result<Resp> {
                 "loglevel" => {
                     cfg.loglevel = val.to_string();
                 }
+                "appendfsync" => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        use crate::persistence::AofSync;
+                        cfg.persistence.aof_sync = match val.to_ascii_lowercase().as_str() {
+                            "always" => AofSync::Always,
+                            "everysec" => AofSync::EverySec,
+                            "no" => AofSync::No,
+                            _ => {
+                                return Err(NexradeError::Generic(
+                                    "ERR invalid appendfsync value — use always, everysec, or no"
+                                        .to_string(),
+                                ));
+                            }
+                        };
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let _ = val;
+                    }
+                }
+                "maxclients" => {
+                    let n = val.parse::<usize>().map_err(|_| {
+                        NexradeError::Generic("Invalid maxclients value".to_string())
+                    })?;
+                    if n == 0 {
+                        return Err(NexradeError::Generic(
+                            "Invalid maxclients value".to_string(),
+                        ));
+                    }
+                    cfg.max_clients = n;
+                }
+                "save" => {
+                    // Redis: CONFIG SET save "900 1 300 10" or empty to disable.
+                    let rules = parse_save_config(val)?;
+                    cfg.save_rules = rules.clone();
+                    cfg.persistence.rdb_save_rules = rules;
+                }
+                "list-max-listpack-entries" => {
+                    let n = val.parse::<usize>().map_err(|_| {
+                        NexradeError::Generic("Invalid list-max-listpack-entries value".to_string())
+                    })?;
+                    if n == 0 {
+                        return Err(NexradeError::Generic(
+                            "Invalid list-max-listpack-entries value".to_string(),
+                        ));
+                    }
+                    cfg.list_max_listpack_entries = n;
+                    let mut t = list_thresholds();
+                    t.max_entries = n;
+                    set_list_thresholds(t);
+                }
+                "list-max-listpack-size" => {
+                    let n = val.parse::<usize>().map_err(|_| {
+                        NexradeError::Generic("Invalid list-max-listpack-size value".to_string())
+                    })?;
+                    if n == 0 {
+                        return Err(NexradeError::Generic(
+                            "Invalid list-max-listpack-size value".to_string(),
+                        ));
+                    }
+                    cfg.list_max_listpack_size = n;
+                    let mut t = list_thresholds();
+                    t.max_size = n;
+                    set_list_thresholds(t);
+                }
+                "list-max-listpack-value" => {
+                    let n = val.parse::<usize>().map_err(|_| {
+                        NexradeError::Generic("Invalid list-max-listpack-value value".to_string())
+                    })?;
+                    if n == 0 {
+                        return Err(NexradeError::Generic(
+                            "Invalid list-max-listpack-value value".to_string(),
+                        ));
+                    }
+                    cfg.list_max_listpack_value = n;
+                    let mut t = list_thresholds();
+                    t.max_elem = n;
+                    set_list_thresholds(t);
+                }
+                "list-demote-entries" => {
+                    let n = val.parse::<usize>().map_err(|_| {
+                        NexradeError::Generic("Invalid list-demote-entries value".to_string())
+                    })?;
+                    cfg.list_demote_entries = n;
+                    let mut t = list_thresholds();
+                    t.demote_entries = n;
+                    set_list_thresholds(t);
+                }
+                "hash-max-listpack-entries" => {
+                    let n = val.parse::<usize>().map_err(|_| {
+                        NexradeError::Generic("Invalid hash-max-listpack-entries value".to_string())
+                    })?;
+                    if n == 0 {
+                        return Err(NexradeError::Generic(
+                            "Invalid hash-max-listpack-entries value".to_string(),
+                        ));
+                    }
+                    cfg.hash_max_listpack_entries = n;
+                    let mut t = hash_thresholds();
+                    t.max_entries = n;
+                    set_hash_thresholds(t);
+                }
+                "hash-max-listpack-size" => {
+                    let n = val.parse::<usize>().map_err(|_| {
+                        NexradeError::Generic("Invalid hash-max-listpack-size value".to_string())
+                    })?;
+                    if n == 0 {
+                        return Err(NexradeError::Generic(
+                            "Invalid hash-max-listpack-size value".to_string(),
+                        ));
+                    }
+                    cfg.hash_max_listpack_size = n;
+                    let mut t = hash_thresholds();
+                    t.max_size = n;
+                    set_hash_thresholds(t);
+                }
+                "hash-max-listpack-value" => {
+                    let n = val.parse::<usize>().map_err(|_| {
+                        NexradeError::Generic("Invalid hash-max-listpack-value value".to_string())
+                    })?;
+                    if n == 0 {
+                        return Err(NexradeError::Generic(
+                            "Invalid hash-max-listpack-value value".to_string(),
+                        ));
+                    }
+                    cfg.hash_max_listpack_value = n;
+                    let mut t = hash_thresholds();
+                    t.max_value = n;
+                    set_hash_thresholds(t);
+                }
+                "hash-demote-entries" => {
+                    let n = val.parse::<usize>().map_err(|_| {
+                        NexradeError::Generic("Invalid hash-demote-entries value".to_string())
+                    })?;
+                    cfg.hash_demote_entries = n;
+                    let mut t = hash_thresholds();
+                    t.demote_entries = n;
+                    set_hash_thresholds(t);
+                }
+                "set-max-listpack-entries" => {
+                    let n = val.parse::<usize>().map_err(|_| {
+                        NexradeError::Generic("Invalid set-max-listpack-entries value".to_string())
+                    })?;
+                    if n == 0 {
+                        return Err(NexradeError::Generic(
+                            "Invalid set-max-listpack-entries value".to_string(),
+                        ));
+                    }
+                    cfg.set_max_listpack_entries = n;
+                    let mut t = set_thresholds();
+                    t.max_entries = n;
+                    set_set_thresholds(t);
+                }
+                "set-max-listpack-size" => {
+                    let n = val.parse::<usize>().map_err(|_| {
+                        NexradeError::Generic("Invalid set-max-listpack-size value".to_string())
+                    })?;
+                    if n == 0 {
+                        return Err(NexradeError::Generic(
+                            "Invalid set-max-listpack-size value".to_string(),
+                        ));
+                    }
+                    cfg.set_max_listpack_size = n;
+                    let mut t = set_thresholds();
+                    t.max_size = n;
+                    set_set_thresholds(t);
+                }
+                "set-max-listpack-value" => {
+                    let n = val.parse::<usize>().map_err(|_| {
+                        NexradeError::Generic("Invalid set-max-listpack-value value".to_string())
+                    })?;
+                    if n == 0 {
+                        return Err(NexradeError::Generic(
+                            "Invalid set-max-listpack-value value".to_string(),
+                        ));
+                    }
+                    cfg.set_max_listpack_value = n;
+                    let mut t = set_thresholds();
+                    t.max_value = n;
+                    set_set_thresholds(t);
+                }
+                "set-demote-entries" => {
+                    let n = val.parse::<usize>().map_err(|_| {
+                        NexradeError::Generic("Invalid set-demote-entries value".to_string())
+                    })?;
+                    cfg.set_demote_entries = n;
+                    let mut t = set_thresholds();
+                    t.demote_entries = n;
+                    set_set_thresholds(t);
+                }
+                "zset-max-listpack-entries" => {
+                    let n = val.parse::<usize>().map_err(|_| {
+                        NexradeError::Generic("Invalid zset-max-listpack-entries value".to_string())
+                    })?;
+                    if n == 0 {
+                        return Err(NexradeError::Generic(
+                            "Invalid zset-max-listpack-entries value".to_string(),
+                        ));
+                    }
+                    cfg.zset_max_listpack_entries = n;
+                    let mut t = zset_thresholds();
+                    t.max_entries = n;
+                    set_zset_thresholds(t);
+                }
+                "zset-max-listpack-size" => {
+                    let n = val.parse::<usize>().map_err(|_| {
+                        NexradeError::Generic("Invalid zset-max-listpack-size value".to_string())
+                    })?;
+                    if n == 0 {
+                        return Err(NexradeError::Generic(
+                            "Invalid zset-max-listpack-size value".to_string(),
+                        ));
+                    }
+                    cfg.zset_max_listpack_size = n;
+                    let mut t = zset_thresholds();
+                    t.max_size = n;
+                    set_zset_thresholds(t);
+                }
+                "zset-max-listpack-value" => {
+                    let n = val.parse::<usize>().map_err(|_| {
+                        NexradeError::Generic("Invalid zset-max-listpack-value value".to_string())
+                    })?;
+                    if n == 0 {
+                        return Err(NexradeError::Generic(
+                            "Invalid zset-max-listpack-value value".to_string(),
+                        ));
+                    }
+                    cfg.zset_max_listpack_value = n;
+                    let mut t = zset_thresholds();
+                    t.max_value = n;
+                    set_zset_thresholds(t);
+                }
+                "zset-demote-entries" => {
+                    let n = val.parse::<usize>().map_err(|_| {
+                        NexradeError::Generic("Invalid zset-demote-entries value".to_string())
+                    })?;
+                    cfg.zset_demote_entries = n;
+                    let mut t = zset_thresholds();
+                    t.demote_entries = n;
+                    set_zset_thresholds(t);
+                }
+                "notify-keyspace-events" => {
+                    // Redis silently accepts any character; unknown chars are
+                    // ignored. Empty string disables notifications.
+                    let flags = crate::notify::NotifyFlags::parse(val);
+                    cfg.notify_keyspace_events = flags;
+                    db.notify_flags.store(flags);
+                }
                 _ => {
                     return Err(NexradeError::Generic(format!(
                         "Unsupported CONFIG parameter: {}",
@@ -445,7 +890,23 @@ pub async fn cmd_config(db: &Db, args: &[Resp]) -> Result<Resp> {
             }
             Ok(Resp::ok())
         }
-        "REWRITE" => Ok(Resp::ok()),
+        "REWRITE" => {
+            let path = cfg_clone_config_path(db);
+            let Some(path) = path else {
+                return Err(NexradeError::Generic(
+                    "ERR CONFIG REWRITE failed: no config file path was set at startup \
+                     (pass --config /path/to/nexrade.toml)"
+                        .to_string(),
+                ));
+            };
+            let snapshot = {
+                let cfg = db.config.lock();
+                render_config_toml(&cfg)
+            };
+            std::fs::write(&path, snapshot)
+                .map_err(|e| NexradeError::Generic(format!("ERR CONFIG REWRITE failed: {e}")))?;
+            Ok(Resp::ok())
+        }
         "RESETSTAT" => {
             db.stats.total_commands.store(0, Ordering::Relaxed);
             db.stats.keyspace_hits.store(0, Ordering::Relaxed);
@@ -469,6 +930,182 @@ pub async fn cmd_publish(db: &Db, args: &[Resp]) -> Result<Resp> {
     let payload = get_bytes_vec(args, 2, "PUBLISH")?;
     let count = db.pubsub.publish(channel, payload);
     Ok(Resp::int(count as i64))
+}
+
+fn cfg_clone_config_path(db: &Db) -> Option<String> {
+    db.config.lock().config_file_path.clone()
+}
+
+/// Parse Redis `CONFIG SET save "900 1 300 10"` value into rule pairs.
+fn parse_save_config(val: &str) -> Result<Vec<(u64, usize)>> {
+    let trimmed = val.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.len() % 2 != 0 {
+        return Err(NexradeError::Generic(
+            "ERR wrong number of arguments for CONFIG SET 'save'".to_string(),
+        ));
+    }
+    let mut rules = Vec::with_capacity(parts.len() / 2);
+    for chunk in parts.chunks(2) {
+        let secs: u64 = chunk[0].parse().map_err(|_| {
+            NexradeError::Generic("ERR Invalid argument for CONFIG SET 'save'".to_string())
+        })?;
+        let changes: usize = chunk[1].parse().map_err(|_| {
+            NexradeError::Generic("ERR Invalid argument for CONFIG SET 'save'".to_string())
+        })?;
+        rules.push((secs, changes));
+    }
+    Ok(rules)
+}
+
+/// Render a TOML snapshot of the live config for CONFIG REWRITE.
+fn render_config_toml(cfg: &crate::db::ServerConfig) -> String {
+    let mut out = String::new();
+    out.push_str("# Generated by CONFIG REWRITE — nexrade-cache\n");
+    out.push_str(&format!("bind = {:?}\n", cfg.bind));
+    out.push_str(&format!("port = {}\n", cfg.port));
+    out.push_str(&format!("databases = {}\n", cfg.databases));
+    out.push_str(&format!("max_clients = {}\n", cfg.max_clients));
+    out.push_str(&format!("hz = {}\n", cfg.hz));
+    out.push_str(&format!("timeout = {}\n", cfg.timeout));
+    out.push_str(&format!("loglevel = {:?}\n", cfg.loglevel));
+    out.push_str(&format!("tcp_backlog = {}\n", cfg.tcp_backlog));
+    if let Some(m) = cfg.max_memory {
+        out.push_str(&format!("maxmemory = {}\n", m));
+    } else {
+        out.push_str("maxmemory = 0\n");
+    }
+    out.push_str(&format!(
+        "maxmemory_policy = {:?}\n",
+        cfg.maxmemory_policy.as_str()
+    ));
+    out.push_str(&format!(
+        "notify_keyspace_events = {:?}\n",
+        cfg.notify_keyspace_events.as_str()
+    ));
+    if let Some(ref p) = cfg.requirepass {
+        out.push_str(&format!("requirepass = {:?}\n", p));
+    }
+    out.push_str(&format!(
+        "slowlog_log_slower_than = {}\n",
+        cfg.slowlog_log_slower_than
+    ));
+    out.push_str(&format!("slowlog_max_len = {}\n", cfg.slowlog_max_len));
+    out.push_str(&format!(
+        "list_max_listpack_entries = {}\n",
+        cfg.list_max_listpack_entries
+    ));
+    out.push_str(&format!(
+        "list_max_listpack_size = {}\n",
+        cfg.list_max_listpack_size
+    ));
+    out.push_str(&format!(
+        "list_max_listpack_value = {}\n",
+        cfg.list_max_listpack_value
+    ));
+    out.push_str(&format!(
+        "list_demote_entries = {}\n",
+        cfg.list_demote_entries
+    ));
+    out.push_str(&format!(
+        "hash_max_listpack_entries = {}\n",
+        cfg.hash_max_listpack_entries
+    ));
+    out.push_str(&format!(
+        "hash_max_listpack_size = {}\n",
+        cfg.hash_max_listpack_size
+    ));
+    out.push_str(&format!(
+        "hash_max_listpack_value = {}\n",
+        cfg.hash_max_listpack_value
+    ));
+    out.push_str(&format!(
+        "hash_demote_entries = {}\n",
+        cfg.hash_demote_entries
+    ));
+    out.push_str(&format!(
+        "set_max_listpack_entries = {}\n",
+        cfg.set_max_listpack_entries
+    ));
+    out.push_str(&format!(
+        "set_max_listpack_size = {}\n",
+        cfg.set_max_listpack_size
+    ));
+    out.push_str(&format!(
+        "set_max_listpack_value = {}\n",
+        cfg.set_max_listpack_value
+    ));
+    out.push_str(&format!(
+        "set_demote_entries = {}\n",
+        cfg.set_demote_entries
+    ));
+    out.push_str(&format!(
+        "zset_max_listpack_entries = {}\n",
+        cfg.zset_max_listpack_entries
+    ));
+    out.push_str(&format!(
+        "zset_max_listpack_size = {}\n",
+        cfg.zset_max_listpack_size
+    ));
+    out.push_str(&format!(
+        "zset_max_listpack_value = {}\n",
+        cfg.zset_max_listpack_value
+    ));
+    out.push_str(&format!(
+        "zset_demote_entries = {}\n",
+        cfg.zset_demote_entries
+    ));
+    // save_rules = [[secs, changes], ...]
+    out.push_str("save_rules = [");
+    for (i, (s, c)) in cfg.save_rules.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("[{}, {}]", s, c));
+    }
+    out.push_str("]\n");
+    out.push_str("\n[persistence]\n");
+    if let Some(ref p) = cfg.persistence.rdb_path {
+        out.push_str(&format!("rdb_path = {:?}\n", p));
+    }
+    if let Some(ref p) = cfg.persistence.aof_path {
+        out.push_str(&format!("aof_path = {:?}\n", p));
+    }
+    let sync = {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            match cfg.persistence.aof_sync {
+                crate::persistence::AofSync::Always => "always",
+                crate::persistence::AofSync::EverySec => "everysec",
+                crate::persistence::AofSync::No => "no",
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            "everysec"
+        }
+    };
+    out.push_str(&format!("aof_sync = {:?}\n", sync));
+    out.push_str("\n[metrics]\n");
+    out.push_str(&format!("enabled = {}\n", cfg.metrics_enabled));
+    out.push_str(&format!("port = {}\n", cfg.metrics_port));
+    out.push_str("\n[tls]\n");
+    out.push_str(&format!("enabled = {}\n", cfg.tls_enabled));
+    if let Some(ref c) = cfg.tls_cert {
+        out.push_str(&format!("cert = {:?}\n", c));
+    }
+    if let Some(ref k) = cfg.tls_key {
+        out.push_str(&format!("key = {:?}\n", k));
+    }
+    if let Some(p) = cfg.tls_port {
+        out.push_str(&format!("port = {}\n", p));
+    }
+    out.push_str("\n[lua]\n");
+    out.push_str(&format!("time_limit = {}\n", cfg.lua_time_limit));
+    out
 }
 
 pub async fn cmd_pubsub(db: &Db, args: &[Resp]) -> Result<Resp> {
@@ -501,25 +1138,38 @@ pub async fn cmd_pubsub(db: &Db, args: &[Resp]) -> Result<Resp> {
             }
             Ok(Resp::array(result))
         }
-        "NUMPAT" => Ok(Resp::int(0)),
+        "NUMPAT" => Ok(Resp::int(db.pubsub.pattern_count() as i64)),
         _ => Ok(Resp::array(vec![])),
     }
 }
 
-pub async fn cmd_command(_args: &[Resp]) -> Result<Resp> {
-    // Return basic command count
-    Ok(Resp::int(200))
-}
+// COMMAND is implemented in `command_table` (static metadata table).
 
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn cmd_save(db: &Db) -> Result<Resp> {
+    let _save_job = match db.rdb_save_job.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Err(NexradeError::Generic(
+                "ERR RDB save already in progress".to_string(),
+            ));
+        }
+    };
+    let _mutation_quiesce = db.persistence.quiesce().await;
     let rdb_path = db.config.lock().persistence.rdb_path.clone();
     if let Some(path) = rdb_path {
+        let dirty_at_capture = db.stats.dirty_keys.load(Ordering::Relaxed);
         let dbs = db.store.snapshot_dbs();
+        drop(_mutation_quiesce);
         let snapshot = Snapshot::new(dbs);
         match snapshot.save(&path) {
             Ok(()) => {
-                db.stats.dirty_keys.store(0, Ordering::Relaxed);
+                db.stats
+                    .dirty_keys
+                    .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                        Some(current.saturating_sub(dirty_at_capture))
+                    })
+                    .ok();
                 db.stats
                     .last_save_time
                     .store(unix_secs(), Ordering::Relaxed);
@@ -527,9 +1177,6 @@ pub async fn cmd_save(db: &Db) -> Result<Resp> {
                 Ok(Resp::ok())
             }
             Err(e) => {
-                // Same flag path as BGSAVE — the operator looking at
-                // `INFO persistence` shouldn't have to know which save
-                // command was used to see a failure.
                 db.stats.bgsave_last_status.store(1, Ordering::Relaxed);
                 Err(NexradeError::Generic(e.to_string()))
             }
@@ -552,24 +1199,39 @@ pub async fn cmd_bgsave(db: &Db) -> Result<Resp> {
             "Background saving already in progress".to_string(),
         ));
     }
+    let save_job = match db.rdb_save_job.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            db.stats.bgsave_in_progress.store(false, Ordering::Release);
+            return Ok(Resp::SimpleString(
+                "Background saving already in progress".to_string(),
+            ));
+        }
+    };
     let rdb_path = db.config.lock().persistence.rdb_path.clone();
     if let Some(path) = rdb_path {
+        let mutation_quiesce = db.persistence.quiesce().await;
+        let dirty_at_capture = db.stats.dirty_keys.load(Ordering::Relaxed);
         let dbs = db.store.snapshot_dbs();
+        drop(mutation_quiesce);
         let stats = db.stats.clone();
         tokio::spawn(async move {
+            let _save_job = save_job;
             let result = tokio::task::spawn_blocking(move || Snapshot::new(dbs).save(&path)).await;
             match result {
                 Ok(Ok(())) => {
                     tracing::info!("BGSAVE completed");
-                    stats.dirty_keys.store(0, Ordering::Relaxed);
+                    stats
+                        .dirty_keys
+                        .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                            Some(current.saturating_sub(dirty_at_capture))
+                        })
+                        .ok();
                     stats.last_save_time.store(unix_secs(), Ordering::Relaxed);
                     stats.bgsave_last_status.store(0, Ordering::Relaxed);
                 }
                 Ok(Err(e)) => {
                     tracing::error!("BGSAVE failed: {}", e);
-                    // Stays at the existing time (no successful save), but
-                    // the status flips to `err` so `INFO persistence`
-                    // reflects the failure rather than stale `ok`.
                     stats.bgsave_last_status.store(1, Ordering::Relaxed);
                 }
                 Err(e) => {
@@ -594,10 +1256,7 @@ pub async fn cmd_bgsave(_db: &Db) -> Result<Resp> {
 pub async fn cmd_bgrewriteaof(db: &Db) -> Result<Resp> {
     use std::sync::atomic::Ordering::AcqRel;
 
-    // Only one concurrent rewrite is allowed. Like Redis, a second
-    // BGREWRITEAOF while one is in flight is rejected (rather than
-    // queueing), so the existing `aof_rewrite_in_progress` flag doubles
-    // as a concurrency lock for the rewrite.
+    // Serialize rewrite so we don't race with normal mutations.
     if db.stats.aof_rewrite_in_progress.swap(true, AcqRel) {
         return Ok(Resp::SimpleString(
             "Background append only file rewriting already in progress".to_string(),
@@ -612,11 +1271,37 @@ pub async fn cmd_bgrewriteaof(db: &Db) -> Result<Resp> {
             .store(false, Ordering::Release);
         return Ok(Resp::error("ERR AOF not enabled"));
     };
+
+    // Take exclusive access for the complete rewrite + writer handoff. The
+    // owned guard is moved into the background task, so no write can slip
+    // between snapshot generation, rename, and replacement-writer install.
+    let quiesce = db.persistence.quiesce().await;
+
+    // Flush/sync and detach the existing writer so concurrent appends wait
+    // on the gate and are included in the next write after handoff.
+    let old_writer = {
+        let mut guard = db.aof_writer.lock();
+        guard.take()
+    };
+    if let Some(mut w) = old_writer {
+        if let Err(e) = w.fsync() {
+            tracing::error!("pre-rewrite AOF fsync failed: {}", e);
+            db.fail_aof("pre-rewrite fsync", &e);
+            db.stats
+                .aof_rewrite_in_progress
+                .store(false, Ordering::Release);
+            return Err(NexradeError::Generic(
+                "AOF fsync failed before rewrite; rewrite aborted".to_string(),
+            ));
+        }
+    }
+
     let dbs = db.store.snapshot_dbs();
     let acl_lines = db.acl.list();
     let db_clone = db.clone();
     let stats = db.stats.clone();
     tokio::spawn(async move {
+        let _quiesce = quiesce;
         let path2 = path.clone();
         let result = tokio::task::spawn_blocking(move || {
             crate::persistence::AofWriter::rewrite(&path, &dbs, &acl_lines)
@@ -626,19 +1311,45 @@ pub async fn cmd_bgrewriteaof(db: &Db) -> Result<Resp> {
             Ok(Ok(())) => {
                 tracing::info!("BGREWRITEAOF completed");
                 stats.aof_rewrite_last_status.store(0, Ordering::Relaxed);
+                stats
+                    .last_rewrite_time
+                    .store(unix_secs(), Ordering::Relaxed);
                 // Re-open the AOF writer on the rewritten file.
                 match crate::persistence::AofWriter::open(&path2) {
                     Ok(writer) => *db_clone.aof_writer.lock() = Some(writer),
-                    Err(e) => tracing::error!("failed to reopen AOF after rewrite: {}", e),
+                    Err(e) => {
+                        tracing::error!("failed to reopen AOF after rewrite: {}", e);
+                        db_clone.fail_aof("post-rewrite writer open", &e);
+                    }
                 }
             }
             Ok(Err(e)) => {
                 tracing::error!("BGREWRITEAOF failed: {}", e);
                 stats.aof_rewrite_last_status.store(1, Ordering::Relaxed);
+                match crate::persistence::AofWriter::open(&path2) {
+                    Ok(writer) => *db_clone.aof_writer.lock() = Some(writer),
+                    Err(reopen) => {
+                        tracing::error!(
+                            "failed to restore AOF writer after rewrite failure: {}",
+                            reopen
+                        );
+                        db_clone.fail_aof("rewrite failure recovery", &reopen);
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!("BGREWRITEAOF task panicked: {}", e);
                 stats.aof_rewrite_last_status.store(1, Ordering::Relaxed);
+                match crate::persistence::AofWriter::open(&path2) {
+                    Ok(writer) => *db_clone.aof_writer.lock() = Some(writer),
+                    Err(reopen) => {
+                        tracing::error!(
+                            "failed to restore AOF writer after rewrite panic: {}",
+                            reopen
+                        );
+                        db_clone.fail_aof("rewrite panic recovery", &reopen);
+                    }
+                }
             }
         }
         stats
@@ -684,30 +1395,106 @@ pub async fn cmd_shutdown(db: &Db, args: &[Resp]) -> Result<Resp> {
         .get(1)
         .and_then(|a| a.as_str())
         .is_some_and(|s| s.eq_ignore_ascii_case("NOSAVE"));
-    if nosave {
-        db.stats.dirty_keys.store(0, Ordering::Relaxed);
-    }
+    db.stats.shutdown_nosave.store(nosave, Ordering::Release);
     db.shutdown.notify_one();
     Ok(Resp::ok())
 }
 
 /// `WAIT numreplicas timeout`
 ///
-/// Blocks until the write offset has been acknowledged by `numreplicas`
-/// replicas, or `timeout` ms elapses. In standalone mode (no replicas)
-/// Redis returns 0 — that's what we return here too.
+/// Blocks until at least `numreplicas` connected replicas have acknowledged
+/// an offset ≥ the primary's current replication offset, or until `timeout`
+/// milliseconds elapse (0 = wait forever). Returns the number of replicas
+/// that have caught up (may be less than `numreplicas` on timeout).
+///
+/// 0.8.0: real implementation. Previously always returned 0.
+/// Standalone (no replicas) still returns 0 immediately, matching Redis.
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn cmd_wait(db: &Db, args: &[Resp]) -> Result<Resp> {
     if args.len() < 3 {
         return Err(NexradeError::WrongArity("wait".to_string()));
     }
-    // We don't honor numreplicas/timeout because we have no replicas — but
-    // accepting the arguments (and validating them) keeps redis-py happy.
-    let _num = get_i64(args, 1, "WAIT")?;
-    let _timeout = get_i64(args, 2, "WAIT")?;
+    let num = get_i64(args, 1, "WAIT")?;
+    let timeout_ms = get_i64(args, 2, "WAIT")?;
+    if num < 0 || timeout_ms < 0 {
+        return Err(NexradeError::Generic("ERR timeout is negative".to_string()));
+    }
+    let num = num as usize;
+    // Target = current primary offset. Writes that land after WAIT starts
+    // are not required to be acknowledged (Redis semantics).
+    let target = db
+        .replication
+        .replication_offset
+        .load(std::sync::atomic::Ordering::Relaxed);
 
-    // Suppress unused warning on `db` (used implicitly via context).
-    let _ = db;
+    // Fast path: already satisfied, or no replicas / num==0.
+    let mut acked = db.replication.replicas_at_or_beyond(target);
+    if num == 0 || acked >= num {
+        return Ok(Resp::int(acked as i64));
+    }
+    if db.replication.propagate_subscriber_count() == 0 {
+        return Ok(Resp::int(0));
+    }
 
+    // Ask replicas to report their offset now.
+    db.replication.request_acks();
+
+    let deadline = if timeout_ms == 0 {
+        None
+    } else {
+        Some(tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64))
+    };
+
+    loop {
+        // Re-check after each wake / poll.
+        acked = db.replication.replicas_at_or_beyond(target);
+        if acked >= num {
+            return Ok(Resp::int(acked as i64));
+        }
+        // Wait for the next ACK or a short poll interval (in case a
+        // replica ACKed between our check and the notify).
+        let notified = db.replication.ack_notify.notified();
+        tokio::pin!(notified);
+        // Enable before re-check (classic notify race).
+        notified.as_mut().enable();
+        acked = db.replication.replicas_at_or_beyond(target);
+        if acked >= num {
+            return Ok(Resp::int(acked as i64));
+        }
+
+        if let Some(dl) = deadline {
+            let remaining = dl.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(Resp::int(acked as i64));
+            }
+            // Also re-request acks periodically so a silent replica is poked.
+            db.replication.request_acks();
+            match tokio::time::timeout(
+                remaining.min(std::time::Duration::from_millis(50)),
+                notified,
+            )
+            .await
+            {
+                Ok(()) => continue, // woke by ACK
+                Err(_) => {
+                    // Timeout of this slice — loop will re-check deadline.
+                    continue;
+                }
+            }
+        } else {
+            // Wait forever, but poke GETACK every 100ms.
+            db.replication.request_acks();
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(100), notified).await;
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn cmd_wait(db: &Db, args: &[Resp]) -> Result<Resp> {
+    if args.len() < 3 {
+        return Err(NexradeError::WrongArity("wait".to_string()));
+    }
+    let _ = (db, get_i64(args, 1, "WAIT")?, get_i64(args, 2, "WAIT")?);
     Ok(Resp::int(0))
 }
 
@@ -744,7 +1531,16 @@ pub async fn cmd_slowlog(db: &Db, args: &[Resp]) -> Result<Resp> {
             db.slowlog.reset();
             Ok(Resp::ok())
         }
-        _ => Ok(Resp::array(vec![])),
+        "HELP" => Ok(Resp::array(vec![
+            Resp::bulk_str("SLOWLOG <subcommand> [<arg> ...]"),
+            Resp::bulk_str("SLOWLOG GET [count] — show the slowlog (most recent first)"),
+            Resp::bulk_str("SLOWLOG LEN — length of the slowlog"),
+            Resp::bulk_str("SLOWLOG RESET — clear the slowlog"),
+            Resp::bulk_str("SLOWLOG HELP — this help"),
+        ])),
+        _ => Err(NexradeError::Generic(format!(
+            "ERR unknown subcommand or wrong number of arguments for '{sub}'. Try SLOWLOG HELP."
+        ))),
     }
 }
 
@@ -825,12 +1621,12 @@ fn entry_memory_bytes(key: &[u8], entry: &crate::store::Entry) -> usize {
         DataType::String(v) => v.len(),
         // Fixed-size atomic cell — no `.len()` to call; 8 bytes for the i64.
         DataType::Int(_) => 8,
-        DataType::List(l) => l.iter().map(|b| b.len()).sum(),
-        DataType::Set(s) => s.iter().map(|v| v.len()).sum(),
-        DataType::Hash(h) => h.iter().map(|(k, v)| k.len() + v.len()).sum(),
+        DataType::List(l) => l.payload_bytes(),
+        DataType::Set(s) => s.payload_bytes(),
+        DataType::Hash(h) => h.payload_bytes(),
         DataType::Bitmap(v) => v.len(),
         DataType::HyperLogLog(v) => v.len(),
-        DataType::ZSet(z) => z.members.keys().map(|m| m.len() + 8).sum(),
+        DataType::ZSet(z) => z.payload_bytes(),
         DataType::Stream(s) => s.estimated_size(),
         DataType::Geo(g) => g.members.len() * 24,
     };
@@ -916,16 +1712,118 @@ fn memory_doctor(db: &Db) -> Resp {
     Resp::bulk_str(lines.join("\n"))
 }
 
-pub async fn cmd_latency(args: &[Resp]) -> Result<Resp> {
+pub async fn cmd_latency(db: &Db, args: &[Resp]) -> Result<Resp> {
     if args.len() < 2 {
         return Err(NexradeError::WrongArity("latency".to_string()));
     }
     let sub = get_str(args, 1, "LATENCY")?.to_uppercase();
     match sub.as_str() {
-        "LATEST" => Ok(Resp::array(vec![])),
-        "HISTORY" => Ok(Resp::array(vec![])),
-        "RESET" => Ok(Resp::int(0)),
-        _ => Ok(Resp::array(vec![])),
+        "LATEST" => {
+            // Shape: array of [event, timestamp, latest_us, all_time_us].
+            // 0.7.4: sourced from the dedicated LatencyMonitor (every timed
+            // command), not only the slowlog ring.
+            let rows: Vec<Resp> = db
+                .latency
+                .latest()
+                .into_iter()
+                .map(|(name, ts, latest, max)| {
+                    Resp::array(vec![
+                        Resp::bulk_str(name),
+                        Resp::int(ts as i64),
+                        Resp::int(latest as i64),
+                        Resp::int(max as i64),
+                    ])
+                })
+                .collect();
+            Ok(Resp::array(rows))
+        }
+        "HISTORY" => {
+            // LATENCY HISTORY <event>
+            let event = args
+                .get(2)
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let rows: Vec<Resp> = db
+                .latency
+                .history(&event)
+                .into_iter()
+                .map(|(ts, us)| Resp::array(vec![Resp::int(ts as i64), Resp::int(us as i64)]))
+                .collect();
+            Ok(Resp::array(rows))
+        }
+        "HISTOGRAM" => {
+            // LATENCY HISTOGRAM [event ...]. Redis 7.2+ map shape:
+            // { event → { calls, histogram_usec → { bucket → count } } }
+            let events: Vec<&str> = (2..args.len())
+                .filter_map(|i| args.get(i).and_then(|a| a.as_str()))
+                .collect();
+            let hist = db.latency.histogram(&events);
+            let mut outer: Vec<Resp> = Vec::with_capacity(hist.len() * 2);
+            for (name, h) in hist {
+                outer.push(Resp::bulk_str(name));
+                let mut inner: Vec<Resp> = Vec::with_capacity(4);
+                inner.push(Resp::bulk_str("calls"));
+                inner.push(Resp::int(h.calls as i64));
+                inner.push(Resp::bulk_str("histogram_usec"));
+                let mut buckets: Vec<Resp> = Vec::with_capacity(h.buckets.len() * 2);
+                for (b, c) in h.buckets {
+                    buckets.push(Resp::bulk_str(b.to_string()));
+                    buckets.push(Resp::int(c as i64));
+                }
+                // RESP2 flat array; RESP3 Map upgrade happens in the
+                // connection layer for known map-shaped commands.
+                inner.push(Resp::array(buckets));
+                outer.push(Resp::array(inner));
+            }
+            Ok(Resp::array(outer))
+        }
+        "RESET" => {
+            // LATENCY RESET [event ...]
+            let events: Vec<&str> = (2..args.len())
+                .filter_map(|i| args.get(i).and_then(|a| a.as_str()))
+                .collect();
+            let n = db.latency.reset(&events);
+            Ok(Resp::int(n as i64))
+        }
+        "DOCTOR" => {
+            let max = db.latency.global_max_us();
+            let samples = db.latency.total_samples();
+            let events = db.latency.event_count();
+            let msg = if samples == 0 {
+                "I'm here to keep free latency for you. No samples recorded yet                  (command timing is off when both metrics and slowlog are disabled)."
+                    .to_string()
+            } else if max < 1_000 {
+                format!(
+                    "Dave, this is your latency doctor speaking. {samples} samples                      across {events} events; all-time max is {max} µs. Looking good."
+                )
+            } else if max < 10_000 {
+                format!(
+                    "Dave, this is your latency doctor speaking. {samples} samples                      across {events} events; all-time max is {max} µs                      ({:.1} ms). Mild spikes — check slowlog for outliers.",
+                    max as f64 / 1000.0
+                )
+            } else {
+                format!(
+                    "Dave, this is your latency doctor speaking. {samples} samples                      across {events} events; all-time max is {max} µs                      ({:.1} ms). Investigate with LATENCY LATEST / HISTORY                      and SLOWLOG GET.",
+                    max as f64 / 1000.0
+                )
+            };
+            Ok(Resp::bulk_str(msg))
+        }
+        "HELP" => Ok(Resp::array(vec![
+            Resp::bulk_str("LATENCY <subcommand> [<arg> ...]"),
+            Resp::bulk_str("LATENCY LATEST — latest events from the latency monitor"),
+            Resp::bulk_str("LATENCY HISTORY <event> — time series for one event"),
+            Resp::bulk_str(
+                "LATENCY HISTOGRAM [event ...] — power-of-two bucket histogram (0.7.4+)",
+            ),
+            Resp::bulk_str("LATENCY RESET [event ...] — clear latency samples"),
+            Resp::bulk_str("LATENCY DOCTOR — human-readable report"),
+            Resp::bulk_str("LATENCY HELP — this help"),
+        ])),
+        _ => Err(NexradeError::Generic(format!(
+            "ERR unknown subcommand or wrong number of arguments for '{sub}'. Try LATENCY HELP."
+        ))),
     }
 }
 
@@ -1322,6 +2220,7 @@ pub async fn cmd_client(db: &Db, args: &[Resp], caller_id: u64) -> Result<Resp> 
             Ok(Resp::ok())
         }
         "NO-EVICT" => client_no_evict(db, caller_id),
+        "SETINFO" => client_setinfo(db, args, caller_id),
         // The subcommands below are intercepted by the connection
         // handler (see `connection.rs::handle_client`) and never reach
         // here. They're matched explicitly to keep `cmd_client` from
@@ -1564,6 +2463,44 @@ fn client_no_evict(db: &Db, caller_id: u64) -> Result<Resp> {
     Ok(Resp::ok())
 }
 
+/// `CLIENT SETINFO LIB-NAME <name>` / `CLIENT SETINFO LIB-VER <ver>`
+///
+/// Redis 7.2+ — redis-py 5+/8 send these on connect. We store the values on
+/// the connection meta so `CLIENT LIST` / `CLIENT INFO` can surface them.
+fn client_setinfo(db: &Db, args: &[Resp], caller_id: u64) -> Result<Resp> {
+    if args.len() != 4 {
+        return Err(NexradeError::WrongArity("client|setinfo".to_string()));
+    }
+    let attr = get_str(args, 2, "CLIENT")?.to_uppercase();
+    let val = match args.get(3).and_then(|a| a.as_str()) {
+        Some(s) => s,
+        None => {
+            return Err(NexradeError::WrongArity("client|setinfo".to_string()));
+        }
+    };
+    // Redis rejects spaces / newlines in these attributes.
+    if val.contains(' ') || val.contains('\n') || val.contains('\r') {
+        return Err(NexradeError::Prefixed(
+            "ERR Client attributes cannot contain spaces, newlines or special characters."
+                .to_string(),
+        ));
+    }
+    let Some(m) = db.connections.meta(caller_id) else {
+        return Ok(Resp::ok());
+    };
+    let mut g = m.write();
+    match attr.as_str() {
+        "LIB-NAME" => g.lib_name = val.to_string(),
+        "LIB-VER" => g.lib_ver = val.to_string(),
+        other => {
+            return Err(NexradeError::Generic(format!(
+                "ERR Unrecognized CLIENT SETINFO attribute '{other}'"
+            )));
+        }
+    }
+    Ok(Resp::ok())
+}
+
 fn client_help() -> Resp {
     Resp::array(vec![
         Resp::bulk_str("CLIENT <subcommand> [<arg> ...]. Subcommands are:"),
@@ -1572,6 +2509,7 @@ fn client_help() -> Resp {
         Resp::bulk_str("LIST"),
         Resp::bulk_str("GETNAME"),
         Resp::bulk_str("SETNAME <name>"),
+        Resp::bulk_str("SETINFO <LIB-NAME|LIB-VER> <value>"),
         Resp::bulk_str("KILL [ID <id>] [TYPE <normal|master|replica|pubsub>] [ADDR <ip:port>] [USER <username>] [SKIPME yes/no]"),
         Resp::bulk_str("PAUSE <timeout>"),
         Resp::bulk_str("UNPAUSE"),
@@ -1614,8 +2552,41 @@ pub async fn cmd_cluster(db: &Db, args: &[Resp]) -> Result<Resp> {
             Ok(Resp::array(arr))
         }
         "SLOTS" => Ok(cluster_slots(db)),
+        "LINKS" => {
+            // 0.9.1: standalone emits no cluster gossip, so there are no
+            // inbound/outbound cluster links. Return an empty array so
+            // redis-cli --cluster info and other probes see a clean
+            // "no links" report.
+            Ok(Resp::array(Vec::new()))
+        }
+        "COUNT-FAILURE-REPORTS" => {
+            // 0.9.1: standalone has no failure tracking; return 0 for
+            // any node id. Tools that compare across replicas can rely on
+            // this being a stable integer.
+            Ok(Resp::int(0))
+        }
+        "FAILOVER-CHECK-RAYS" => Err(NexradeError::Generic(
+            "ERR FAILOVER-CHECK-RAYS is not available in standalone              (no quorum to check against)"
+                .to_string(),
+        )),
         "HELP" => Ok(cluster_help()),
-        // Anything else: pretend we don't know it — Redis does the same.
+        // 0.9.0: explicit hard-error for multi-node subcommands. The
+        // probe-only subcommands above (INFO / MYID / KEYSLOT / NODES /
+        // SLOTS / COUNTKEYSINSLOT / GETKEYSINSLOT / HELP) still work so
+        // tools like `redis-cli --cluster check` can inspect the server,
+        // but anything that would mutate gossip state is rejected
+        // because nexrade-cache is a standalone server (see
+        // docs/cluster-compat.md).
+        "MEET" | "FORGET" | "REPLICATE" | "RESET" | "SETSLOT"
+        | "SAVECONFIG" | "FAILOVER" | "ADDSLOTS" | "ADDSLOTSRANGE"
+        | "DELSLOTS" | "DELSLOTSRANGE" | "BUMPEPOCH" => Err(
+            NexradeError::Generic(format!(
+                "ERR CLUSTER {sub} is not supported by nexrade-cache                  (standalone server). See docs/cluster-compat.md for guidance.",
+            )),
+        ),
+        // Anything else: still pretend we do not know it (Redis does
+        // the same — unknown subcommands return OK so probes do not
+        // error on newer protocol features).
         _ => Ok(Resp::ok()),
     }
 }

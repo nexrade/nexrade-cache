@@ -1,4 +1,5 @@
 pub mod bit;
+pub mod command_table;
 pub mod generic;
 pub mod geo;
 pub mod hash;
@@ -88,7 +89,7 @@ pub fn is_write_command(cmd: &str) -> bool {
         | "SETRANGE"
         // List
         | "LPUSH" | "RPUSH" | "LPUSHX" | "RPUSHX" | "LPOP" | "RPOP" | "LSET" | "LINSERT"
-        | "LREM" | "LTRIM" | "LMOVE" | "RPOPLPUSH" | "BLPOP" | "BRPOP"
+        | "LREM" | "LTRIM" | "LMOVE" | "RPOPLPUSH" | "BLPOP" | "BRPOP" | "BLMOVE"
         | "LMPOP" | "BLMPOP"
         // Hash
         | "HSET" | "HMSET" | "HDEL" | "HSETNX" | "HINCRBY" | "HINCRBYFLOAT"
@@ -97,6 +98,7 @@ pub fn is_write_command(cmd: &str) -> bool {
         // ZSet
         | "ZADD" | "ZINCRBY" | "ZREM" | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZPOPMIN"
         | "ZPOPMAX" | "ZUNIONSTORE" | "ZINTERSTORE" | "ZRANGESTORE" | "ZDIFFSTORE" | "ZMPOP" | "BZMPOP"
+        | "BZPOPMIN" | "BZPOPMAX"
         // Generic
         | "DEL" | "UNLINK" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST"
         | "RENAME" | "RENAMENX" | "COPY" | "MOVE" | "RESTORE" | "SORT"
@@ -104,16 +106,26 @@ pub fn is_write_command(cmd: &str) -> bool {
         | "FLUSHDB" | "FLUSHALL"
         // Stream
         | "XADD" | "XTRIM" | "XDEL" | "XGROUP" | "XREADGROUP" | "XACK" | "XCLAIM" | "XAUTOCLAIM"
+        | "XSETID"
         // Bitmap
         | "SETBIT" | "BITOP" | "BITFIELD"
         // Geo
-        | "GEOADD"
+        | "GEOADD" | "GEOSEARCHSTORE"
         // HyperLogLog
         | "PFADD" | "PFMERGE"
     )
 }
 
-/// Dispatch a command as the implicit `"default"` ACL user.
+/// Blocking commands can wait indefinitely before they mutate. They
+/// should acquire the mutation permit only at the actual mutation,
+/// not while parked.
+#[cfg(not(target_arch = "wasm32"))]
+fn is_blocking_write_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "BLPOP" | "BRPOP" | "BLMOVE" | "BLMPOP" | "BZMPOP" | "BZPOPMIN" | "BZPOPMAX" | "XREADGROUP"
+    )
+}
 ///
 /// **System-internal only** — AOF replay, replication apply, embedded
 /// (WASM) callers, and library tests. These contexts don't have a
@@ -206,11 +218,40 @@ pub async fn dispatch_tracked(
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    if is_write && db.stats.aof_failed.load(Ordering::Acquire) {
+        return Resp::Error(
+            "MISCONF AOF persistence is in an error state; writes are disabled until operator recovery"
+                .to_string(),
+        );
+    }
+
+    // A persistence operation closes admission while it captures a coherent
+    // snapshot or replaces the AOF. Normal writes use the coordinator's
+    // atomic fast path and keep the permit through AOF append/fsync.
+    // Blocking commands (BLPOP, BRPOP, BLMOVE, BLMPOP, BZMPOP, XREADGROUP)
+    // acquire the permit only at their actual mutation, not while parked.
+    #[cfg(not(target_arch = "wasm32"))]
+    let _persistence_write_permit = if is_write && !is_blocking_write_command(cmd) {
+        match db.persistence.enter_mutation() {
+            Some(permit) => Some(permit),
+            None => {
+                return Resp::Error(
+                    "MISCONF persistence is quiescing; writes are temporarily disabled".to_string(),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
     // Key extraction is only needed when:
     //   * ACL is not fully open (must pass keys into check_permission), or
-    //   * CLIENT TRACKING is enabled for someone (must feed on_write/track_read).
+    //   * CLIENT TRACKING is enabled for someone (must feed on_write/track_read), or
+    //   * keyspace notifications are enabled (must feed notify_command_keys).
     // Under redis-benchmark neither is true — skip the Vec allocation.
-    let need_keys = !is_flush && (!db.acl.is_open() || db.tracking.enabled_count() > 0);
+    let need_keys = !is_flush
+        && (!db.acl.is_open() || db.tracking.enabled_count() > 0 || db.notify_flags.load().0 != 0);
     let touched_keys: Vec<Vec<u8>> = if need_keys {
         extract_keys(cmd, &args)
             .into_iter()
@@ -237,7 +278,8 @@ pub async fn dispatch_tracked(
     // Enforce maxmemory before write commands. Lock-free fast path:
     // if `db.max_memory_limit` is 0 (the default), there's nothing to
     // enforce and we never take the config lock.
-    if is_write {
+    // Helper: decode policy once so pre- and post-write share the same path.
+    let maxmem = if is_write {
         let limit = db.max_memory_limit.load(Ordering::Relaxed);
         if limit > 0 {
             let policy_u8 = db.maxmemory_policy.load(Ordering::Relaxed);
@@ -252,9 +294,24 @@ pub async fn dispatch_tracked(
                 5 => crate::db::MaxMemoryPolicy::VolatileTtl,
                 _ => crate::db::MaxMemoryPolicy::NoEviction,
             };
-            db.store.evict_if_needed(&policy, limit);
+            // Pre-write eviction — fire keyspace `evicted` events when enabled.
+            let pre = db.store.evict_if_needed(&policy, limit);
+            if !pre.is_empty() && db.notify_flags.load().0 != 0 {
+                use crate::notify::NotifyFlags;
+                let flags = db.notify_flags.load();
+                if flags.contains(NotifyFlags::K_EVICTED) {
+                    for k in &pre {
+                        db.notify_keyspace_event(db_index, "evicted", k);
+                    }
+                }
+            }
+            Some((policy, limit))
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
 
     let result = match dispatch_inner(
         db, args, db_index, peer_addr, user, client_id, &key_refs, cmd,
@@ -267,6 +324,26 @@ pub async fn dispatch_tracked(
 
     let succeeded = !matches!(result, Resp::Error(_));
 
+    // Post-write: a single fat write can push live_bytes past the cap; re-check
+    // so maxmemory is enforced without waiting for the next command.
+    // Evicted keys fire keyspace `evicted` events when the `e` flag is on.
+    if succeeded {
+        if let Some((policy, limit)) = maxmem {
+            let evicted = db.store.evict_if_needed(&policy, limit);
+            if !evicted.is_empty() && db.notify_flags.load().0 != 0 {
+                use crate::notify::NotifyFlags;
+                let flags = db.notify_flags.load();
+                if flags.contains(NotifyFlags::K_EVICTED) {
+                    for k in &evicted {
+                        // We don't know which db each key came from after a
+                        // multi-db sweep; the common case is the current db.
+                        db.notify_keyspace_event(db_index, "evicted", k);
+                    }
+                }
+            }
+        }
+    }
+
     if is_write && succeeded {
         db.stats.dirty_keys.fetch_add(1, Ordering::Relaxed);
 
@@ -274,27 +351,40 @@ pub async fn dispatch_tracked(
         if let Some(bytes) = aof_bytes {
             let aof_sync = db.config.lock().persistence.aof_sync.clone();
             let mut writer_guard = db.aof_writer.lock();
-            if let Some(ref mut w) = *writer_guard {
-                if let Err(e) = w.append(&bytes) {
-                    tracing::error!("AOF append error: {}", e);
-                } else if aof_sync == AofSync::Always {
-                    if let Err(e) = w.fsync() {
-                        tracing::error!("AOF fsync error: {}", e);
+            let write_result = match writer_guard.as_mut() {
+                Some(writer) => writer.append(&bytes).and_then(|()| {
+                    if aof_sync == AofSync::Always {
+                        writer.fsync()
+                    } else {
+                        Ok(())
                     }
-                }
+                }),
+                None => Err(NexradeError::Generic(
+                    "AOF writer is unavailable".to_string(),
+                )),
+            };
+            if let Err(e) = write_result {
+                tracing::error!("AOF write error: {}", e);
+                db.fail_aof("append or sync", &e);
+                return Resp::Error(format!(
+                    "MISCONF AOF persistence failed after in-memory mutation: {e}; writes are now disabled"
+                ));
             }
+            db.stats.aof_last_write_status.store(0, Ordering::Relaxed);
         }
     }
 
     // CLIENT TRACKING bookkeeping: reads arm invalidation for this client,
     // writes fire invalidation pushes to every client tracking the touched
     // keys. FLUSHALL/FLUSHDB use a dedicated broadcast instead of per-key.
+    // Keyspace notifications (notify-keyspace-events) share the same key list.
     if succeeded {
         if is_flush {
             db.tracking.flush_all();
         } else if !key_refs.is_empty() {
             if is_write {
                 db.tracking.on_write(&key_refs, client_id);
+                db.notify_command_keys(db_index, cmd, &key_refs);
             } else {
                 db.tracking.track_read(client_id, &key_refs);
             }
@@ -352,6 +442,7 @@ async fn dispatch_inner(
         "STRLEN" => string::cmd_strlen(db, &args, db_index).await,
         "GETRANGE" | "SUBSTR" => string::cmd_getrange(db, &args, db_index).await,
         "SETRANGE" => string::cmd_setrange(db, &args, db_index).await,
+        "LCS" => string::cmd_lcs(db, &args, db_index).await,
 
         // --- List commands ---
         "LPUSH" => list::cmd_lpush(db, &args, db_index).await,
@@ -368,6 +459,7 @@ async fn dispatch_inner(
         "LREM" => list::cmd_lrem(db, &args, db_index).await,
         "LTRIM" => list::cmd_ltrim(db, &args, db_index).await,
         "LMOVE" => list::cmd_lmove(db, &args, db_index).await,
+        "BLMOVE" => list::cmd_blmove(db, &args, db_index).await,
         "RPOPLPUSH" => list::cmd_rpoplpush(db, &args, db_index).await,
         "LPOS" => list::cmd_lpos(db, &args, db_index).await,
         "BLPOP" => list::cmd_blpop(db, &args, db_index).await,
@@ -403,6 +495,7 @@ async fn dispatch_inner(
         "SUNIONSTORE" => set::cmd_sunionstore(db, &args, db_index).await,
         "SINTER" => set::cmd_sinter(db, &args, db_index).await,
         "SINTERSTORE" => set::cmd_sinterstore(db, &args, db_index).await,
+        "SINTERCARD" => set::cmd_sintercard(db, &args, db_index).await,
         "SDIFF" => set::cmd_sdiff(db, &args, db_index).await,
         "SDIFFSTORE" => set::cmd_sdiffstore(db, &args, db_index).await,
         "SMOVE" => set::cmd_smove(db, &args, db_index).await,
@@ -430,6 +523,8 @@ async fn dispatch_inner(
         "ZREMRANGEBYSCORE" => zset::cmd_zremrangebyscore(db, &args, db_index).await,
         "ZPOPMIN" => zset::cmd_zpopmin(db, &args, db_index).await,
         "ZPOPMAX" => zset::cmd_zpopmax(db, &args, db_index).await,
+        "BZPOPMIN" => zset::cmd_bzpopmin(db, &args, db_index).await,
+        "BZPOPMAX" => zset::cmd_bzpopmax(db, &args, db_index).await,
         "ZRANDMEMBER" => zset::cmd_zrandmember(db, &args, db_index).await,
         "ZUNIONSTORE" => zset::cmd_zunionstore(db, &args, db_index).await,
         "ZINTERSTORE" => zset::cmd_zinterstore(db, &args, db_index).await,
@@ -481,7 +576,7 @@ async fn dispatch_inner(
         "FLUSHALL" => server::cmd_flushall(db, &args).await,
         "INFO" => server::cmd_info(db, &args).await,
         "CONFIG" => server::cmd_config(db, &args).await,
-        "COMMAND" => server::cmd_command(&args).await,
+        "COMMAND" => command_table::cmd_command(&args).await,
         "SAVE" => server::cmd_save(db).await,
         "BGSAVE" => server::cmd_bgsave(db).await,
         "BGREWRITEAOF" => server::cmd_bgrewriteaof(db).await,
@@ -491,7 +586,7 @@ async fn dispatch_inner(
         "SLOWLOG" => server::cmd_slowlog(db, &args).await,
         "WAIT" => server::cmd_wait(db, &args).await,
         "MEMORY" => server::cmd_memory(db, &args, db_index).await,
-        "LATENCY" => server::cmd_latency(&args).await,
+        "LATENCY" => server::cmd_latency(db, &args).await,
         "ACL" => server::cmd_acl(db, &args, authenticated_user).await,
         "RESET" => server::cmd_reset().await,
         "TIME" => server::cmd_time().await,
@@ -500,7 +595,26 @@ async fn dispatch_inner(
         "CLUSTER" => server::cmd_cluster(db, &args).await,
         "HELLO" => server::cmd_hello(&args).await,
         "PUBLISH" => server::cmd_publish(db, &args).await,
+        // Standalone alias: sharded publish maps to the same global bus.
+        "SPUBLISH" => server::cmd_publish(db, &args).await,
         "PUBSUB" => server::cmd_pubsub(db, &args).await,
+
+        // 0.8.1: SENTINEL is explicitly unsupported. nexrade-cache is a
+        // standalone server; it does not run a Sentinel cell, accept
+        // `SENTINEL MONITOR`/`SENTINEL MASTER`/`SENTINEL FAILOVER` /
+        // pub/sub-based failover, or participate in a discovery
+        // quorum. Redis Sentinel clients (redis-py Sentinel, Jedis, etc.)
+        // treat any non-OK SENTINEL reply as a non-Sentinel endpoint,
+        // so a clean explicit error is friendlier than the generic
+        // "unknown command" they would otherwise receive. Use the
+        // process manager (systemd / docker / k8s) to fail over the
+        // nexrade-cache process; for redis-py, set `sentinel=None` or
+        // pin to the standalone client.
+        "SENTINEL" => Err(NexradeError::Generic(
+            "ERR SENTINEL is not supported by nexrade-cache (standalone server). \
+             See docs/redis-sentinel-compat.md for failover guidance."
+                .to_string(),
+        )),
 
         // --- Replication commands ---
         #[cfg(not(target_arch = "wasm32"))]
@@ -525,6 +639,7 @@ async fn dispatch_inner(
         "XINFO" => stream::cmd_xinfo(db, &args, db_index).await,
         "XCLAIM" => stream::cmd_xclaim(db, &args, db_index).await,
         "XAUTOCLAIM" => stream::cmd_xautoclaim(db, &args, db_index).await,
+        "XSETID" => stream::cmd_xsetid(db, &args, db_index).await,
 
         // --- Bitmap commands ---
         "SETBIT" => bit::cmd_setbit(db, &args, db_index).await,
@@ -533,6 +648,7 @@ async fn dispatch_inner(
         "BITOP" => bit::cmd_bitop(db, &args, db_index).await,
         "BITPOS" => bit::cmd_bitpos(db, &args, db_index).await,
         "BITFIELD" => bit::cmd_bitfield(db, &args, db_index).await,
+        "BITFIELD_RO" => bit::cmd_bitfield_ro(db, &args, db_index).await,
 
         // --- Geo commands ---
         "GEOADD" => geo::cmd_geoadd(db, &args, db_index).await,
@@ -542,6 +658,7 @@ async fn dispatch_inner(
         "GEORADIUS" => geo::cmd_georadius(db, &args, db_index).await,
         "GEORADIUSBYMEMBER" => geo::cmd_georadiusbymember(db, &args, db_index).await,
         "GEOSEARCH" => geo::cmd_geosearch(db, &args, db_index).await,
+        "GEOSEARCHSTORE" => geo::cmd_geosearchstore(db, &args, db_index).await,
 
         // --- HyperLogLog commands ---
         "PFADD" => hll::cmd_pfadd(db, &args, db_index).await,
@@ -596,7 +713,9 @@ fn extract_keys<'a>(cmd: &str, args: &'a [Resp]) -> Vec<&'a [u8]> {
         | "ZRANDMEMBER" | "ZSCAN" | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "PFADD"
         | "PFCOUNT" | "PFMERGE" | "GEOADD" | "GEOPOS" | "GEODIST" | "GEOHASH" | "XADD" | "XLEN"
         | "XRANGE" | "XREVRANGE" | "XTRIM" | "XDEL" | "XGROUP" | "XACK" | "XPENDING" | "XCLAIM"
-        | "XAUTOCLAIM" | "WAIT" => &[(1, 0, Some(1))],
+        | "XAUTOCLAIM" | "XSETID" | "WAIT" | "BZPOPMIN" | "BZPOPMAX" | "BITFIELD_RO" => {
+            &[(1, 0, Some(1))]
+        }
 
         // XINFO STREAM|GROUPS|CONSUMERS <key> — key is at index 2.
         "XINFO" => &[(2, 0, Some(1))],
@@ -607,7 +726,9 @@ fn extract_keys<'a>(cmd: &str, args: &'a [Resp]) -> Vec<&'a [u8]> {
         "MSET" => &[(1, 2, None)], // (k1, v1, k2, v2, …)
         "MSETNX" => &[(1, 2, None)],
         "RENAME" | "COPY" => &[(1, 1, Some(2))], // src, dst
-        "LMOVE" | "BLMOVE" => &[(1, 1, Some(2))],
+        "LMOVE" | "BLMOVE" | "LCS" => &[(1, 1, Some(2))],
+        // GEOSEARCHSTORE dest source …
+        "GEOSEARCHSTORE" => &[(1, 1, Some(2))],
 
         // BITOP op destkey key [key …]
         "BITOP" => &[(2, 1, None)],
@@ -615,7 +736,7 @@ fn extract_keys<'a>(cmd: &str, args: &'a [Resp]) -> Vec<&'a [u8]> {
         // Sorted-set multi-key ops.
         "ZUNIONSTORE" | "ZINTERSTORE" | "ZDIFFSTORE" | "ZRANGESTORE" => &[(2, 1, None)],
         "ZUNION" | "ZINTER" | "ZDIFF" | "ZMPOP" | "BZMPOP" => &[(2, 1, None)],
-        "ZINTERCARD" => &[(2, 1, None)],
+        "ZINTERCARD" | "SINTERCARD" => &[(2, 1, None)],
 
         // Stream: XREAD/XREADGROUP layout is: COUNT? BLOCK? GROUP group consumer
         // COUNT? NOACK? STREAMS k1 k2 … id1 id2 … — keys aren't easily

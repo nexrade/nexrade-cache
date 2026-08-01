@@ -10,6 +10,11 @@ on:
       - "fuzz/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "scripts/**"
+      - "nexrade.example.toml"
+      - "nexrade.cache.toml"
+      - "nexrade.production.toml"
+      - "docs/**"
       - ".github/workflows/ci.yml"
   pull_request:
     branches: ["**"]
@@ -20,6 +25,11 @@ on:
       - "fuzz/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "scripts/**"
+      - "nexrade.example.toml"
+      - "nexrade.cache.toml"
+      - "nexrade.production.toml"
+      - "docs/**"
       - ".github/workflows/ci.yml"
 
 # Cancel stale runs on the same ref — never pay for an outdated run
@@ -92,6 +102,87 @@ jobs:
       # run added nothing but a second full test-suite execution.
       - name: Run all tests
         run: cargo test --workspace --all-features
+
+  # ─── Client wire smokes (1.0.0) ────────────────────────────────────────────
+  # Three independent parsers against one release binary:
+  #   1. scripts/redis_py_smoke.py          — redis-py sync + asyncio (31+5)
+  #   2. scripts/redis_py_cluster_smoke.py  — cluster-client path safety (13)
+  #   3. scripts/raw_resp_smoke.py          — raw TCP + hand-rolled RESP (10)
+  # Fails the build on any miss.
+  client-smokes:
+    name: Client smokes (redis-py + cluster + raw RESP)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: client-smokes
+
+      - name: Build release nexrade-cache
+        run: cargo build --release -p nexrade-cache
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install redis-py
+        run: pip install "redis>=5,<9"
+
+      - name: Start nexrade-cache and run all client smokes
+        run: |
+          set -euo pipefail
+          PORT=16379
+          ./target/release/nexrade-cache --port "$PORT" --metrics false --log-level warn &
+          PID=$!
+          trap 'kill $PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 50); do
+            if python3 -c "import socket; s=socket.create_connection(('127.0.0.1',$PORT),1); s.close()" 2>/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          python3 scripts/redis_py_smoke.py --host 127.0.0.1 --port "$PORT"
+          python3 scripts/redis_py_cluster_smoke.py --host 127.0.0.1 --port "$PORT"
+          python3 scripts/raw_resp_smoke.py --host 127.0.0.1 --port "$PORT"
+
+  # ─── Operations drill (1.2.0) ────────────────────────────────────────────────
+  # Validates the production profile end-to-end against the release
+  # binary: print-config, preflight, clean start/health/ready/metrics,
+  # clean shutdown, RDB restore, corrupt-AOF rejection, truncated-RDB
+  # rejection, unavailable-path rejection. Stdlib-only — no Python deps.
+  ops-drill:
+    name: Operations drill (--print-config, --preflight, RDB/AOF recovery)
+    runs-on: ubuntu-latest
+    if: >
+      github.ref == 'refs/heads/main' ||
+      github.base_ref == 'main' ||
+      github.base_ref == 'master'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ops-drill
+
+      - name: Build release nexrade-cache
+        run: cargo build --release -p nexrade-cache
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run operator drill
+        # Stdlib-only — no pip install needed for the drill itself.
+        run: python3 scripts/operator_drill.py --binary ./target/release/nexrade-cache
 
   # ─── Security audit ─────────────────────────────────────────────────────────
   # Removed standalone cargo-audit job — cargo-deny (below) covers advisory

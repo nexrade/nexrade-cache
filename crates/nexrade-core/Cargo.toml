@@ -11,6 +11,7 @@ default = []
 embedded = []
 
 [dependencies]
+crc32fast = "1"
 # Only the features actually used by nexrade-core (sync, time, rt).
 # Excludes `net` and other mio-backed features so this crate can compile
 # for wasm32-unknown-unknown (mio has no wasm support).

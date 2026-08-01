@@ -33,7 +33,7 @@ use tracing::info;
 
 use nexrade_core::db::{Db, ServerConfig};
 use nexrade_core::persistence::AofSync;
-use nexrade_metrics::{init_tracing, Metrics, MetricsServer};
+use nexrade_metrics::{init_tracing, HealthServer, Metrics, MetricsServer};
 use nexrade_server::Listener;
 
 #[derive(Parser, Debug)]
@@ -89,7 +89,11 @@ struct Cli {
     )]
     metrics: Option<bool>,
 
-    /// Metrics port (overrides the config file's [metrics].port)
+    /// Metrics server bind address (overrides the config file's [metrics].bind).
+    #[arg(long, env = "NEXRADE_METRICS_BIND")]
+    metrics_bind: Option<String>,
+
+    /// Metrics server port (overrides the config file's [metrics].port)
     #[arg(long, env = "NEXRADE_METRICS_PORT")]
     metrics_port: Option<u16>,
 
@@ -129,6 +133,12 @@ struct Cli {
     #[arg(long)]
     print_config: bool,
 
+    /// Run preflight checks (config, persistence validation) and exit.
+    /// Performs the same non-mutating validation as startup but does not
+    /// bind listeners, open files, or start tasks.
+    #[arg(long)]
+    preflight: bool,
+
     /// Install nexrade-cache as a Windows auto-start service (run as Administrator)
     #[cfg(windows)]
     #[arg(long)]
@@ -143,18 +153,53 @@ struct Cli {
     #[cfg(windows)]
     #[arg(long, hide = true)]
     service: bool,
+
+    /// Enable the operations health and readiness HTTP surface
+    /// (`/healthz` and `/readyz`).
+    #[arg(long, env = "NEXRADE_HEALTH")]
+    health: bool,
+
+    /// Health server bind address (overrides the config file's [health].bind).
+    #[arg(long, env = "NEXRADE_HEALTH_BIND")]
+    health_bind: Option<String>,
+
+    /// Health server port (overrides the config file's [health].port).
+    #[arg(long, env = "NEXRADE_HEALTH_PORT")]
+    health_port: Option<u16>,
+
+    /// Maximum snapshot age in seconds before the instance becomes not-ready
+    /// (overrides the config file's [health].max_snapshot_age_secs).
+    /// `0` disables this check.
+    #[arg(long, env = "NEXRADE_HEALTH_MAX_SNAPSHOT_AGE")]
+    health_max_snapshot_age: Option<u64>,
+
+    /// Maximum replica ACK age in seconds before the instance becomes not-ready
+    /// (overrides the config file's [health].max_replication_lag_secs).
+    /// `0` disables this check.
+    #[arg(long, env = "NEXRADE_HEALTH_MAX_REPLICATION_LAG")]
+    health_max_replication_lag: Option<u64>,
 }
 
 /// Build a [`ServerConfig`] from the parsed CLI arguments.
 fn config_from_cli(cli: &Cli) -> Result<ServerConfig> {
     let mut config = if let Some(ref config_path) = cli.config {
-        load_config_file(config_path)?
+        let mut c = load_config_file(config_path)?;
+        c.config_file_path = Some(config_path.clone());
+        c
     } else {
         ServerConfig::default()
     };
 
     if let Some(ref bind) = cli.bind {
         config.bind = bind.clone();
+    }
+    // After all `bind` overrides (file, CLI) have landed, default
+    // `metrics_bind` to the Redis listener's address when nothing
+    // explicitly set it. Prevents the metrics endpoint from
+    // accidentally drifting onto the wrong interface, while still
+    // allowing `--metrics-bind` / `[metrics].bind` to override it.
+    if config.metrics_bind.is_empty() {
+        config.metrics_bind = config.bind.clone();
     }
     if let Some(port) = cli.port {
         config.port = port;
@@ -189,6 +234,9 @@ fn config_from_cli(cli: &Cli) -> Result<ServerConfig> {
     if let Some(metrics) = cli.metrics {
         config.metrics_enabled = metrics;
     }
+    if let Some(ref metrics_bind) = cli.metrics_bind {
+        config.metrics_bind = metrics_bind.clone();
+    }
     if let Some(metrics_port) = cli.metrics_port {
         config.metrics_port = metrics_port;
     }
@@ -200,6 +248,21 @@ fn config_from_cli(cli: &Cli) -> Result<ServerConfig> {
     }
     if let Some(timeout) = cli.timeout {
         config.timeout = timeout;
+    }
+    if cli.health {
+        config.health.enabled = true;
+    }
+    if let Some(ref bind) = cli.health_bind {
+        config.health.bind = bind.clone();
+    }
+    if let Some(port) = cli.health_port {
+        config.health.port = port;
+    }
+    if let Some(age) = cli.health_max_snapshot_age {
+        config.health.max_snapshot_age_secs = if age == 0 { None } else { Some(age) };
+    }
+    if let Some(lag) = cli.health_max_replication_lag {
+        config.health.max_replication_lag_secs = if lag == 0 { None } else { Some(lag) };
     }
 
     // Relative RDB/AOF paths (the default `rdb_path` is just "nexrade.rdb")
@@ -246,15 +309,65 @@ pub(crate) async fn start_server(config: ServerConfig) -> Result<()> {
     // Initialize the database
     let db = Db::new(config.clone());
 
-    // Start metrics server
-    let metrics = if config.metrics_enabled {
+    // Start metrics server (Prometheus /metrics). Both metrics and
+    // health servers are spawned as background tasks: their `start`
+    // returns once the listener is bound so the main thread can move
+    // on to bind the redis port and start recovery.
+    let (metrics, metrics_handle) = if config.metrics_enabled {
         let m = Metrics::new();
-        MetricsServer::start(config.metrics_port, m.clone()).await;
+        // Use the dedicated `metrics_bind` field rather than `bind` so
+        // the data-plane and observability listeners can be scoped to
+        // different interfaces (e.g. Redis on 0.0.0.0 with requirepass,
+        // metrics on a sidecar-only address). The previous code wrote
+        // the metrics bind into `bind` and silently rebounded Redis.
+        let metrics_addr = format!("{}:{}", config.metrics_bind, config.metrics_port)
+            .parse()
+            .unwrap_or_else(|_| "127.0.0.1:9091".parse().unwrap());
+        let handle = MetricsServer::start(metrics_addr, m.clone()).await;
         info!(
             "metrics available at http://{}:{}/metrics",
-            config.bind, config.metrics_port
+            config.metrics_bind, config.metrics_port
         );
-        Some(m)
+        // Surface bind failure as a startup error: an operator who
+        // configured `[metrics] enabled = true` expects `/metrics` to
+        // be reachable. If the listener failed to bind (port in use,
+        // permission denied) we must not silently continue.
+        if handle.is_none() {
+            anyhow::bail!(
+                "failed to bind metrics server on {}:{} — port in use, \
+                 permissions, or interface missing?",
+                config.metrics_bind,
+                config.metrics_port
+            );
+        }
+        (Some(m), handle)
+    } else {
+        (None, None)
+    };
+
+    // Start health server (operations /healthz, /readyz) — bound to the
+    // configured `health.bind` so loopback production profiles are not
+    // reachable on the public interface.
+    let health_handle = if config.health.enabled {
+        let health_addr = format!("{}:{}", config.health.bind, config.health.port)
+            .parse()
+            .unwrap_or_else(|_| "127.0.0.1:9090".parse().unwrap());
+        let handle = HealthServer::start(health_addr, db.clone(), None).await;
+        info!(
+            "health endpoints available at http://{}:{}/healthz and /readyz",
+            config.health.bind, config.health.port
+        );
+        // Mirror the metrics bind-failure surfacing: an operator who
+        // explicitly enabled `[health]` expects the endpoints to work.
+        if handle.is_none() {
+            anyhow::bail!(
+                "failed to bind health server on {}:{} — port in use, \
+                 permissions, or interface missing?",
+                config.health.bind,
+                config.health.port
+            );
+        }
+        handle
     } else {
         None
     };
@@ -263,12 +376,34 @@ pub(crate) async fn start_server(config: ServerConfig) -> Result<()> {
     // TLS-upgraded accept loop on `tls_port` when `config.tls_enabled` is
     // set (see `nexrade_server::listener`) — both listeners run
     // concurrently and share the same shutdown signal.
+    //
+    // Clone the db handle so the lifecycle state stays addressable
+    // after `Listener::run` consumes `self`. A startup failure
+    // (corrupt RDB, invalid TLS, occupied port, …) must flip the
+    // lifecycle to `Failed` so `/healthz` returns 503 — otherwise a
+    // process that bound health but failed to bind the data plane
+    // would falsely advertise `live=true` to probes.
+    let db_for_failure = db.clone();
     let listener = Listener::new(db, metrics);
-    listener.run().await?;
+    if let Err(e) = listener.run().await {
+        db_for_failure
+            .lifecycle()
+            .set_phase(nexrade_core::health::HealthPhase::Failed);
+        return Err(e.context("startup failed"));
+    }
+
+    // Background servers have no shutdown signal wired in yet (the
+    // production profile defaults to disabled, so the operator opts in);
+    // they will exit when their accept loop is dropped on process exit.
+    let _ = metrics_handle;
+    let _ = health_handle;
 
     Ok(())
 }
 
+// Cap workers: redis-benchmark single-key write pipelines (LPUSH/SET) regress
+// hard when every core contends on one shard. 4 matches prior measured tables
+// and beats Redis on pipelined LPUSH after Compact front-headroom.
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -322,7 +457,119 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if cli.preflight {
+        return run_preflight(&config);
+    }
+
     start_server(config).await
+}
+
+/// Non-mutating startup checks — same validations the server runs before
+/// bind, but exits before binding listeners, opening files, or starting
+/// tasks. Exit code 0 means "would start cleanly", non-zero means a
+/// startup-relevant problem was found. Safe to run on any host as part
+/// of a deploy pipeline.
+fn run_preflight(config: &ServerConfig) -> Result<()> {
+    use std::path::Path;
+
+    let mut errors: Vec<String> = Vec::new();
+
+    // Bind address sanity: must parse to a SocketAddr (the CLI layer
+    // already validated the format; this is the post-merge check).
+    let bind_addr = format!("{}:{}", config.bind, config.port);
+    if bind_addr.parse::<std::net::SocketAddr>().is_err() {
+        errors.push(format!("bind address not parseable: {bind_addr}"));
+    }
+
+    // Recovery-source rule: RDB and AOF both configured is rejected at
+    // startup because the AOF replay would duplicate non-idempotent
+    // writes. Surface this here too so a deploy can fail before the
+    // server even reaches startup.
+    let rdb = config
+        .persistence
+        .rdb_path
+        .as_deref()
+        .filter(|p| !p.is_empty());
+    let aof = config
+        .persistence
+        .aof_path
+        .as_deref()
+        .filter(|p| !p.is_empty());
+    if rdb.is_some() && aof.is_some() {
+        errors.push(
+            "RDB and AOF sources both configured; pick exactly one \
+             authoritative recovery mode (the RDB+AOF combination is \
+             rejected at startup to avoid replaying non-idempotent writes)"
+                .to_string(),
+        );
+    }
+
+    // Persistence path parents: must exist and be writable when a path
+    // is configured. We don't create them — preflight is non-mutating.
+    for (label, path) in [("rdb_path", rdb), ("aof_path", aof)] {
+        if let Some(p) = path {
+            let parent = Path::new(p).parent().unwrap_or_else(|| Path::new("."));
+            if parent.as_os_str().is_empty() {
+                errors.push(format!("{label} '{p}' has no parent directory"));
+            } else if !parent.exists() {
+                errors.push(format!(
+                    "{label} '{p}' parent directory '{}' does not exist",
+                    parent.display()
+                ));
+            } else if std::fs::metadata(parent)
+                .map(|m| !m.is_dir())
+                .unwrap_or(true)
+            {
+                errors.push(format!(
+                    "{label} '{p}' parent '{}' is not a directory",
+                    parent.display()
+                ));
+            }
+        }
+    }
+
+    // RDB sanity: if the configured path already exists, verify the
+    // header + CRC32C (without decoding). Snapshot::verify is the same
+    // path the standalone recovery code uses; reusing it here means
+    // there is no second parser to drift.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(rdb_path) = rdb {
+        if Path::new(rdb_path).exists() {
+            if let Err(e) = nexrade_core::persistence::Snapshot::verify(rdb_path) {
+                errors.push(format!("RDB '{rdb_path}' failed integrity check: {e}"));
+            }
+        }
+    }
+
+    // AOF sanity: if the configured path already exists, stream-parse
+    // through clean EOF to catch truncation early. We deliberately
+    // don't apply the commands — preflight is non-mutating.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(aof_path) = aof {
+        if Path::new(aof_path).exists() {
+            match nexrade_core::persistence::AofReader::open(aof_path) {
+                Ok(mut reader) => {
+                    if let Err(e) = reader.scan_to_eof() {
+                        errors.push(format!("AOF '{aof_path}' parse failure: {e}"));
+                    }
+                }
+                Err(e) => errors.push(format!("AOF '{aof_path}' open failure: {e}")),
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        eprintln!("preflight: OK");
+        Ok(())
+    } else {
+        for e in &errors {
+            eprintln!("preflight: {e}");
+        }
+        Err(anyhow::anyhow!(
+            "preflight failed ({} error(s))",
+            errors.len()
+        ))
+    }
 }
 
 fn load_config_file(path: &str) -> Result<ServerConfig> {
@@ -468,8 +715,169 @@ fn load_config_file(path: &str) -> Result<ServerConfig> {
             .get("enabled")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
+        if let Some(bind) = metrics.get("bind").and_then(|v| v.as_str()) {
+            config.metrics_bind = bind.to_string();
+        }
         if let Some(port) = metrics.get("port").and_then(|v| v.as_integer()) {
             config.metrics_port = port as u16;
+        }
+    }
+    if let Some(health) = toml_val.get("health").and_then(|v| v.as_table()) {
+        config.health.enabled = health
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if let Some(bind) = health.get("bind").and_then(|v| v.as_str()) {
+            config.health.bind = bind.to_string();
+        }
+        if let Some(port) = health.get("port").and_then(|v| v.as_integer()) {
+            config.health.port = port as u16;
+        }
+        if let Some(age) = health
+            .get("max_snapshot_age_secs")
+            .and_then(|v| v.as_integer())
+        {
+            config.health.max_snapshot_age_secs = if age < 0 { None } else { Some(age as u64) };
+        }
+        if let Some(lag) = health
+            .get("max_replication_lag_secs")
+            .and_then(|v| v.as_integer())
+        {
+            config.health.max_replication_lag_secs = if lag < 0 { None } else { Some(lag as u64) };
+        }
+    }
+
+    // List dual-encoding thresholds (same keys as CONFIG REWRITE / CONFIG SET).
+    // Zero is rejected (same as CONFIG SET).
+    if let Some(v) = toml_val
+        .get("list_max_listpack_entries")
+        .and_then(|v| v.as_integer())
+    {
+        if v > 0 {
+            config.list_max_listpack_entries = v as usize;
+        }
+    }
+    if let Some(v) = toml_val
+        .get("list_max_listpack_size")
+        .and_then(|v| v.as_integer())
+    {
+        if v > 0 {
+            config.list_max_listpack_size = v as usize;
+        }
+    }
+    if let Some(v) = toml_val
+        .get("list_max_listpack_value")
+        .and_then(|v| v.as_integer())
+    {
+        if v > 0 {
+            config.list_max_listpack_value = v as usize;
+        }
+    }
+    if let Some(v) = toml_val
+        .get("list_demote_entries")
+        .and_then(|v| v.as_integer())
+    {
+        // demote_entries may be 0 (disable demote)
+        if v >= 0 {
+            config.list_demote_entries = v as usize;
+        }
+    }
+
+    // Hash / set / zset dual-encoding thresholds (CONFIG REWRITE / CONFIG SET).
+    if let Some(v) = toml_val
+        .get("hash_max_listpack_entries")
+        .and_then(|v| v.as_integer())
+    {
+        if v > 0 {
+            config.hash_max_listpack_entries = v as usize;
+        }
+    }
+    if let Some(v) = toml_val
+        .get("hash_max_listpack_size")
+        .and_then(|v| v.as_integer())
+    {
+        if v > 0 {
+            config.hash_max_listpack_size = v as usize;
+        }
+    }
+    if let Some(v) = toml_val
+        .get("hash_max_listpack_value")
+        .and_then(|v| v.as_integer())
+    {
+        if v > 0 {
+            config.hash_max_listpack_value = v as usize;
+        }
+    }
+    if let Some(v) = toml_val
+        .get("hash_demote_entries")
+        .and_then(|v| v.as_integer())
+    {
+        if v >= 0 {
+            config.hash_demote_entries = v as usize;
+        }
+    }
+    if let Some(v) = toml_val
+        .get("set_max_listpack_entries")
+        .and_then(|v| v.as_integer())
+    {
+        if v > 0 {
+            config.set_max_listpack_entries = v as usize;
+        }
+    }
+    if let Some(v) = toml_val
+        .get("set_max_listpack_size")
+        .and_then(|v| v.as_integer())
+    {
+        if v > 0 {
+            config.set_max_listpack_size = v as usize;
+        }
+    }
+    if let Some(v) = toml_val
+        .get("set_max_listpack_value")
+        .and_then(|v| v.as_integer())
+    {
+        if v > 0 {
+            config.set_max_listpack_value = v as usize;
+        }
+    }
+    if let Some(v) = toml_val
+        .get("set_demote_entries")
+        .and_then(|v| v.as_integer())
+    {
+        if v >= 0 {
+            config.set_demote_entries = v as usize;
+        }
+    }
+    if let Some(v) = toml_val
+        .get("zset_max_listpack_entries")
+        .and_then(|v| v.as_integer())
+    {
+        if v > 0 {
+            config.zset_max_listpack_entries = v as usize;
+        }
+    }
+    if let Some(v) = toml_val
+        .get("zset_max_listpack_size")
+        .and_then(|v| v.as_integer())
+    {
+        if v > 0 {
+            config.zset_max_listpack_size = v as usize;
+        }
+    }
+    if let Some(v) = toml_val
+        .get("zset_max_listpack_value")
+        .and_then(|v| v.as_integer())
+    {
+        if v > 0 {
+            config.zset_max_listpack_value = v as usize;
+        }
+    }
+    if let Some(v) = toml_val
+        .get("zset_demote_entries")
+        .and_then(|v| v.as_integer())
+    {
+        if v >= 0 {
+            config.zset_demote_entries = v as usize;
         }
     }
 
@@ -563,7 +971,29 @@ fn print_config(config: &ServerConfig) {
     println!();
     println!("[metrics]");
     println!("enabled = {}", config.metrics_enabled);
+    println!("bind = \"{}\"", config.metrics_bind);
     println!("port = {}", config.metrics_port);
+    println!();
+    println!("[health]");
+    println!("enabled = {}", config.health.enabled);
+    println!("bind = \"{}\"", config.health.bind);
+    println!("port = {}", config.health.port);
+    println!(
+        "max_snapshot_age_secs = {}",
+        config
+            .health
+            .max_snapshot_age_secs
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "disabled".to_string())
+    );
+    println!(
+        "max_replication_lag_secs = {}",
+        config
+            .health
+            .max_replication_lag_secs
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "disabled".to_string())
+    );
 }
 
 fn print_banner(config: &ServerConfig) {
@@ -581,6 +1011,7 @@ fn print_banner(config: &ServerConfig) {
     Databases      {}
     TLS            {}
     Metrics        http://{}:{}/metrics
+    Health         {}
     "#,
         // CARGO_PKG_VERSION is the workspace version (from
         // `[workspace.package].version` propagated via
@@ -592,8 +1023,16 @@ fn print_banner(config: &ServerConfig) {
         config.port,
         config.databases,
         if config.tls_enabled { "ON" } else { "OFF" },
-        config.bind,
-        config.metrics_port
+        config.metrics_bind,
+        config.metrics_port,
+        if config.health.enabled {
+            format!(
+                "http://{}:{}/healthz and /readyz",
+                config.health.bind, config.health.port
+            )
+        } else {
+            "OFF".to_string()
+        }
     );
 }
 
@@ -701,6 +1140,109 @@ time_limit_ms = 8000
     }
 
     #[test]
+    fn list_thresholds_are_parsed() {
+        let path = temp_config(
+            "list_thr",
+            r#"
+list_max_listpack_entries = 64
+list_max_listpack_size = 4096
+list_max_listpack_value = 128
+list_demote_entries = 32
+"#,
+        );
+        let cfg = load_config_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.list_max_listpack_entries, 64);
+        assert_eq!(cfg.list_max_listpack_value, 128);
+        assert_eq!(cfg.list_demote_entries, 32);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // Audit fix F1 (1.2.1): `--metrics-bind` and `[metrics].bind` must
+    // NOT clobber the Redis listener's `bind`. They populate the
+    // dedicated `metrics_bind` field, leaving `bind` alone.
+    #[test]
+    fn metrics_bind_does_not_overwrite_redis_bind() {
+        // File sets Redis bind = 0.0.0.0 and metrics_bind = 127.0.0.1;
+        // both must survive `load_config_file`.
+        let path = temp_config(
+            "metrics_bind_isolated",
+            r#"
+bind = "0.0.0.0"
+port = 16389
+
+[metrics]
+enabled = true
+bind = "127.0.0.1"
+port = 9091
+"#,
+        );
+        let cfg = load_config_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.bind, "0.0.0.0", "Redis bind must stay 0.0.0.0");
+        assert_eq!(
+            cfg.metrics_bind, "127.0.0.1",
+            "metrics_bind must be 127.0.0.1, not the Redis bind"
+        );
+        assert_eq!(cfg.metrics_port, 9091);
+        assert!(cfg.metrics_enabled);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // Audit fix F1: with no `[metrics].bind` set, `metrics_bind`
+    // defaults to `bind` after all overrides land. This preserves
+    // 1.1.x behavior where metrics + Redis shared the same bind.
+    #[test]
+    fn metrics_bind_defaults_to_redis_bind_when_unset() {
+        // No [metrics].bind in the file — after config_from_cli,
+        // metrics_bind should mirror the Redis bind.
+        let path = temp_config(
+            "metrics_bind_default",
+            r#"
+bind = "10.0.0.5"
+port = 6379
+
+[metrics]
+enabled = true
+"#,
+        );
+        let cli = Cli {
+            config: Some(path.to_str().unwrap().to_string()),
+            bind: None,
+            port: None,
+            databases: None,
+            requirepass: None,
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
+            tls_port: None,
+            metrics: None,
+            metrics_bind: None,
+            metrics_port: None,
+            log_level: "info".to_string(),
+            log_json: false,
+            max_clients: None,
+            maxmemory: None,
+            maxmemory_policy: None,
+            timeout: None,
+            rdb_path: None,
+            aof_path: None,
+            print_config: false,
+            preflight: false,
+            health: false,
+            health_bind: None,
+            health_port: None,
+            health_max_snapshot_age: None,
+            health_max_replication_lag: None,
+        };
+        let cfg = config_from_cli(&cli).unwrap();
+        assert_eq!(cfg.bind, "10.0.0.5");
+        assert_eq!(
+            cfg.metrics_bind, "10.0.0.5",
+            "metrics_bind must default to Redis bind when not set"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn cli_flag_overrides_file_but_absent_flag_keeps_file() {
         // File sets a non-default bind + max_clients; with no CLI flags those
         // file values must survive (regression test for CLI defaults that used
@@ -727,6 +1269,7 @@ port = 9099
             tls_key: None,
             tls_port: None,
             metrics: None,
+            metrics_bind: None,
             metrics_port: None,
             log_level: "info".to_string(),
             log_json: false,
@@ -737,6 +1280,12 @@ port = 9099
             rdb_path: None,
             aof_path: None,
             print_config: false,
+            preflight: false,
+            health: false,
+            health_bind: None,
+            health_port: None,
+            health_max_snapshot_age: None,
+            health_max_replication_lag: None,
         };
         let cfg = config_from_cli(&cli).unwrap();
         assert_eq!(cfg.bind, "0.0.0.0");

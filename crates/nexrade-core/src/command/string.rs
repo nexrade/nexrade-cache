@@ -17,10 +17,11 @@ pub async fn cmd_set(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
         return Err(NexradeError::WrongArity("set".to_string()));
     }
 
-    // Use Bytes for both key and value — SET is a refcount bump into the
-    // store instead of a full Vec copy. The Entry holds `DataType::String(Bytes)`.
-    let key = match args.get(1).and_then(|a| a.as_bytes()) {
-        Some(b) => b.clone(),
+    // Borrow key bytes — plain SET only needs `&[u8]` for shard + HashMap.
+    // Clone into owned Bytes only when the flagged path needs a Bytes key
+    // for `write_for`/`insert` (still a refcount bump, not a payload copy).
+    let key_bytes = match args.get(1).and_then(|a| a.as_bytes()) {
+        Some(b) => b,
         None => return Err(NexradeError::WrongArity("set".to_string())),
     };
     // Compact copy — do NOT refcount-clone the RESP buffer slice.
@@ -127,6 +128,24 @@ pub async fn cmd_set(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
         return Err(NexradeError::SyntaxError);
     }
 
+    // Plain SET k v — no flags. Avoid key Bytes clone + key.to_vec() + full
+    // Entry rebuild on the redis-benchmark hot path (existing same-length
+    // string overwrite).
+    let plain = !nx
+        && !xx
+        && !get
+        && !keepttl
+        && expiry.is_none()
+        && ifeq.is_none()
+        && ifgt.is_none()
+        && iflt.is_none();
+    if plain {
+        let mut store_db = db.store.db(db_index).write_for(key_bytes.as_ref());
+        store_db.set_plain(key_bytes.as_ref(), value);
+        return Ok(Resp::ok());
+    }
+
+    let key = key_bytes.clone();
     let mut store_db = db.store.db(db_index).write_for(&key);
 
     // GET option: return old value before SET
@@ -390,12 +409,20 @@ pub async fn cmd_mset(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     let mut pairs = Vec::with_capacity((args.len() - 1) / 2);
     let mut i = 1;
     while i + 1 < args.len() {
-        let key = get_bytes_vec(args, i, "MSET")?;
-        let val = get_bytes_vec(args, i + 1, "MSET")?;
-        pairs.push((key, Entry::new(DataType::String(Bytes::from(val)))));
+        // Compact copies (same as SET) — avoid pinning the parse buffer and
+        // avoid Vec→Bytes double allocation via get_bytes_vec + Bytes::from.
+        let key = match args.get(i).and_then(|a| a.as_bytes()) {
+            Some(b) => b.to_vec(),
+            None => return Err(NexradeError::WrongArity("mset".to_string())),
+        };
+        let val = match args.get(i + 1).and_then(|a| a.as_bytes()) {
+            Some(b) => Bytes::copy_from_slice(b),
+            None => return Err(NexradeError::WrongArity("mset".to_string())),
+        };
+        pairs.push((key, Entry::new(DataType::String(val))));
         i += 2;
     }
-    sdb.mset(pairs);
+    sdb.mset_async(pairs).await;
     Ok(Resp::ok())
 }
 
@@ -405,15 +432,21 @@ pub async fn cmd_msetnx(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
     }
     let sdb = db.store.db(db_index);
 
-    let mut pairs = Vec::new();
+    let mut pairs = Vec::with_capacity((args.len() - 1) / 2);
     let mut i = 1;
     while i + 1 < args.len() {
-        let key = get_bytes_vec(args, i, "MSETNX")?;
-        let val = get_bytes_vec(args, i + 1, "MSETNX")?;
-        pairs.push((key, Entry::new(DataType::String(Bytes::from(val)))));
+        let key = match args.get(i).and_then(|a| a.as_bytes()) {
+            Some(b) => b.to_vec(),
+            None => return Err(NexradeError::WrongArity("msetnx".to_string())),
+        };
+        let val = match args.get(i + 1).and_then(|a| a.as_bytes()) {
+            Some(b) => Bytes::copy_from_slice(b),
+            None => return Err(NexradeError::WrongArity("msetnx".to_string())),
+        };
+        pairs.push((key, Entry::new(DataType::String(val))));
         i += 2;
     }
-    let ok = sdb.msetnx(pairs);
+    let ok = sdb.msetnx_async(pairs).await;
     Ok(Resp::int(if ok { 1 } else { 0 }))
 }
 
@@ -600,34 +633,42 @@ pub async fn cmd_append(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
 
     let mut store_db = db.store.db(db_index).write_for(&key);
 
-    match store_db.get_mut(&key) {
+    // Vacant path: insert accounts for full entry (overhead + key + value).
+    // Existing key: in-place mut — adjust live_bytes by payload growth only.
+    let (resp, delta) = match store_db.get_mut(&key) {
         Some(e) => match &mut e.value {
             DataType::String(v) => {
+                let old_len = v.len();
                 let mut owned = v.to_vec();
                 owned.extend_from_slice(&val);
                 let len = owned.len() as i64;
+                let d = (owned.len() as isize) - (old_len as isize);
                 e.value = DataType::String(Bytes::from(owned));
-                Ok(Resp::int(len))
+                (Ok(Resp::int(len)), d)
             }
             // APPEND always demotes an int-encoded key to a raw String —
             // real Redis does the same (int encoding can't be appended to
             // in place). Build the concatenated bytes and replace the entry.
+            // Int payload is fixed at 8 bytes in estimate_entry_size.
             DataType::Int(cell) => {
                 let mut buf = itoa::Buffer::new();
                 let mut owned = buf.format(cell.load()).as_bytes().to_vec();
                 owned.extend_from_slice(&val);
                 let len = owned.len() as i64;
+                let d = (owned.len() as isize) - 8;
                 e.value = DataType::String(Bytes::from(owned));
-                Ok(Resp::int(len))
+                (Ok(Resp::int(len)), d)
             }
-            _ => Err(NexradeError::WrongType),
+            _ => (Err(NexradeError::WrongType), 0),
         },
         None => {
             let len = val.len() as i64;
             store_db.insert(key, Entry::new(DataType::String(Bytes::from(val))));
-            Ok(Resp::int(len))
+            (Ok(Resp::int(len)), 0)
         }
-    }
+    };
+    store_db.adjust_live_bytes(delta);
+    resp
 }
 
 pub async fn cmd_strlen(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
@@ -721,4 +762,180 @@ fn normalize_range_idx(idx: isize, len: isize) -> usize {
     } else {
         idx as usize
     }
+}
+
+/// `LCS key1 key2 [LEN] [IDX] [MINMATCHLEN len] [WITHMATCHLEN]`
+///
+/// Longest Common Subsequence of two string values (Redis 7). Binary-safe
+/// over the raw bytes of each key. Missing keys are treated as empty strings.
+pub async fn cmd_lcs(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    if args.len() < 3 {
+        return Err(NexradeError::WrongArity("lcs".to_string()));
+    }
+    let key1 = get_bytes_vec(args, 1, "LCS")?;
+    let key2 = get_bytes_vec(args, 2, "LCS")?;
+
+    let mut want_len = false;
+    let mut want_idx = false;
+    let mut min_match_len: usize = 0;
+    let mut with_match_len = false;
+    let mut i = 3;
+    while i < args.len() {
+        let opt = get_str(args, i, "LCS")?.to_uppercase();
+        match opt.as_str() {
+            "LEN" => {
+                want_len = true;
+                i += 1;
+            }
+            "IDX" => {
+                want_idx = true;
+                i += 1;
+            }
+            "MINMATCHLEN" => {
+                let n = get_i64(args, i + 1, "LCS")?;
+                if n < 0 {
+                    return Err(NexradeError::Generic(
+                        "ERR value is not an integer or out of range".to_string(),
+                    ));
+                }
+                min_match_len = n as usize;
+                i += 2;
+            }
+            "WITHMATCHLEN" => {
+                with_match_len = true;
+                i += 1;
+            }
+            _ => return Err(NexradeError::SyntaxError),
+        }
+    }
+
+    // Load both values (treat missing as empty; WrongType if non-string).
+    let sdb = db.store.db(db_index);
+    let a = {
+        let g = sdb.read_for(&key1);
+        match g.get_ro(&key1) {
+            None => Vec::new(),
+            Some(e) => e
+                .value
+                .as_string_bytes()
+                .map(|b| b.to_vec())
+                .ok_or(NexradeError::WrongType)?,
+        }
+    };
+    let b = {
+        let g = sdb.read_for(&key2);
+        match g.get_ro(&key2) {
+            None => Vec::new(),
+            Some(e) => e
+                .value
+                .as_string_bytes()
+                .map(|b| b.to_vec())
+                .ok_or(NexradeError::WrongType)?,
+        }
+    };
+
+    let (lcs_bytes, matches) = compute_lcs(&a, &b);
+
+    if want_len && !want_idx {
+        return Ok(Resp::int(lcs_bytes.len() as i64));
+    }
+
+    if want_idx {
+        // Filter matches by MINMATCHLEN, optionally attach length.
+        let mut match_items: Vec<Resp> = Vec::new();
+        for (a_start, a_end, b_start, b_end) in matches.into_iter().rev() {
+            // Inclusive end indices (Redis reports inclusive ranges).
+            let len = a_end - a_start;
+            if len < min_match_len {
+                continue;
+            }
+            let mut row = vec![
+                Resp::array(vec![
+                    Resp::int(a_start as i64),
+                    Resp::int((a_end - 1) as i64),
+                ]),
+                Resp::array(vec![
+                    Resp::int(b_start as i64),
+                    Resp::int((b_end - 1) as i64),
+                ]),
+            ];
+            if with_match_len {
+                row.push(Resp::int(len as i64));
+            }
+            match_items.push(Resp::array(row));
+        }
+        return Ok(Resp::array(vec![
+            Resp::bulk_str("matches"),
+            Resp::array(match_items),
+            Resp::bulk_str("len"),
+            Resp::int(lcs_bytes.len() as i64),
+        ]));
+    }
+
+    // Default: return the LCS bulk string.
+    Ok(Resp::bulk(Bytes::from(lcs_bytes)))
+}
+
+/// Contiguous LCS match range: (a_start, a_end_excl, b_start, b_end_excl).
+type LcsMatch = (usize, usize, usize, usize);
+
+/// Compute LCS of two byte strings.
+/// Returns (lcs_bytes, contiguous match ranges).
+fn compute_lcs(a: &[u8], b: &[u8]) -> (Vec<u8>, Vec<LcsMatch>) {
+    let n = a.len();
+    let m = b.len();
+    // DP table of (n+1) × (m+1). For large strings this is O(n*m) memory —
+    // Redis has the same bound; keep it simple for the compatibility surface.
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in 1..=n {
+        for j in 1..=m {
+            if a[i - 1] == b[j - 1] {
+                dp[i][j] = dp[i - 1][j - 1] + 1;
+            } else {
+                dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
+            }
+        }
+    }
+
+    // Backtrack to recover LCS bytes and per-character alignments.
+    let mut i = n;
+    let mut j = m;
+    let mut pairs: Vec<(usize, usize)> = Vec::new(); // (a_idx, b_idx)
+    while i > 0 && j > 0 {
+        if a[i - 1] == b[j - 1] {
+            pairs.push((i - 1, j - 1));
+            i -= 1;
+            j -= 1;
+        } else if dp[i - 1][j] >= dp[i][j - 1] {
+            i -= 1;
+        } else {
+            j -= 1;
+        }
+    }
+    pairs.reverse();
+
+    let lcs_bytes: Vec<u8> = pairs.iter().map(|&(ai, _)| a[ai]).collect();
+
+    // Collapse consecutive alignments into contiguous match ranges.
+    let mut matches: Vec<LcsMatch> = Vec::new();
+    if !pairs.is_empty() {
+        let (mut a0, mut b0) = pairs[0];
+        let mut a1 = a0 + 1;
+        let mut b1 = b0 + 1;
+        for &(ai, bi) in pairs.iter().skip(1) {
+            if ai == a1 && bi == b1 {
+                a1 += 1;
+                b1 += 1;
+            } else {
+                matches.push((a0, a1, b0, b1));
+                a0 = ai;
+                b0 = bi;
+                a1 = ai + 1;
+                b1 = bi + 1;
+            }
+        }
+        matches.push((a0, a1, b0, b1));
+    }
+
+    (lcs_bytes, matches)
 }

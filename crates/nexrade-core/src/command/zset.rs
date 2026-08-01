@@ -1,7 +1,6 @@
 //! Sorted Set command handlers.
 
 use bytes::Bytes;
-use ordered_float::OrderedFloat;
 
 use crate::command::get_f64;
 
@@ -10,7 +9,7 @@ use crate::command::{get_bytes_vec, get_i64, get_str};
 use crate::db::Db;
 use crate::error::{NexradeError, Result};
 use crate::resp::Resp;
-use crate::store::Entry;
+use crate::store::{glob_match, Entry};
 use crate::types::{DataType, ZSetData};
 
 fn get_or_create_zset<'a>(
@@ -110,15 +109,23 @@ pub async fn cmd_zadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
 
     let mut store_db = db.store.db(db_index).write_for(&key);
     let zset = get_or_create_zset(&mut store_db, &key)?;
+    // Payload is member bytes only (score is not counted). New members
+    // contribute +member.len(); score-only updates contribute 0.
+    let mut payload_delta: isize = 0;
 
     // INCR path: atomic score increment, returns the new score as a bulk
     // string. Only one (score, member) pair is allowed.
     if incr {
         let (delta, _) = parse_score_bound(get_str(args, i, "ZADD")?)?;
         let member = get_bytes_vec(args, i + 1, "ZADD")?;
+        let mlen = member.len() as isize;
         let old = zset.score(&member).unwrap_or(0.0);
         let new_score = old + delta;
-        zset.insert(member, new_score);
+        let added = zset.insert(member, new_score);
+        if added {
+            payload_delta += mlen;
+        }
+        store_db.adjust_live_bytes(payload_delta);
         // Drop the shard lock before notifying waiters.
         drop(store_db);
         db.notify_zset_waiters();
@@ -128,41 +135,53 @@ pub async fn cmd_zadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     let mut added = 0i64;
     let mut changed = 0i64;
 
+    // Fast path: plain ZADD with no NX/XX/GT/LT — insert does one scan
+    // and returns is_new; same-score is a no-op with changed=0.
+    let need_existing = nx || xx || gt || lt || ch;
     while i + 1 < args.len() {
         let (score, _) = parse_score_bound(get_str(args, i, "ZADD")?)?;
         let member = get_bytes_vec(args, i + 1, "ZADD")?;
+        let mlen = member.len() as isize;
         i += 2;
 
-        let existing_score = zset.score(&member);
+        if need_existing {
+            let existing_score = zset.score(&member);
 
-        if nx && existing_score.is_some() {
-            continue;
-        }
-        if xx && existing_score.is_none() {
-            continue;
-        }
-        if gt {
-            if let Some(old) = existing_score {
-                if score <= old {
-                    continue;
+            if nx && existing_score.is_some() {
+                continue;
+            }
+            if xx && existing_score.is_none() {
+                continue;
+            }
+            if gt {
+                if let Some(old) = existing_score {
+                    if score <= old {
+                        continue;
+                    }
                 }
             }
-        }
-        if lt {
-            if let Some(old) = existing_score {
-                if score >= old {
-                    continue;
+            if lt {
+                if let Some(old) = existing_score {
+                    if score >= old {
+                        continue;
+                    }
                 }
             }
-        }
 
-        let is_new = zset.insert(member, score);
-        if is_new {
+            let is_new = zset.insert(member, score);
+            if is_new {
+                added += 1;
+                payload_delta += mlen;
+            } else if existing_score.map(|old| old != score).unwrap_or(false) {
+                changed += 1;
+            }
+        } else if zset.insert(member, score) {
             added += 1;
-        } else if existing_score.map(|old| old != score).unwrap_or(false) {
-            changed += 1;
+            payload_delta += mlen;
         }
     }
+
+    store_db.adjust_live_bytes(payload_delta);
 
     // `added`/`changed` already track every successful insert — no separate
     // mutated flag. Wake BZMPOP only when the zset actually changed.
@@ -244,11 +263,17 @@ pub async fn cmd_zincrby(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp
     let member = get_bytes_vec(args, 3, "ZINCRBY")?;
 
     let mut store_db = db.store.db(db_index).write_for(&key);
-    let zset = get_or_create_zset(&mut store_db, &key)?;
-
-    let old = zset.score(&member).unwrap_or(0.0);
-    let new_score = old + delta;
-    zset.insert(member, new_score);
+    let (new_score, payload_delta) = {
+        let zset = get_or_create_zset(&mut store_db, &key)?;
+        let mlen = member.len() as isize;
+        let old = zset.score(&member).unwrap_or(0.0);
+        let new_score = old + delta;
+        // insert returns is_new; payload grows by member len only for a new
+        // member (score is not counted).
+        let is_new = zset.insert(member, new_score);
+        (new_score, if is_new { mlen } else { 0 })
+    };
+    store_db.adjust_live_bytes(payload_delta);
     drop(store_db);
     // Score change (or new member) must wake BZMPOP waiters.
     db.notify_zset_waiters();
@@ -274,24 +299,10 @@ async fn rank(db: &Db, args: &[Resp], db_index: usize, rev: bool, cmd: &str) -> 
     match store_db.get_ro(&key) {
         None => Ok(Resp::null()),
         Some(e) => match &e.value {
-            DataType::ZSet(z) => {
-                let score = match z.score(&member) {
-                    None => return Ok(Resp::null()),
-                    Some(s) => s,
-                };
-                let rank = z
-                    .by_score
-                    .keys()
-                    .position(|(s, m)| s.0 == score && m == &member)
-                    .ok_or_else(|| {
-                        NexradeError::Generic(
-                        "ERR internal: member found in members map but missing from score index"
-                            .to_string(),
-                    )
-                    })?;
-                let rank = if rev { z.len() - rank - 1 } else { rank };
-                Ok(Resp::int(rank as i64))
-            }
+            DataType::ZSet(z) => match z.rank(&member, rev) {
+                Some(rank) => Ok(Resp::int(rank as i64)),
+                None => Ok(Resp::null()),
+            },
             _ => Err(NexradeError::WrongType),
         },
     }
@@ -449,33 +460,9 @@ pub async fn cmd_zrangebylex(db: &Db, args: &[Resp], db_index: usize) -> Result<
         Some(e) => match &e.value {
             DataType::ZSet(z) => {
                 let result: Vec<Resp> = z
-                    .by_score
-                    .keys()
-                    .map(|(_, m)| m)
-                    .filter(|m| {
-                        let after_min = match &min_b {
-                            None => true,
-                            Some(b) => {
-                                if min_excl {
-                                    m.as_slice() > b.as_slice()
-                                } else {
-                                    m.as_slice() >= b.as_slice()
-                                }
-                            }
-                        };
-                        let before_max = match &max_b {
-                            None => true,
-                            Some(b) => {
-                                if max_excl {
-                                    m.as_slice() < b.as_slice()
-                                } else {
-                                    m.as_slice() <= b.as_slice()
-                                }
-                            }
-                        };
-                        after_min && before_max
-                    })
-                    .map(|m| Resp::bulk(Bytes::from(m.clone())))
+                    .range_by_lex_members(min_b.as_deref(), min_excl, max_b.as_deref(), max_excl)
+                    .into_iter()
+                    .map(|m| Resp::bulk(Bytes::from(m)))
                     .collect();
                 Ok(Resp::array(result))
             }
@@ -534,33 +521,8 @@ pub async fn cmd_zlexcount(db: &Db, args: &[Resp], db_index: usize) -> Result<Re
         Some(e) => match &e.value {
             DataType::ZSet(z) => {
                 let count = z
-                    .by_score
-                    .keys()
-                    .map(|(_, m)| m)
-                    .filter(|m| {
-                        let after_min = match &min_b {
-                            None => true,
-                            Some(b) => {
-                                if min_excl {
-                                    m.as_slice() > b.as_slice()
-                                } else {
-                                    m.as_slice() >= b.as_slice()
-                                }
-                            }
-                        };
-                        let before_max = match &max_b {
-                            None => true,
-                            Some(b) => {
-                                if max_excl {
-                                    m.as_slice() < b.as_slice()
-                                } else {
-                                    m.as_slice() <= b.as_slice()
-                                }
-                            }
-                        };
-                        after_min && before_max
-                    })
-                    .count() as i64;
+                    .range_by_lex_members(min_b.as_deref(), min_excl, max_b.as_deref(), max_excl)
+                    .len() as i64;
                 Ok(Resp::int(count))
             }
             _ => Err(NexradeError::WrongType),
@@ -575,23 +537,35 @@ pub async fn cmd_zrem(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     let key = get_bytes_vec(args, 1, "ZREM")?;
     let mut store_db = db.store.db(db_index).write_for(&key);
 
-    match store_db.get_mut(&key) {
+    let mut emptied = false;
+    let mut payload_delta: isize = 0;
+    let result = match store_db.get_mut(&key) {
         None => Ok(Resp::int(0)),
         Some(e) => match &mut e.value {
             DataType::ZSet(z) => {
                 let mut removed = 0i64;
+                let mut delta: isize = 0;
                 for i in 2..args.len() {
                     if let Ok(m) = get_bytes_vec(args, i, "ZREM") {
+                        let mlen = m.len() as isize;
                         if z.remove(&m).is_some() {
                             removed += 1;
+                            delta -= mlen;
                         }
                     }
                 }
+                payload_delta = delta;
+                emptied = z.is_empty();
                 Ok(Resp::int(removed))
             }
             _ => Err(NexradeError::WrongType),
         },
+    };
+    store_db.adjust_live_bytes(payload_delta);
+    if emptied {
+        store_db.remove_empty_key(&key);
     }
+    result
 }
 
 pub async fn cmd_zremrangebyrank(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
@@ -603,7 +577,9 @@ pub async fn cmd_zremrangebyrank(db: &Db, args: &[Resp], db_index: usize) -> Res
     let stop = get_i64(args, 3, "ZREMRANGEBYRANK")?;
 
     let mut store_db = db.store.db(db_index).write_for(&key);
-    match store_db.get_mut(&key) {
+    let mut emptied = false;
+    let mut payload_delta: isize = 0;
+    let result = match store_db.get_mut(&key) {
         None => Ok(Resp::int(0)),
         Some(e) => match &mut e.value {
             DataType::ZSet(z) => {
@@ -613,14 +589,23 @@ pub async fn cmd_zremrangebyrank(db: &Db, args: &[Resp], db_index: usize) -> Res
                     .map(|(m, _)| m)
                     .collect();
                 let count = to_remove.len() as i64;
+                let mut delta: isize = 0;
                 for m in to_remove {
+                    delta -= m.len() as isize;
                     z.remove(&m);
                 }
+                payload_delta = delta;
+                emptied = z.is_empty();
                 Ok(Resp::int(count))
             }
             _ => Err(NexradeError::WrongType),
         },
+    };
+    store_db.adjust_live_bytes(payload_delta);
+    if emptied {
+        store_db.remove_empty_key(&key);
     }
+    result
 }
 
 pub async fn cmd_zremrangebyscore(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
@@ -632,7 +617,9 @@ pub async fn cmd_zremrangebyscore(db: &Db, args: &[Resp], db_index: usize) -> Re
     let (max, max_excl) = parse_score_bound(get_str(args, 3, "ZREMRANGEBYSCORE")?)?;
 
     let mut store_db = db.store.db(db_index).write_for(&key);
-    match store_db.get_mut(&key) {
+    let mut emptied = false;
+    let mut payload_delta: isize = 0;
+    let result = match store_db.get_mut(&key) {
         None => Ok(Resp::int(0)),
         Some(e) => match &mut e.value {
             DataType::ZSet(z) => {
@@ -642,14 +629,23 @@ pub async fn cmd_zremrangebyscore(db: &Db, args: &[Resp], db_index: usize) -> Re
                     .map(|(m, _)| m)
                     .collect();
                 let count = to_remove.len() as i64;
+                let mut delta: isize = 0;
                 for m in to_remove {
+                    delta -= m.len() as isize;
                     z.remove(&m);
                 }
+                payload_delta = delta;
+                emptied = z.is_empty();
                 Ok(Resp::int(count))
             }
             _ => Err(NexradeError::WrongType),
         },
+    };
+    store_db.adjust_live_bytes(payload_delta);
+    if emptied {
+        store_db.remove_empty_key(&key);
     }
+    result
 }
 
 pub async fn cmd_zpopmin(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
@@ -678,78 +674,139 @@ async fn zpop(db: &Db, args: &[Resp], db_index: usize, max: bool, cmd: &str) -> 
     };
 
     let mut store_db = db.store.db(db_index).write_for(&key);
-    match store_db.get_mut(&key) {
+    let mut emptied = false;
+    let mut payload_delta: isize = 0;
+    let result = match store_db.get_mut(&key) {
         None => Ok(Resp::array(vec![])),
         Some(e) => match &mut e.value {
             DataType::ZSet(z) => {
+                let mut delta: isize = 0;
                 let mut result = Vec::new();
                 for _ in 0..count {
-                    let entry = if max {
-                        z.by_score.keys().next_back().cloned()
-                    } else {
-                        z.by_score.keys().next().cloned()
-                    };
-                    if let Some((score, member)) = entry {
-                        z.remove(&member);
+                    if let Some((score, member)) = z.pop_extreme(max) {
+                        delta -= member.len() as isize;
                         result.push(Resp::bulk(Bytes::from(member)));
-                        result.push(Resp::bulk_str(format_float(score.0)));
+                        result.push(Resp::bulk_str(format_float(score)));
                     } else {
                         break;
                     }
                 }
+                payload_delta = delta;
+                emptied = z.is_empty();
                 Ok(Resp::array(result))
             }
             _ => Err(NexradeError::WrongType),
         },
+    };
+    store_db.adjust_live_bytes(payload_delta);
+    if emptied {
+        store_db.remove_empty_key(&key);
     }
+    result
 }
 
+/// `ZRANDMEMBER key [count [WITHSCORES]]`
+///
+/// Without count: single bulk (or null). With count: flat array of members
+/// (or `[member, score, …]` when WITHSCORES). RESP3 nesting is applied by
+/// the connection layer when WITHSCORES is present.
 pub async fn cmd_zrandmember(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     if args.len() < 2 {
         return Err(NexradeError::WrongArity("zrandmember".to_string()));
     }
     let key = get_bytes_vec(args, 1, "ZRANDMEMBER")?;
-    let count = if args.len() >= 3 {
-        Some(get_i64(args, 2, "ZRANDMEMBER")?)
-    } else {
-        None
-    };
+
+    // Parse optional count + WITHSCORES. Redis requires count when WITHSCORES
+    // is used: `ZRANDMEMBER key WITHSCORES` is a syntax error.
+    let mut count: Option<i64> = None;
+    let mut withscores = false;
+    let mut i = 2;
+    if i < args.len() {
+        // First optional arg is count (integer). WITHSCORES alone is illegal.
+        match get_str(args, i, "ZRANDMEMBER") {
+            Ok(s) if s.eq_ignore_ascii_case("WITHSCORES") => {
+                return Err(NexradeError::SyntaxError);
+            }
+            Ok(s) => {
+                let n: i64 = s.parse().map_err(|_| NexradeError::NotInteger)?;
+                count = Some(n);
+                i += 1;
+            }
+            Err(_) => {}
+        }
+    }
+    if i < args.len() {
+        if get_str(args, i, "ZRANDMEMBER")?.eq_ignore_ascii_case("WITHSCORES") {
+            withscores = true;
+            i += 1;
+        } else {
+            return Err(NexradeError::SyntaxError);
+        }
+    }
+    if i != args.len() {
+        return Err(NexradeError::SyntaxError);
+    }
 
     let store_db = db.store.db(db_index).read_for(&key);
     match store_db.get_ro(&key) {
-        None => Ok(Resp::null()),
+        None => Ok(if count.is_some() {
+            Resp::array(vec![])
+        } else {
+            Resp::null()
+        }),
         Some(e) => match &e.value {
             DataType::ZSet(z) => {
-                let members: Vec<_> = z.members.keys().cloned().collect();
+                // Snapshot (member, score) pairs so WITHSCORES can look up scores
+                // without a second pass under the lock.
+                let pairs: Vec<(Vec<u8>, f64)> = z.to_pairs();
+                if pairs.is_empty() {
+                    return Ok(if count.is_some() {
+                        Resp::array(vec![])
+                    } else {
+                        Resp::null()
+                    });
+                }
+
+                let push_pair = |out: &mut Vec<Resp>, m: &[u8], score: f64| {
+                    out.push(Resp::bulk(Bytes::copy_from_slice(m)));
+                    if withscores {
+                        out.push(Resp::bulk_str(format_float(score)));
+                    }
+                };
+
                 match count {
                     None => {
-                        let idx = pseudo_rand_idx(members.len());
-                        Ok(members
-                            .get(idx)
-                            .map(|m| Resp::bulk(Bytes::from(m.clone())))
-                            .unwrap_or(Resp::null()))
+                        let idx = pseudo_rand_idx(pairs.len());
+                        let (m, s) = &pairs[idx];
+                        if withscores {
+                            // Unreachable: WITHSCORES without count is rejected
+                            // above. Kept for exhaustiveness.
+                            Ok(Resp::array(vec![
+                                Resp::bulk(Bytes::from(m.clone())),
+                                Resp::bulk_str(format_float(*s)),
+                            ]))
+                        } else {
+                            Ok(Resp::bulk(Bytes::from(m.clone())))
+                        }
                     }
                     Some(n) => {
-                        let result: Vec<Resp> = if n < 0 {
-                            // Negative count: allow duplicates, return exactly |n| elements.
-                            let count = n.unsigned_abs() as usize;
-                            (0..count)
-                                .map(|_| {
-                                    let idx = pseudo_rand_idx(members.len());
-                                    members
-                                        .get(idx)
-                                        .map(|m| Resp::bulk(Bytes::from(m.clone())))
-                                        .unwrap_or(Resp::null())
-                                })
-                                .collect()
+                        let mut result = Vec::new();
+                        if n < 0 {
+                            // Negative count: allow duplicates, return exactly |n|.
+                            let take = n.unsigned_abs() as usize;
+                            for _ in 0..take {
+                                let idx = pseudo_rand_idx(pairs.len());
+                                let (m, s) = &pairs[idx];
+                                push_pair(&mut result, m, *s);
+                            }
                         } else {
                             // Positive count: no duplicates, up to n elements.
-                            members
-                                .into_iter()
-                                .take(n as usize)
-                                .map(|m| Resp::bulk(Bytes::from(m)))
-                                .collect()
-                        };
+                            // Iterate in hash-map order (pseudo-random enough;
+                            // matches prior behaviour before WITHSCORES).
+                            for (m, s) in pairs.into_iter().take(n as usize) {
+                                push_pair(&mut result, &m, s);
+                            }
+                        }
                         Ok(Resp::array(result))
                     }
                 }
@@ -757,6 +814,102 @@ pub async fn cmd_zrandmember(db: &Db, args: &[Resp], db_index: usize) -> Result<
             _ => Err(NexradeError::WrongType),
         },
     }
+}
+
+/// `BZPOPMIN timeout key [key ...]` — blocking ZPOPMIN across keys.
+pub async fn cmd_bzpopmin(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    bzpop(db, args, db_index, false, "BZPOPMIN").await
+}
+
+/// `BZPOPMAX timeout key [key ...]` — blocking ZPOPMAX across keys.
+pub async fn cmd_bzpopmax(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    bzpop(db, args, db_index, true, "BZPOPMAX").await
+}
+
+async fn bzpop(db: &Db, args: &[Resp], db_index: usize, max: bool, cmd: &str) -> Result<Resp> {
+    // BZPOPMIN/MAX timeout key [key ...] — timeout is last arg (Redis shape).
+    if args.len() < 3 {
+        return Err(NexradeError::WrongArity(cmd.to_string()));
+    }
+    let timeout_secs = get_f64(args, args.len() - 1, cmd)?;
+    let keys: Vec<Vec<u8>> = (1..args.len() - 1)
+        .map(|i| get_bytes_vec(args, i, cmd))
+        .collect::<Result<_>>()?;
+
+    if let Some(resp) = bzpop_attempt(db, db_index, &keys, max)? {
+        return Ok(resp);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let dur = if timeout_secs == 0.0 {
+            std::time::Duration::from_secs(u64::MAX)
+        } else {
+            std::time::Duration::from_secs_f64(timeout_secs)
+        };
+        match tokio::time::timeout(dur, async {
+            let _parked = db.park_zset_waiter();
+            loop {
+                // Register for the next wake *before* re-checking emptiness
+                // so a producer that notifies between empty-check and park
+                // cannot be lost (tokio Notify is edge-triggered).
+                let notified = db.zset_chan.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                #[cfg(not(target_arch = "wasm32"))]
+                let _permit = match db.persistence.enter_mutation() {
+                    Some(p) => p,
+                    None => {
+                        return Err(NexradeError::Generic(
+                            "MISCONF persistence is quiescing; writes are temporarily disabled"
+                                .to_string(),
+                        ))
+                    }
+                };
+                if let Some(resp) = bzpop_attempt(db, db_index, &keys, max)? {
+                    return Ok::<Resp, NexradeError>(resp);
+                }
+                notified.await;
+            }
+        })
+        .await
+        {
+            Ok(resp) => Ok(resp?),
+            Err(_) => Ok(Resp::null_array()),
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = timeout_secs;
+        Ok(Resp::null_array())
+    }
+}
+
+/// Try to pop one member from the first non-empty zset among `keys`.
+/// Returns `[key, member, score]` on success, matching Redis BZPOPMIN/MAX.
+fn bzpop_attempt(db: &Db, db_index: usize, keys: &[Vec<u8>], max: bool) -> Result<Option<Resp>> {
+    for key in keys {
+        let mut store_db = db.store.db(db_index).write_for(key);
+        if let Some(entry) = store_db.get_mut(key) {
+            if let DataType::ZSet(z) = &mut entry.value {
+                if let Some((score, member)) = z.pop_extreme(max) {
+                    let emptied = z.is_empty();
+                    store_db.adjust_live_bytes(-(member.len() as isize));
+                    if emptied {
+                        store_db.remove_empty_key(key);
+                    }
+                    return Ok(Some(Resp::array(vec![
+                        Resp::bulk(Bytes::copy_from_slice(key)),
+                        Resp::bulk(Bytes::from(member)),
+                        Resp::bulk_str(format_float(score)),
+                    ])));
+                }
+            } else {
+                return Err(NexradeError::WrongType);
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -857,17 +1010,13 @@ fn parse_numkeys_for_set_op(args: &[Resp], idx: usize, cmd: &str) -> Result<usiz
 
 /// Convert a `ZSetData` to a RESP array, optionally with scores interleaved.
 fn zset_to_array(z: &crate::types::ZSetData, withscores: bool) -> Resp {
-    use std::collections::BTreeMap;
     // Iterate in score-ascending order (Redis default).
-    let mut sorted: BTreeMap<(OrderedFloat<f64>, Vec<u8>), ()> = BTreeMap::new();
-    for (m, s) in &z.members {
-        sorted.insert((*s, m.clone()), ());
-    }
+    let sorted = z.to_pairs_sorted();
     let mut out: Vec<Resp> = Vec::with_capacity(sorted.len() * (if withscores { 2 } else { 1 }));
-    for (score, member) in sorted.keys() {
-        out.push(Resp::bulk(Bytes::from(member.clone())));
+    for (member, score) in sorted {
+        out.push(Resp::bulk(Bytes::from(member)));
         if withscores {
-            out.push(Resp::bulk_str(format_float(score.0)));
+            out.push(Resp::bulk_str(format_float(score)));
         }
     }
     Resp::array(out)
@@ -887,10 +1036,10 @@ fn compute_zunion_result(
         if let Some(e) = sdb.write_for(key).get(key) {
             if let DataType::ZSet(z) = &e.value {
                 let weight = weights.get(i).copied().unwrap_or(1.0);
-                for (member, &score) in &z.members {
-                    let weighted = score.0 * weight;
-                    let new_score = apply_aggregate(agg, result.score(member), weighted);
-                    result.insert(member.clone(), new_score);
+                for (member, score) in z.to_pairs() {
+                    let weighted = score * weight;
+                    let new_score = apply_aggregate(agg, result.score(&member), weighted);
+                    result.insert(member, new_score);
                 }
             }
         }
@@ -922,11 +1071,11 @@ fn compute_zinter_result(
     if sets.is_empty() {
         return Ok(result);
     }
-    for (member, &score) in &sets[0].members {
-        let mut acc = score.0 * weights.first().copied().unwrap_or(1.0);
+    for (member, score) in sets[0].to_pairs() {
+        let mut acc = score * weights.first().copied().unwrap_or(1.0);
         let mut in_all = true;
         for (j, other) in sets[1..].iter().enumerate() {
-            if let Some(s) = other.score(member) {
+            if let Some(s) = other.score(&member) {
                 let weighted = s * weights.get(j + 1).copied().unwrap_or(1.0);
                 acc = apply_aggregate(agg, Some(acc), weighted);
             } else {
@@ -935,7 +1084,7 @@ fn compute_zinter_result(
             }
         }
         if in_all {
-            result.insert(member.clone(), acc);
+            result.insert(member, acc);
         }
     }
     Ok(result)
@@ -958,11 +1107,8 @@ fn compute_zdiff_result(db: &Db, db_index: usize, keys: &[Vec<u8>]) -> Result<ZS
     for key in keys.iter().skip(1) {
         if let Some(e) = sdb.write_for(key).get(key) {
             if let DataType::ZSet(z) = &e.value {
-                for member in z.members.keys() {
-                    result.members.remove(member);
-                    if let Some(&s) = z.members.get(member) {
-                        result.by_score.remove(&(s, member.clone()));
-                    }
+                for member in z.member_keys() {
+                    result.remove(&member);
                 }
             }
         }
@@ -1070,23 +1216,63 @@ pub async fn cmd_zinter(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
     Ok(zset_to_array(&result, withscores))
 }
 
+/// `ZSCAN key cursor [MATCH pattern] [COUNT count]`
 pub async fn cmd_zscan(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     if args.len() < 3 {
         return Err(NexradeError::WrongArity("zscan".to_string()));
     }
     let key = get_bytes_vec(args, 1, "ZSCAN")?;
-    let store_db = db.store.db(db_index).read_for(&key);
+    let cursor: u64 = get_i64(args, 2, "ZSCAN")
+        .ok()
+        .map(|n| n.max(0) as u64)
+        .unwrap_or(0);
 
+    let mut pattern: Option<Vec<u8>> = None;
+    let mut count: usize = 10;
+    let mut i = 3;
+    while i < args.len() {
+        let opt = get_str(args, i, "ZSCAN")?.to_uppercase();
+        match opt.as_str() {
+            "MATCH" => {
+                pattern = Some(get_bytes_vec(args, i + 1, "ZSCAN")?);
+                i += 2;
+            }
+            "COUNT" => {
+                let n = get_i64(args, i + 1, "ZSCAN")?;
+                if n <= 0 {
+                    return Err(NexradeError::Generic("syntax error".to_string()));
+                }
+                count = n as usize;
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let store_db = db.store.db(db_index).read_for(&key);
     match store_db.get_ro(&key) {
         None => Ok(Resp::array(vec![Resp::bulk_str("0"), Resp::array(vec![])])),
         Some(e) => match &e.value {
             DataType::ZSet(z) => {
-                let mut items = Vec::new();
-                for (member, &score) in &z.members {
-                    items.push(Resp::bulk(Bytes::from(member.clone())));
-                    items.push(Resp::bulk_str(format!("{}", score.0)));
+                let pat = pattern.unwrap_or_else(|| b"*".to_vec());
+                let mut pairs: Vec<(Vec<u8>, f64)> = z
+                    .to_pairs()
+                    .into_iter()
+                    .filter(|(m, _)| glob_match(&pat, m.as_slice()))
+                    .collect();
+                pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                let start = (cursor as usize).min(pairs.len());
+                let end = (start + count).min(pairs.len());
+                let next = if end >= pairs.len() { 0u64 } else { end as u64 };
+                let mut items = Vec::with_capacity((end - start) * 2);
+                for (m, score) in &pairs[start..end] {
+                    items.push(Resp::bulk(Bytes::from(m.clone())));
+                    items.push(Resp::bulk_str(format_float(*score)));
                 }
-                Ok(Resp::array(vec![Resp::bulk_str("0"), Resp::array(items)]))
+                Ok(Resp::array(vec![
+                    Resp::bulk_str(next.to_string()),
+                    Resp::array(items),
+                ]))
             }
             _ => Err(NexradeError::WrongType),
         },
@@ -1160,10 +1346,24 @@ pub async fn cmd_bzmpop(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
         match tokio::time::timeout(dur, async {
             let _parked = db.park_zset_waiter();
             loop {
-                db.zset_chan.notified().await;
+                // Register before re-check (see bzpop).
+                let notified = db.zset_chan.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                #[cfg(not(target_arch = "wasm32"))]
+                let _permit = match db.persistence.enter_mutation() {
+                    Some(p) => p,
+                    None => {
+                        return Err(NexradeError::Generic(
+                            "MISCONF persistence is quiescing; writes are temporarily disabled"
+                                .to_string(),
+                        ))
+                    }
+                };
                 if let Some(resp) = zmpop_attempt(db, db_index, &keys, min, count)? {
                     return Ok::<Resp, NexradeError>(resp);
                 }
+                notified.await;
             }
         })
         .await
@@ -1196,35 +1396,33 @@ fn zmpop_attempt(
     min: bool,
     count: usize,
 ) -> Result<Option<Resp>> {
-    use std::collections::BTreeSet;
     for key in keys {
         let mut store_db = db.store.db(db_index).write_for(key);
         if let Some(entry) = store_db.get_mut(key) {
             if let DataType::ZSet(z) = &mut entry.value {
-                if z.members.is_empty() {
+                if z.is_empty() {
                     continue;
                 }
-                // Snapshot scores+members, then pop `count` from the chosen end.
-                let mut sorted: BTreeSet<(OrderedFloat<f64>, Vec<u8>)> = BTreeSet::new();
-                for (m, s) in z.members.iter() {
-                    sorted.insert((*s, m.clone()));
-                }
-                let take: Box<dyn Iterator<Item = _>> = if min {
-                    Box::new(sorted.into_iter().take(count))
-                } else {
-                    Box::new(sorted.into_iter().rev().take(count))
-                };
+                let mut delta: isize = 0;
                 let mut popped: Vec<Resp> = Vec::with_capacity(count);
-                for (score, member) in take {
-                    z.members.remove(&member);
-                    z.by_score.remove(&(score, member.clone()));
+                for _ in 0..count {
+                    // min=true → pop lowest; min=false → pop highest
+                    let Some((score, member)) = z.pop_extreme(!min) else {
+                        break;
+                    };
+                    delta -= member.len() as isize;
                     popped.push(Resp::array(vec![
                         Resp::bulk(bytes::Bytes::from(member)),
-                        Resp::bulk_str(format_float(score.0)),
+                        Resp::bulk_str(format_float(score)),
                     ]));
                 }
                 if popped.is_empty() {
                     continue;
+                }
+                let emptied = z.is_empty();
+                store_db.adjust_live_bytes(delta);
+                if emptied {
+                    store_db.remove_empty_key(key);
                 }
                 return Ok(Some(Resp::array(vec![
                     Resp::bulk(bytes::Bytes::copy_from_slice(key)),
@@ -1390,8 +1588,8 @@ pub async fn cmd_zintercard(db: &Db, args: &[Resp], db_index: usize) -> Result<R
             None => return Ok(Resp::int(0)),
             Some(e) => match &e.value {
                 DataType::ZSet(z) => {
-                    if z.members.len() < smallest {
-                        smallest = z.members.len();
+                    if z.len() < smallest {
+                        smallest = z.len();
                         smallest_idx = i;
                     }
                     z.clone()
@@ -1414,8 +1612,8 @@ pub async fn cmd_zintercard(db: &Db, args: &[Resp], db_index: usize) -> Result<R
         }
     }
     let base = &sets[smallest_idx];
-    for member in base.members.keys() {
-        if other_idx.iter().all(|&i| sets[i].score(member).is_some()) {
+    for member in base.member_keys() {
+        if other_idx.iter().all(|&i| sets[i].score(&member).is_some()) {
             count += 1;
             if let Some(l) = limit {
                 if count as usize >= l {
@@ -1533,7 +1731,6 @@ fn range_by_lex(
     offset: usize,
     count: Option<usize>,
 ) -> Vec<(Vec<u8>, f64)> {
-    use std::collections::BTreeMap;
     let min_excl = min_s.starts_with('(');
     let max_excl = max_s.starts_with('(');
     let min_bytes: Option<Vec<u8>> = if min_s == "-" {
@@ -1546,31 +1743,17 @@ fn range_by_lex(
     } else {
         Some(max_s.trim_start_matches(['[', '(']).as_bytes().to_vec())
     };
-    // Lex sort: use BTreeMap keyed by member. Members with same score appear
-    // in lex order. For BYLEX we filter by member bytes alone.
-    let mut lex_sorted: BTreeMap<Vec<u8>, f64> = BTreeMap::new();
-    for (member, score) in &z.members {
-        if let Some(lo) = &min_bytes {
-            if min_excl {
-                if member.as_slice() <= lo.as_slice() {
-                    continue;
-                }
-            } else if member.as_slice() < lo.as_slice() {
-                continue;
-            }
-        }
-        if let Some(hi) = &max_bytes {
-            if max_excl {
-                if member.as_slice() >= hi.as_slice() {
-                    continue;
-                }
-            } else if member.as_slice() > hi.as_slice() {
-                continue;
-            }
-        }
-        lex_sorted.insert(member.clone(), score.0);
-    }
-    let mut out: Vec<(Vec<u8>, f64)> = lex_sorted.into_iter().collect();
+    // Members filtered by lex range, then paired with scores.
+    let members = z.range_by_lex_members(
+        min_bytes.as_deref(),
+        min_excl,
+        max_bytes.as_deref(),
+        max_excl,
+    );
+    let mut out: Vec<(Vec<u8>, f64)> = members
+        .into_iter()
+        .filter_map(|m| z.score(&m).map(|s| (m, s)))
+        .collect();
     if rev {
         out.reverse();
     }

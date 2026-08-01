@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.3"
+version = "1.2.1"
 edition = "2021"
 authors = ["Nexrade Contributors"]
 license = "MIT OR Apache-2.0"
@@ -66,8 +66,8 @@ uuid = { version = "1", features = ["v4", "js"] }
 # dashmap for concurrent access
 dashmap = "6"
 
-# parking_lot
-parking_lot = "0.12"
+# parking_lot — send_guard so RwLockWriteGuard is Send (0.5.0 MSET Option B foundation)
+parking_lot = { version = "0.12", features = ["send_guard"] }
 
 # ordered-float for sorted sets
 ordered-float = { version = "5", features = ["serde"] }

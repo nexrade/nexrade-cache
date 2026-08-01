@@ -368,7 +368,11 @@ pub async fn cmd_scan(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     if args.len() < 2 {
         return Err(NexradeError::WrongArity("scan".to_string()));
     }
-    // Simplified SCAN: cursor-based but we always return all in one shot (cursor=0)
+    let cursor: u64 = get_i64(args, 1, "SCAN")
+        .ok()
+        .map(|n| if n < 0 { 0 } else { n as u64 })
+        .unwrap_or(0);
+
     let mut pattern: Option<Vec<u8>> = None;
     let mut count: usize = 10;
     let mut type_filter: Option<String> = None;
@@ -398,8 +402,13 @@ pub async fn cmd_scan(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     }
 
     let sdb = db.store.db(db_index);
+    // Materialise the full key list once per SCAN round-trip and paginate
+    // deterministically. The cursor is a `u64` position into that sorted
+    // list — Redis clients treat any non-zero cursor as opaque, so this
+    // value is just a stable "resume here" token.
     let pat = pattern.unwrap_or_else(|| b"*".to_vec());
     let mut keys = sdb.keys_matching(&pat);
+    keys.sort();
 
     if let Some(ref t) = type_filter {
         let sdb2 = db.store.db(db_index);
@@ -411,15 +420,19 @@ pub async fn cmd_scan(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
         });
     }
 
-    // count is a hint only — since we always return cursor=0 (single shot),
-    // we must return all matching keys or scan_iter will terminate early.
-    let _ = count;
-    let result: Vec<Resp> = keys
-        .into_iter()
-        .map(|k| Resp::bulk(Bytes::from(k)))
-        .collect();
+    // Honour the `cursor` (start position). Cursor 0 = start from beginning.
+    let start = (cursor as usize).min(keys.len());
+    let end = (start + count).min(keys.len());
+    let next = if end >= keys.len() { 0u64 } else { end as u64 };
 
-    Ok(Resp::array(vec![Resp::bulk_str("0"), Resp::array(result)]))
+    let page: Vec<Resp> = keys[start..end]
+        .iter()
+        .map(|k| Resp::bulk(Bytes::from(k.clone())))
+        .collect();
+    Ok(Resp::array(vec![
+        Resp::bulk_str(next.to_string()),
+        Resp::array(page),
+    ]))
 }
 
 pub async fn cmd_randomkey(db: &Db, _args: &[Resp], db_index: usize) -> Result<Resp> {
@@ -513,12 +526,131 @@ pub async fn cmd_object(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
     }
 }
 
-pub async fn cmd_dump(_db: &Db, _args: &[Resp], _db_index: usize) -> Result<Resp> {
-    // Simplified: return null (serialized format would be complex)
-    Ok(Resp::null())
+/// Magic + version for nexrade-native DUMP payloads.
+/// Not Redis RDB-compatible — clients must treat this as opaque and only
+/// RESTORE it into nexrade-cache (or another process that understands `NEXD`).
+const DUMP_MAGIC: &[u8; 4] = b"NEXD";
+const DUMP_VERSION: u8 = 1;
+
+/// `DUMP key` — serialize the entry as a custom nexrade payload.
+/// Returns null when the key is missing (Redis-compatible).
+pub async fn cmd_dump(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    if args.len() != 2 {
+        return Err(NexradeError::WrongArity("dump".to_string()));
+    }
+    let key = get_bytes_vec(args, 1, "DUMP")?;
+    let store_db = db.store.db(db_index).read_for(&key);
+    let entry = match store_db.get_ro(&key) {
+        None => return Ok(Resp::null()),
+        Some(e) => e,
+    };
+    // Snapshot so we don't hold the shard lock across bincode.
+    let snapshot = entry.clone();
+    drop(store_db);
+
+    let body = bincode::serde::encode_to_vec(&snapshot, bincode::config::standard())
+        .map_err(|e| NexradeError::Generic(format!("ERR DUMP serialize failed: {e}")))?;
+    let mut out = Vec::with_capacity(5 + body.len());
+    out.extend_from_slice(DUMP_MAGIC);
+    out.push(DUMP_VERSION);
+    out.extend_from_slice(&body);
+    Ok(Resp::bulk(Bytes::from(out)))
 }
 
-pub async fn cmd_restore(_db: &Db, _args: &[Resp], _db_index: usize) -> Result<Resp> {
+/// `RESTORE key ttl payload [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ freq]`
+///
+/// `ttl` is relative milliseconds (0 = no expiry), unless `ABSTTL` is set, in
+/// which case it is an absolute unix-ms deadline. Only nexrade `NEXD` payloads
+/// produced by `DUMP` are accepted — Redis RDB dumps are rejected with a clear
+/// error so clients don't silently get a no-op.
+pub async fn cmd_restore(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    if args.len() < 4 {
+        return Err(NexradeError::WrongArity("restore".to_string()));
+    }
+    let key = get_bytes_vec(args, 1, "RESTORE")?;
+    let ttl_ms = get_i64(args, 2, "RESTORE")?;
+    let payload = match &args[3] {
+        Resp::BulkString(Some(b)) => b.as_ref(),
+        _ => {
+            return Err(NexradeError::Generic(
+                "ERR RESTORE payload must be a bulk string".to_string(),
+            ))
+        }
+    };
+
+    let mut replace = false;
+    let mut absttl = false;
+    let mut i = 4;
+    while i < args.len() {
+        let opt = get_str(args, i, "RESTORE")?.to_uppercase();
+        match opt.as_str() {
+            "REPLACE" => {
+                replace = true;
+                i += 1;
+            }
+            "ABSTTL" => {
+                absttl = true;
+                i += 1;
+            }
+            // IDLETIME / FREQ are accepted and ignored (Redis accepts them for
+            // LFU/LRU bookkeeping we don't persist in the DUMP payload).
+            "IDLETIME" | "FREQ" => {
+                i += 2;
+            }
+            _ => {
+                return Err(NexradeError::Generic("ERR syntax error".to_string()));
+            }
+        }
+    }
+
+    if payload.len() < 5 || &payload[..4] != DUMP_MAGIC {
+        return Err(NexradeError::Generic(
+            "ERR DUMP payload version or checksum are wrong — \
+             nexrade DUMP uses a custom NEXD format, not Redis RDB"
+                .to_string(),
+        ));
+    }
+    if payload[4] != DUMP_VERSION {
+        return Err(NexradeError::Generic(format!(
+            "ERR unsupported DUMP version {}",
+            payload[4]
+        )));
+    }
+    let (mut entry, _): (crate::store::Entry, usize) =
+        bincode::serde::decode_from_slice(&payload[5..], bincode::config::standard())
+            .map_err(|e| NexradeError::Generic(format!("ERR DUMP payload is corrupt: {e}")))?;
+
+    // Apply the TTL argument, overriding whatever expiry was in the payload.
+    if ttl_ms < 0 {
+        return Err(NexradeError::Generic(
+            "ERR Invalid TTL value, must be >= 0".to_string(),
+        ));
+    }
+    if ttl_ms == 0 && !absttl {
+        entry.expiry = None;
+    } else {
+        let deadline_ms = if absttl {
+            ttl_ms as u128
+        } else {
+            now_unix_ms().saturating_add(ttl_ms as u128)
+        };
+        // Past absolute deadline → key would already be expired; refuse rather
+        // than insert a ghost that lazy-expire would drop on first access.
+        if deadline_ms <= now_unix_ms() {
+            return Err(NexradeError::Generic(
+                "ERR Invalid TTL value, must be >= 0".to_string(),
+            ));
+        }
+        entry.expiry = Some(Expiry::from_ms(deadline_ms as u64));
+    }
+
+    let mut store_db = db.store.db(db_index).write_for(&key);
+    if !replace && store_db.get(&key).is_some() {
+        return Err(NexradeError::Generic(
+            "BUSYKEY Target key name already exists.".to_string(),
+        ));
+    }
+    store_db.insert(key, entry);
     Ok(Resp::ok())
 }
 
@@ -568,9 +700,9 @@ async fn sort_inner(
             None => return Ok(Resp::array(vec![])),
             Some(e) => match &e.value {
                 crate::types::DataType::List(l) => {
-                    ListOrSet::List(l.iter().map(|v| v.to_vec()).collect())
+                    ListOrSet::List(l.to_vec_bytes().into_iter().map(|v| v.to_vec()).collect())
                 }
-                crate::types::DataType::Set(s) => ListOrSet::Set(s.iter().cloned().collect()),
+                crate::types::DataType::Set(s) => ListOrSet::Set(s.to_vec()),
                 _ => return Err(NexradeError::WrongType),
             },
         }
@@ -580,59 +712,225 @@ async fn sort_inner(
             None => return Ok(Resp::array(vec![])),
             Some(e) => match &e.value {
                 crate::types::DataType::List(l) => {
-                    ListOrSet::List(l.iter().map(|v| v.to_vec()).collect())
+                    ListOrSet::List(l.to_vec_bytes().into_iter().map(|v| v.to_vec()).collect())
                 }
-                crate::types::DataType::Set(s) => ListOrSet::Set(s.iter().cloned().collect()),
+                crate::types::DataType::Set(s) => ListOrSet::Set(s.to_vec()),
                 _ => return Err(NexradeError::WrongType),
             },
         }
     };
 
-    // Pull the BY / LIMIT / GET / ASC|DESC / ALPHA options out so the
-    // remaining identical logic can run.
-    let alpha = args
-        .iter()
-        .any(|a| a.as_str().is_some_and(|s| s.eq_ignore_ascii_case("ALPHA")));
-    let desc = args
-        .iter()
-        .any(|a| a.as_str().is_some_and(|s| s.eq_ignore_ascii_case("DESC")));
-    let store_requested = !take_write_lock  // SORT_RO path runs this
-        && args
-            .iter()
-            .any(|a| a.as_str().is_some_and(|s| s.eq_ignore_ascii_case("STORE")));
-    debug_assert!(!store_requested, "STORE should have been rejected above");
-    let _ = store_requested;
+    // Pull the BY / LIMIT / GET / ASC|DESC / ALPHA / STORE options.
+    let mut alpha = false;
+    let mut desc = false;
+    let mut limit_offset: usize = 0;
+    let mut limit_count: Option<usize> = None;
+    let mut by_pattern: Option<Vec<u8>> = None;
+    let mut get_patterns: Vec<Vec<u8>> = Vec::new();
+    let mut store_dst: Option<Vec<u8>> = None;
+    let mut i = 2;
+    while i < args.len() {
+        let opt = args[i]
+            .as_str()
+            .map(|s| s.to_uppercase())
+            .unwrap_or_default();
+        match opt.as_str() {
+            "ASC" => {
+                desc = false;
+                i += 1;
+            }
+            "DESC" => {
+                desc = true;
+                i += 1;
+            }
+            "ALPHA" => {
+                alpha = true;
+                i += 1;
+            }
+            "LIMIT" => {
+                if i + 2 >= args.len() {
+                    return Err(NexradeError::Generic("syntax error".to_string()));
+                }
+                let off = get_i64(args, i + 1, "SORT")?;
+                let cnt = get_i64(args, i + 2, "SORT")?;
+                if off < 0 || cnt < 0 {
+                    return Err(NexradeError::Generic("syntax error".to_string()));
+                }
+                limit_offset = off as usize;
+                limit_count = Some(cnt as usize);
+                i += 3;
+            }
+            "BY" => {
+                if i + 1 >= args.len() {
+                    return Err(NexradeError::Generic("syntax error".to_string()));
+                }
+                by_pattern = Some(get_bytes_vec(args, i + 1, "SORT")?);
+                i += 2;
+            }
+            "GET" => {
+                if i + 1 >= args.len() {
+                    return Err(NexradeError::Generic("syntax error".to_string()));
+                }
+                get_patterns.push(get_bytes_vec(args, i + 1, "SORT")?);
+                i += 2;
+            }
+            "STORE" => {
+                if !take_write_lock {
+                    // SORT_RO already rejected STORE above, but be defensive.
+                    return Err(NexradeError::Generic(
+                        "ERR SORT_RO does not support STORE".to_string(),
+                    ));
+                }
+                if i + 1 >= args.len() {
+                    return Err(NexradeError::Generic("syntax error".to_string()));
+                }
+                store_dst = Some(get_bytes_vec(args, i + 1, "SORT")?);
+                i += 2;
+            }
+            _ => {
+                return Err(NexradeError::Generic("syntax error".to_string()));
+            }
+        }
+    }
 
     let mut items: Vec<Vec<u8>> = match items {
         ListOrSet::List(v) | ListOrSet::Set(v) => v,
     };
 
-    if alpha {
-        items.sort();
-    } else {
-        items.sort_by(|a, b| {
-            let a_n: f64 = std::str::from_utf8(a)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.0);
-            let b_n: f64 = std::str::from_utf8(b)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.0);
-            a_n.partial_cmp(&b_n).unwrap_or(std::cmp::Ordering::Equal)
-        });
-    }
+    // Resolve sort weights. Without BY, the element itself is the weight.
+    // With BY pattern (e.g. "weight_*"), substitute '*' with the element
+    // and look up that key's string value.
+    let sdb = db.store.db(db_index);
+    let lookup_string = |k: &[u8]| -> Option<Vec<u8>> {
+        sdb.read_for(k)
+            .get_ro(k)
+            .and_then(|e| e.value.as_string_bytes().map(|b| b.to_vec()))
+    };
+    let expand_pattern = |pat: &[u8], elem: &[u8]| -> Vec<u8> {
+        // Redis: first '*' in the pattern is replaced by the element.
+        if let Some(pos) = pat.iter().position(|&b| b == b'*') {
+            let mut out = Vec::with_capacity(pat.len() + elem.len());
+            out.extend_from_slice(&pat[..pos]);
+            out.extend_from_slice(elem);
+            out.extend_from_slice(&pat[pos + 1..]);
+            out
+        } else {
+            // No '*' → constant key for every element (Redis: don't sort).
+            pat.to_vec()
+        }
+    };
 
-    if desc {
+    let nosort = by_pattern
+        .as_ref()
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"nosort"));
+
+    if !nosort {
+        items.sort_by(|a, b| {
+            let weight = |elem: &[u8]| -> (Option<f64>, Vec<u8>) {
+                let raw = if let Some(ref pat) = by_pattern {
+                    lookup_string(&expand_pattern(pat, elem)).unwrap_or_default()
+                } else {
+                    elem.to_vec()
+                };
+                if alpha {
+                    (None, raw)
+                } else {
+                    let n = std::str::from_utf8(&raw)
+                        .ok()
+                        .and_then(|s| s.parse::<f64>().ok());
+                    (n, raw)
+                }
+            };
+            let (an, ar) = weight(a);
+            let (bn, br) = weight(b);
+            let ord = if alpha {
+                ar.cmp(&br)
+            } else {
+                match (an, bn) {
+                    (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => ar.cmp(&br),
+                }
+            };
+            if desc {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+    } else if desc {
         items.reverse();
     }
 
-    Ok(Resp::array(
-        items
-            .into_iter()
-            .map(|v| Resp::bulk(Bytes::from(v)))
-            .collect(),
-    ))
+    // LIMIT
+    let end = match limit_count {
+        Some(c) => (limit_offset + c).min(items.len()),
+        None => items.len(),
+    };
+    let start = limit_offset.min(items.len());
+    let page = if start >= end {
+        Vec::new()
+    } else {
+        items[start..end].to_vec()
+    };
+
+    // Build reply rows: plain elements, or GET-expanded values.
+    let mut rows: Vec<Resp> = Vec::new();
+    if get_patterns.is_empty() {
+        for elem in &page {
+            rows.push(Resp::bulk(Bytes::from(elem.clone())));
+        }
+    } else {
+        for elem in &page {
+            for pat in &get_patterns {
+                if pat == b"#" {
+                    rows.push(Resp::bulk(Bytes::from(elem.clone())));
+                } else {
+                    let k = expand_pattern(pat, elem);
+                    match lookup_string(&k) {
+                        Some(v) => rows.push(Resp::bulk(Bytes::from(v))),
+                        None => rows.push(Resp::null()),
+                    }
+                }
+            }
+        }
+    }
+
+    // STORE → write as a list and return the element count.
+    if let Some(dst) = store_dst {
+        use crate::list_data::ListData;
+        use crate::store::Entry;
+        use crate::types::DataType;
+        let mut list = ListData::new();
+        // When GET is used, Redis stores the GET results; otherwise the
+        // sorted elements themselves.
+        if get_patterns.is_empty() {
+            for elem in page {
+                list.push_back(Bytes::from(elem));
+            }
+        } else {
+            for r in &rows {
+                if let Resp::BulkString(Some(b)) = r {
+                    list.push_back(b.clone());
+                } else {
+                    // Null GET results are stored as empty strings (Redis).
+                    list.push_back(Bytes::new());
+                }
+            }
+        }
+        let n = list.len() as i64;
+        let mut shard = db.store.db(db_index).write_for(&dst);
+        if list.is_empty() {
+            shard.remove(&dst);
+            Ok(Resp::int(0))
+        } else {
+            shard.insert(dst, Entry::new(DataType::List(list)));
+            Ok(Resp::int(n))
+        }
+    } else {
+        Ok(Resp::array(rows))
+    }
 }
 
 pub async fn cmd_touch(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {

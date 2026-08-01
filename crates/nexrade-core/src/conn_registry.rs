@@ -55,6 +55,10 @@ pub struct ClientMeta {
     pub watch_keys: usize,
     /// `multi=-1` or the size of the queued transactions (0..N).
     pub multi: i64,
+    /// `CLIENT SETINFO LIB-NAME` (redis-py / go-redis / etc.).
+    pub lib_name: String,
+    /// `CLIENT SETINFO LIB-VER`.
+    pub lib_ver: String,
 }
 
 // Bitflag values for `ClientMeta.flags`. These match the official Redis
@@ -113,6 +117,8 @@ impl ConnectionRegistry {
             qbuf_free: 0,
             watch_keys: 0,
             multi: -1,
+            lib_name: String::new(),
+            lib_ver: String::new(),
         }));
         let kill_flag = Arc::new(AtomicBool::new(false));
         {
@@ -245,9 +251,19 @@ pub fn format_client_list_line(meta: &ClientMeta) -> String {
     let flags = flags_letters(meta.flags);
 
     let mut out = String::with_capacity(256);
+    let lib_name = if meta.lib_name.is_empty() {
+        ""
+    } else {
+        &meta.lib_name
+    };
+    let lib_ver = if meta.lib_ver.is_empty() {
+        ""
+    } else {
+        &meta.lib_ver
+    };
     let _ = write!(
         out,
-        "id={} addr={} laddr= fd=0 name={} age={} idle={} flags={} db={} sub={} psub={} multi={} watch={} qbuf={} qbuf-free={} argv-mem=0 multi-mem=0 tot-mem=0 rbs=16384 rbp=0 obl=0 oll=0 omem=0 events=r cmd={} user={} library-name= library-ver=",
+        "id={} addr={} laddr= fd=0 name={} age={} idle={} flags={} db={} sub={} psub={} multi={} watch={} qbuf={} qbuf-free={} argv-mem=0 multi-mem=0 tot-mem=0 rbs=16384 rbp=0 obl=0 oll=0 omem=0 events=r cmd={} user={} library-name={} library-ver={}",
         meta.id,
         meta.addr,
         name,
@@ -263,6 +279,8 @@ pub fn format_client_list_line(meta: &ClientMeta) -> String {
         meta.qbuf_free,
         last_cmd,
         meta.user,
+        lib_name,
+        lib_ver,
     );
     out
 }

@@ -207,15 +207,58 @@ fn setup_redis_table(lua: &Lua) -> mlua::Result<()> {
 
     lua.globals().set("redis", redis)?;
 
-    // cjson stub
+    // cjson — encode/decode JSON for Lua scripts (Redis ships lua-cjson).
     let cjson = lua.create_table()?;
     let encode = lua.create_function(|_, val: LuaValue| Ok(simple_lua_to_json(&val)))?;
-    let decode = lua.create_function(|_, _s: String| Ok(LuaValue::Nil))?;
+    let decode = lua.create_function(|lua, s: String| json_to_lua(lua, &s))?;
     cjson.set("encode", encode)?;
     cjson.set("decode", decode)?;
     lua.globals().set("cjson", cjson)?;
 
     Ok(())
+}
+
+/// Parse a JSON string into a Lua value (table / scalar / nil).
+fn json_to_lua<'lua>(lua: &'lua Lua, s: &str) -> mlua::Result<LuaValue<'lua>> {
+    let v: serde_json::Value = serde_json::from_str(s)
+        .map_err(|e| mlua::Error::RuntimeError(format!("cjson.decode: invalid JSON: {e}")))?;
+    json_value_to_lua(lua, &v)
+}
+
+fn json_value_to_lua<'lua>(lua: &'lua Lua, v: &serde_json::Value) -> mlua::Result<LuaValue<'lua>> {
+    match v {
+        serde_json::Value::Null => Ok(LuaValue::Nil),
+        serde_json::Value::Bool(b) => Ok(LuaValue::Boolean(*b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(LuaValue::Integer(i))
+            } else if let Some(u) = n.as_u64() {
+                // Fits i64? Prefer integer; else fall back to f64.
+                if u <= i64::MAX as u64 {
+                    Ok(LuaValue::Integer(u as i64))
+                } else {
+                    Ok(LuaValue::Number(u as f64))
+                }
+            } else {
+                Ok(LuaValue::Number(n.as_f64().unwrap_or(0.0)))
+            }
+        }
+        serde_json::Value::String(s) => Ok(LuaValue::String(lua.create_string(s)?)),
+        serde_json::Value::Array(arr) => {
+            let t = lua.create_table()?;
+            for (i, item) in arr.iter().enumerate() {
+                t.set(i + 1, json_value_to_lua(lua, item)?)?;
+            }
+            Ok(LuaValue::Table(t))
+        }
+        serde_json::Value::Object(map) => {
+            let t = lua.create_table()?;
+            for (k, item) in map {
+                t.set(k.as_str(), json_value_to_lua(lua, item)?)?;
+            }
+            Ok(LuaValue::Table(t))
+        }
+    }
 }
 
 fn multivalue_to_resp_args(args: mlua::MultiValue) -> mlua::Result<Vec<Resp>> {
@@ -359,5 +402,57 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(r, Resp::BulkString(Some(ref b)) if b.as_ref() == b"v"));
+    }
+
+    #[tokio::test]
+    async fn cjson_decode_parses_number_and_object() {
+        let e = engine();
+        let db = Db::default();
+
+        let r = e
+            .eval(
+                r#"return cjson.decode('42')"#,
+                vec![],
+                vec![],
+                db.clone(),
+                0,
+                "default",
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, Resp::Integer(42)),
+            "expected integer 42, got {r:?}"
+        );
+
+        let r = e
+            .eval(
+                r#"
+                local t = cjson.decode('{"a":1,"b":"x"}')
+                return {tostring(t.a), t.b}
+                "#,
+                vec![],
+                vec![],
+                db,
+                0,
+                "default",
+            )
+            .await
+            .unwrap();
+        match r {
+            Resp::Array(Some(parts)) => {
+                assert_eq!(parts.len(), 2, "{parts:?}");
+                // tostring(1) → "1"
+                assert!(
+                    matches!(&parts[0], Resp::BulkString(Some(b)) if b.as_ref() == b"1"),
+                    "{parts:?}"
+                );
+                assert!(
+                    matches!(&parts[1], Resp::BulkString(Some(b)) if b.as_ref() == b"x"),
+                    "{parts:?}"
+                );
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
     }
 }

@@ -1,13 +1,17 @@
 //! Core data types for nexrade-cache.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
+
+use crate::hash_data::HashData;
+use crate::list_data::ListData;
+use crate::set_data::SetData;
+pub use crate::zset_data::ZSetData;
 
 /// Atomic-backed integer cell — the storage for `DataType::Int`.
 ///
@@ -130,14 +134,14 @@ pub enum DataType {
     /// Redis-compatible `TYPE`/`OBJECT ENCODING` still report this as
     /// `string`/`int`, matching real Redis's int-encoded string.
     Int(Arc<AtomicIntCell>),
-    /// Doubly-linked list — elements stored as `Bytes` so clones are O(1) refcount bumps.
-    List(VecDeque<Bytes>),
-    /// Unordered set of unique strings
-    Set(HashSet<Vec<u8>>),
+    /// Doubly-linked or compact list — see [`ListData`].
+    List(ListData),
+    /// Unordered set of unique strings — see [`SetData`].
+    Set(SetData),
     /// Sorted set: member → score mapping, ordered by score
     ZSet(ZSetData),
-    /// Hash map of field → value
-    Hash(HashMap<Vec<u8>, Vec<u8>>),
+    /// Hash map of field → value — see [`HashData`].
+    Hash(HashData),
     /// Bit array (stored as Vec<u8>)
     Bitmap(Vec<u8>),
     /// HyperLogLog approximation (stored as raw bytes)
@@ -220,151 +224,14 @@ impl DataType {
             }
             // Always int-encoded by construction — no parse needed.
             DataType::Int(_) => "int",
-            DataType::List(_) => "listpack",
-            DataType::Set(s) => {
-                if s.len() <= 128 {
-                    "listpack"
-                } else {
-                    "hashtable"
-                }
-            }
-            DataType::ZSet(z) => {
-                if z.members.len() <= 128 {
-                    "listpack"
-                } else {
-                    "skiplist"
-                }
-            }
-            DataType::Hash(h) => {
-                if h.len() <= 128 {
-                    "listpack"
-                } else {
-                    "hashtable"
-                }
-            }
+            DataType::List(l) => l.encoding_name(),
+            DataType::Set(s) => s.encoding_name(),
+            DataType::ZSet(z) => z.encoding_name(),
+            DataType::Hash(h) => h.encoding_name(),
             DataType::Bitmap(_) => "raw",
             DataType::HyperLogLog(_) => "raw",
             DataType::Stream(_) => "stream",
             DataType::Geo(_) => "skiplist",
-        }
-    }
-}
-
-// ── Sorted Set ────────────────────────────────────────────────────────────────
-
-/// Sorted set data structure.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ZSetData {
-    /// member → score
-    pub members: HashMap<Vec<u8>, OrderedFloat<f64>>,
-    /// Sorted index: (score, member) → ()
-    pub by_score: BTreeMap<(OrderedFloat<f64>, Vec<u8>), ()>,
-}
-
-impl ZSetData {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn insert(&mut self, member: Vec<u8>, score: f64) -> bool {
-        let score = OrderedFloat(score);
-        // Single `members.entry()` probe instead of contains_key + get +
-        // insert. Also skips the by_score remove/insert churn when the
-        // score is unchanged (a no-op reinsert previously always paid for
-        // a BTreeMap round trip for nothing).
-        match self.members.entry(member.clone()) {
-            std::collections::hash_map::Entry::Occupied(mut o) => {
-                let old_score = *o.get();
-                if old_score != score {
-                    self.by_score.remove(&(old_score, member.clone()));
-                    self.by_score.insert((score, member), ());
-                }
-                *o.get_mut() = score;
-                false
-            }
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(score);
-                self.by_score.insert((score, member), ());
-                true
-            }
-        }
-    }
-
-    pub fn remove(&mut self, member: &[u8]) -> Option<f64> {
-        if let Some(score) = self.members.remove(member) {
-            self.by_score.remove(&(score, member.to_vec()));
-            Some(score.0)
-        } else {
-            None
-        }
-    }
-
-    pub fn score(&self, member: &[u8]) -> Option<f64> {
-        self.members.get(member).map(|s| s.0)
-    }
-
-    pub fn len(&self) -> usize {
-        self.members.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.members.is_empty()
-    }
-
-    pub fn range_by_rank(&self, start: isize, stop: isize, rev: bool) -> Vec<(Vec<u8>, f64)> {
-        let len = self.len() as isize;
-        let start = normalize_index(start, len).min(len as usize);
-        let stop = normalize_index(stop, len);
-        let mut entries: Vec<_> = self
-            .by_score
-            .keys()
-            .map(|(s, m)| (m.clone(), s.0))
-            .collect();
-        if rev {
-            entries.reverse();
-        }
-        if start >= entries.len() || start > stop {
-            return vec![];
-        }
-        let stop = stop.min(entries.len().saturating_sub(1));
-        entries[start..=stop].to_vec()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn range_by_score(
-        &self,
-        min: f64,
-        min_excl: bool,
-        max: f64,
-        max_excl: bool,
-        rev: bool,
-        offset: usize,
-        count: Option<usize>,
-    ) -> Vec<(Vec<u8>, f64)> {
-        let min_key = (OrderedFloat(min), vec![]);
-        // Use take_while on an open-ended range instead of an upper key bound.
-        // A fixed-length sentinel like [0xFF; 256] would exclude members with
-        // score == max whose byte representation exceeds that sentinel in the
-        // BTreeMap ordering, silently dropping valid entries.
-        let entries: Vec<_> = self
-            .by_score
-            .range(min_key..)
-            .take_while(|((s, _), _)| s.0 <= max)
-            .map(|((s, m), _)| (m.clone(), s.0))
-            .filter(|(_, s)| {
-                let ok_min = if min_excl { *s > min } else { *s >= min };
-                let ok_max = if max_excl { *s < max } else { *s <= max };
-                ok_min && ok_max
-            })
-            .collect();
-        let entries = if rev {
-            entries.into_iter().rev().collect::<Vec<_>>()
-        } else {
-            entries
-        };
-        let entries = entries.into_iter().skip(offset);
-        match count {
-            Some(n) => entries.take(n).collect(),
-            None => entries.collect(),
         }
     }
 }
@@ -376,6 +243,21 @@ impl ZSetData {
 pub struct StreamEntry {
     pub id: String,
     pub fields: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl StreamEntry {
+    /// Content-only payload (id + field key/value bytes). Matches
+    /// [`StreamData::estimated_size`] per-entry contribution so XADD/XDEL
+    /// can apply known `live_bytes` deltas without re-scanning the stream.
+    #[inline]
+    pub fn payload_bytes(&self) -> usize {
+        self.id.len()
+            + self
+                .fields
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>()
+    }
 }
 
 /// Pending-entry record (for XPENDING).
@@ -426,6 +308,14 @@ pub struct StreamData {
     pub entries: Vec<StreamEntry>,
     /// group name → group state
     pub groups: HashMap<Vec<u8>, ConsumerGroup>,
+    /// Last ID generated by XADD / set by XSETID. Independent of whether
+    /// the entry still exists (XDEL/XTRIM do not lower this). Empty means
+    /// "derive from entries" for backward-compatible RDB loads.
+    #[serde(default)]
+    pub last_id: String,
+    /// Monotonic entries-added counter (XADD increments; XSETID may set).
+    #[serde(default)]
+    pub entries_added: u64,
 }
 
 impl StreamData {
@@ -433,17 +323,19 @@ impl StreamData {
         Self::default()
     }
 
+    /// Effective last-generated id: explicit `last_id` if set, else last entry.
+    pub fn last_generated_id(&self) -> &str {
+        if !self.last_id.is_empty() {
+            &self.last_id
+        } else if let Some(e) = self.entries.last() {
+            &e.id
+        } else {
+            "0-0"
+        }
+    }
+
     pub fn estimated_size(&self) -> usize {
-        self.entries
-            .iter()
-            .map(|e| {
-                e.id.len()
-                    + e.fields
-                        .iter()
-                        .map(|(k, v)| k.len() + v.len())
-                        .sum::<usize>()
-            })
-            .sum()
+        self.entries.iter().map(StreamEntry::payload_bytes).sum()
     }
 }
 
@@ -469,14 +361,6 @@ impl GeoData {
 }
 
 // ── Utility ───────────────────────────────────────────────────────────────────
-
-fn normalize_index(idx: isize, len: isize) -> usize {
-    if idx < 0 {
-        (len + idx).max(0) as usize
-    } else {
-        idx as usize
-    }
-}
 
 /// Current millisecond timestamp.
 pub fn now_ms() -> u64 {

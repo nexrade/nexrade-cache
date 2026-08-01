@@ -1,9 +1,11 @@
 //! Prometheus metric definitions.
+//!
+//! Counters are constructed directly and registered into the owned
+//! `Registry` (not via the `register_*` macros that target a process-global
+//! registry). This lets a test or the listener create independent
+//! `Metrics` instances without panicking on duplicate registration.
 
-use prometheus::{
-    register_counter_vec, register_gauge_vec, register_histogram_vec, CounterVec, GaugeVec,
-    HistogramVec, Registry,
-};
+use prometheus::{CounterVec, GaugeVec, HistogramVec, Registry};
 use std::sync::Arc;
 
 /// All Prometheus metrics for nexrade-cache.
@@ -57,104 +59,155 @@ impl Metrics {
     pub fn new() -> Self {
         let registry = Arc::new(Registry::new());
 
-        macro_rules! reg {
-            ($e:expr) => {{
-                let m = $e;
-                registry.register(Box::new(m.clone())).unwrap();
-                m
-            }};
-        }
-
-        let commands_total = reg!(register_counter_vec!(
-            "nexrade_commands_total",
-            "Total number of commands processed",
-            &["cmd"]
-        )
-        .unwrap());
-
-        let command_errors_total = reg!(register_counter_vec!(
-            "nexrade_command_errors_total",
-            "Total number of command errors",
-            &["cmd"]
-        )
-        .unwrap());
-
-        let command_duration_seconds = reg!(register_histogram_vec!(
-            "nexrade_command_duration_seconds",
-            "Command execution latency",
+        let commands_total = CounterVec::new(
+            prometheus::Opts::new(
+                "nexrade_commands_total",
+                "Total number of commands processed",
+            ),
             &["cmd"],
-            vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
         )
-        .unwrap());
+        .unwrap();
+        registry.register(Box::new(commands_total.clone())).unwrap();
 
-        let connected_clients = reg!(register_gauge_vec!(
-            "nexrade_connected_clients",
-            "Number of active client connections",
-            &[]
+        let command_errors_total = CounterVec::new(
+            prometheus::Opts::new(
+                "nexrade_command_errors_total",
+                "Total number of command errors",
+            ),
+            &["cmd"],
         )
-        .unwrap());
+        .unwrap();
+        registry
+            .register(Box::new(command_errors_total.clone()))
+            .unwrap();
 
-        let connections_total = reg!(register_counter_vec!(
-            "nexrade_connections_total",
-            "Total number of connections accepted",
-            &[]
+        // 0.7.4: denser sub-ms buckets so p50/p99 under redis-benchmark
+        // (typically 50–200 µs) land in distinct bins instead of one
+        // coarse 100 µs bucket. Upper end kept for pathological spikes.
+        let command_duration_seconds = HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "nexrade_command_duration_seconds",
+                "Command execution latency",
+            )
+            .buckets(vec![
+                0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01,
+                0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            ]),
+            &["cmd"],
         )
-        .unwrap());
+        .unwrap();
+        registry
+            .register(Box::new(command_duration_seconds.clone()))
+            .unwrap();
 
-        let keyspace_hits_total = reg!(register_counter_vec!(
-            "nexrade_keyspace_hits_total",
-            "Number of successful lookups of keys in the main dictionary",
-            &["db"]
+        let connected_clients = GaugeVec::new(
+            prometheus::Opts::new(
+                "nexrade_connected_clients",
+                "Number of active client connections",
+            ),
+            &[],
         )
-        .unwrap());
+        .unwrap();
+        registry
+            .register(Box::new(connected_clients.clone()))
+            .unwrap();
 
-        let keyspace_misses_total = reg!(register_counter_vec!(
-            "nexrade_keyspace_misses_total",
-            "Number of failed lookups of keys in the main dictionary",
-            &["db"]
+        let connections_total = CounterVec::new(
+            prometheus::Opts::new(
+                "nexrade_connections_total",
+                "Total number of connections accepted",
+            ),
+            &[],
         )
-        .unwrap());
+        .unwrap();
+        registry
+            .register(Box::new(connections_total.clone()))
+            .unwrap();
 
-        let db_keys = reg!(register_gauge_vec!(
-            "nexrade_db_keys",
-            "Number of keys in each database",
-            &["db"]
+        let keyspace_hits_total = CounterVec::new(
+            prometheus::Opts::new(
+                "nexrade_keyspace_hits_total",
+                "Number of successful lookups of keys in the main dictionary",
+            ),
+            &["db"],
         )
-        .unwrap());
+        .unwrap();
+        registry
+            .register(Box::new(keyspace_hits_total.clone()))
+            .unwrap();
 
-        let memory_used_bytes = reg!(register_gauge_vec!(
-            "nexrade_memory_used_bytes",
-            "Estimated memory used by nexrade",
-            &[]
+        let keyspace_misses_total = CounterVec::new(
+            prometheus::Opts::new(
+                "nexrade_keyspace_misses_total",
+                "Number of failed lookups of keys in the main dictionary",
+            ),
+            &["db"],
         )
-        .unwrap());
+        .unwrap();
+        registry
+            .register(Box::new(keyspace_misses_total.clone()))
+            .unwrap();
 
-        let pubsub_channels = reg!(register_gauge_vec!(
-            "nexrade_pubsub_channels",
-            "Number of active pub/sub channels",
-            &[]
+        let db_keys = GaugeVec::new(
+            prometheus::Opts::new("nexrade_db_keys", "Number of keys in each database"),
+            &["db"],
         )
-        .unwrap());
+        .unwrap();
+        registry.register(Box::new(db_keys.clone())).unwrap();
 
-        let pubsub_messages_total = reg!(register_counter_vec!(
-            "nexrade_pubsub_messages_total",
-            "Total pub/sub messages published",
-            &["channel"]
+        let memory_used_bytes = GaugeVec::new(
+            prometheus::Opts::new(
+                "nexrade_memory_used_bytes",
+                "Estimated memory used by nexrade",
+            ),
+            &[],
         )
-        .unwrap());
+        .unwrap();
+        registry
+            .register(Box::new(memory_used_bytes.clone()))
+            .unwrap();
 
-        let rdb_saves_total =
-            reg!(
-                register_counter_vec!("nexrade_rdb_saves_total", "Total RDB snapshot saves", &[])
-                    .unwrap()
-            );
-
-        let aof_appends_total = reg!(register_counter_vec!(
-            "nexrade_aof_appends_total",
-            "Total AOF append operations",
-            &[]
+        let pubsub_channels = GaugeVec::new(
+            prometheus::Opts::new(
+                "nexrade_pubsub_channels",
+                "Number of active pub/sub channels",
+            ),
+            &[],
         )
-        .unwrap());
+        .unwrap();
+        registry
+            .register(Box::new(pubsub_channels.clone()))
+            .unwrap();
+
+        let pubsub_messages_total = CounterVec::new(
+            prometheus::Opts::new(
+                "nexrade_pubsub_messages_total",
+                "Total pub/sub messages published",
+            ),
+            &["channel"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(pubsub_messages_total.clone()))
+            .unwrap();
+
+        let rdb_saves_total = CounterVec::new(
+            prometheus::Opts::new("nexrade_rdb_saves_total", "Total RDB snapshot saves"),
+            &[],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(rdb_saves_total.clone()))
+            .unwrap();
+
+        let aof_appends_total = CounterVec::new(
+            prometheus::Opts::new("nexrade_aof_appends_total", "Total AOF append operations"),
+            &[],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(aof_appends_total.clone()))
+            .unwrap();
 
         Self {
             registry,

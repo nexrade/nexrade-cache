@@ -43,6 +43,8 @@ pub enum Resp {
 
 impl Resp {
     pub fn ok() -> Self {
+        // Small alloc; wire framing still cheap. (A `Raw` "+OK\r\n" would
+        // avoid the String but breaks many unit tests that match SimpleString.)
         Resp::SimpleString("OK".to_string())
     }
 
@@ -111,9 +113,18 @@ impl Resp {
         match self {
             Resp::SimpleString(s) => {
                 let b = buf.inner();
-                b.put_u8(b'+');
-                b.put(s.as_bytes());
-                b.put(&b"\r\n"[..]);
+                // 0.7.2: "+OK\r\n" / "+PONG\r\n" are the most common
+                // replies under redis-benchmark SET/PING. Write the static
+                // frame without walking the String.
+                if s == "OK" {
+                    b.put_slice(b"+OK\r\n");
+                } else if s == "PONG" {
+                    b.put_slice(b"+PONG\r\n");
+                } else {
+                    b.put_u8(b'+');
+                    b.put(s.as_bytes());
+                    b.put(&b"\r\n"[..]);
+                }
             }
             Resp::Error(s) => {
                 let b = buf.inner();
@@ -287,9 +298,11 @@ impl Resp {
         // Tight lower bound: array header + per-elem framing for 1-digit
         // lengths ($N\r\n\r\n = 5) + zero payload. Real payload is written
         // on top; BytesMut grows amortised if the estimate is short.
-        // Skip the reserve entirely when the caller already sized us.
+        // Skip the reserve entirely when the caller already sized us
+        // (LRANGE Compact/Linked pass exact `need` — 0.5.5).
         let min_needed = 4 + count * 8; // "*N\r\n" + "$n\r\n\r\n" rough
-        if buf.capacity().saturating_sub(buf.len()) < min_needed {
+        let remaining = buf.capacity().saturating_sub(buf.len());
+        if remaining < min_needed {
             // Conservative fallback for callers that didn't pre-size:
             // 14 framing + 64 typical small element under redis-benchmark.
             buf.reserve(23 + count * (14 + 64));
@@ -375,6 +388,16 @@ impl fmt::Display for Resp {
 /// Write an i64 to `buf` without heap allocation.
 #[inline]
 fn put_i64(buf: &mut BytesMut, n: i64) {
+    // 0.7.2: 0 and 1 dominate redis-benchmark integer replies
+    // (INCR/LPUSH/SADD return counts; MSETNX returns 0/1).
+    if n == 0 {
+        buf.put_u8(b'0');
+        return;
+    }
+    if n == 1 {
+        buf.put_u8(b'1');
+        return;
+    }
     let mut tmp = [0u8; 20];
     let mut pos = 20usize;
     let neg = n < 0;
@@ -527,6 +550,14 @@ impl Buf for SegBuf {
     }
 }
 
+/// Max bulk-string payload accepted by the parser (512 MiB).
+/// Matches Redis's practical upper bound and blocks trivial memory DoS.
+pub const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
+
+/// Max number of elements in a single RESP array / map / set / push.
+/// Large enough for real pipelines; small enough to stop `*999999999` OOM.
+pub const MAX_ARRAY_LEN: usize = 1_024_000;
+
 /// RESP protocol parser
 pub struct RespParser {
     buf: BytesMut,
@@ -534,8 +565,10 @@ pub struct RespParser {
 
 impl RespParser {
     pub fn new() -> Self {
+        // 0.7.2: 16 KiB matches the connection read_buf so a typical
+        // redis-benchmark -P 50 batch is absorbed without reallocation.
         Self {
-            buf: BytesMut::with_capacity(4096),
+            buf: BytesMut::with_capacity(16 * 1024),
         }
     }
 
@@ -649,6 +682,9 @@ fn parse_bulk_string(buf: &[u8]) -> std::result::Result<(Resp, usize), ParseErro
     }
 
     let len = len as usize;
+    if len > MAX_BULK_LEN {
+        return Err(ParseError::Invalid(format!("invalid bulk length: {}", len)));
+    }
     let total = header_len + len + 2; // +2 for trailing \r\n
     if buf.len() < total {
         return Err(ParseError::Incomplete);
@@ -684,6 +720,12 @@ fn parse_array(buf: &[u8]) -> std::result::Result<(Resp, usize), ParseError> {
     }
 
     let len = len as usize;
+    if len > MAX_ARRAY_LEN {
+        return Err(ParseError::Invalid(format!(
+            "invalid multibulk length: {}",
+            len
+        )));
+    }
     let mut items = Vec::with_capacity(len);
     let mut offset = header_len;
 
@@ -740,6 +782,12 @@ fn parse_resp3_map(buf: &[u8]) -> std::result::Result<(Resp, usize), ParseError>
     let count: usize = s
         .parse()
         .map_err(|_| ParseError::Invalid(format!("invalid map length: {}", s)))?;
+    if count > MAX_ARRAY_LEN {
+        return Err(ParseError::Invalid(format!(
+            "invalid map length: {}",
+            count
+        )));
+    }
     let mut pairs = Vec::with_capacity(count);
     let mut offset = header_len;
     for _ in 0..count {
@@ -759,6 +807,12 @@ fn parse_resp3_set(buf: &[u8]) -> std::result::Result<(Resp, usize), ParseError>
     let count: usize = s
         .parse()
         .map_err(|_| ParseError::Invalid(format!("invalid set length: {}", s)))?;
+    if count > MAX_ARRAY_LEN {
+        return Err(ParseError::Invalid(format!(
+            "invalid set length: {}",
+            count
+        )));
+    }
     let mut items = Vec::with_capacity(count);
     let mut offset = header_len;
     for _ in 0..count {
@@ -776,6 +830,12 @@ fn parse_resp3_push(buf: &[u8]) -> std::result::Result<(Resp, usize), ParseError
     let count: usize = s
         .parse()
         .map_err(|_| ParseError::Invalid(format!("invalid push length: {}", s)))?;
+    if count > MAX_ARRAY_LEN {
+        return Err(ParseError::Invalid(format!(
+            "invalid push length: {}",
+            count
+        )));
+    }
     let mut items = Vec::with_capacity(count);
     let mut offset = header_len;
     for _ in 0..count {

@@ -12,6 +12,15 @@
 pub const CLUSTER_SLOTS: u16 = 16384;
 pub const NODE_ID_LEN: usize = 40;
 
+/// 0.9.1: documented sentinel that no gossip frame is ever emitted
+/// by this server. Standalone deployment, single shard — there are no
+/// peers to gossip with. Tools that scan for gossip traffic (e.g. tcpdump
+/// during chaos drills) will see zero CLUSTER PING/PONG frames on port 6380.
+pub const MINIMAL_GOSSIP_INTERVAL_SECS: u64 = u64::MAX;
+/// 0.9.1: slot migration is closed for the 0.x series. See
+/// [`docs/cluster-compat.md`](../../docs/cluster-compat.md).
+pub const SLOT_MIGRATION_ENABLED: bool = false;
+
 /// CRC-16/CCITT-XMODEM — same algorithm as Redis's `keyHashSlot()` in
 /// `cluster.c`. Polynomial 0x1021, init 0, no input/output reflection,
 /// no final XOR. Table is byte-for-byte identical to Redis's
@@ -78,6 +87,35 @@ pub fn extract_hash_tag(key: &[u8]) -> &[u8] {
 /// key, modulo 16384.
 pub fn keyslot(key: &[u8]) -> u16 {
     crc16_hash(extract_hash_tag(key)) % CLUSTER_SLOTS
+}
+
+/// 0.9.0: assert every key hashes to the same slot (or hash tag group).
+///
+/// Returns `Ok(())` when all keys share a slot. Returns
+/// `Err(CROSSSLOT ...)` matching the Redis Cluster error string when
+/// at least one key falls outside. Used by the standalone server to
+/// reject multi-key commands with a Redis-compatible error so redis-py
+/// `RedisCluster` and other slot-aware tooling get a clean answer
+/// instead of silently cross-sharding results.
+pub fn check_same_slot(keys: &[&[u8]]) -> Result<(), String> {
+    if keys.len() < 2 {
+        return Ok(());
+    }
+    // Hash tags override per-key slots. If every key shares a `{tag}`
+    // they all share the tag's slot. Redis-cluster compat: only the
+    // tag's slot matters, not the literal key slot.
+    let base_slot = keyslot(keys[0]);
+    for k in &keys[1..] {
+        if keyslot(k) != base_slot {
+            return Err(format!(
+                "CROSSSLOT Keys in request don't hash to the same slot.                  Key '{}' hashes to slot {}, expected slot {}.                  nexrade-cache is a standalone server; either use single-key                  commands or share a {{hash_tag}} across the keys.",
+                String::from_utf8_lossy(k),
+                keyslot(k),
+                base_slot,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether `keyslot` is currently served by this server. For a

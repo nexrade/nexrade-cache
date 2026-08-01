@@ -57,15 +57,21 @@ pub async fn cmd_setbit(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
     // SETBIT mutates raw bytes in place, which an atomic `Int` cell has no
     // bytes to offer — demote to a plain `String` first (same decimal bytes
     // GET would have returned) so the shared match below can mutate a
-    // `Vec<u8>` uniformly. No-op for every other variant.
+    // `Vec<u8>` uniformly. Track the Int→String payload delta (decimal
+    // digit count − fixed 8-byte Int accounting) so live_bytes stays honest.
+    let mut demote_delta: isize = 0;
     if let Some(entry) = store_db.get_mut(&key) {
         if let DataType::Int(cell) = &entry.value {
-            entry.value = DataType::String(Bytes::from(cell.load().to_string().into_bytes()));
+            let s = cell.load().to_string().into_bytes();
+            demote_delta = (s.len() as isize) - 8;
+            entry.value = DataType::String(Bytes::from(s));
         }
     }
+    let mut grow_delta: isize = 0;
     let old_bit = match store_db.get_mut(&key) {
         Some(entry) => match &mut entry.value {
             DataType::String(s) => {
+                let old_len = s.len();
                 let mut bits = s.to_vec();
                 ensure_bitmap(&mut bits, byte_idx);
                 let old = (bits[byte_idx] >> bit_pos) & 1;
@@ -74,10 +80,12 @@ pub async fn cmd_setbit(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
                 } else {
                     bits[byte_idx] &= !(1 << bit_pos);
                 }
+                grow_delta = (bits.len() as isize) - (old_len as isize);
                 entry.value = DataType::String(Bytes::from(bits));
                 old as i64
             }
             DataType::Bitmap(v) => {
+                let old_len = v.len();
                 ensure_bitmap(v, byte_idx);
                 let old = (v[byte_idx] >> bit_pos) & 1;
                 if value == 1 {
@@ -85,11 +93,13 @@ pub async fn cmd_setbit(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
                 } else {
                     v[byte_idx] &= !(1 << bit_pos);
                 }
+                grow_delta = (v.len() as isize) - (old_len as isize);
                 old as i64
             }
             _ => return Err(NexradeError::WrongType),
         },
         None => {
+            // insert accounts for full entry (overhead + key + bitmap bytes).
             let mut bits = vec![0u8; byte_idx + 1];
             if value == 1 {
                 bits[byte_idx] |= 1 << bit_pos;
@@ -98,6 +108,7 @@ pub async fn cmd_setbit(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
             0
         }
     };
+    store_db.adjust_live_bytes(demote_delta + grow_delta);
 
     Ok(Resp::int(old_bit))
 }
@@ -405,14 +416,19 @@ pub async fn cmd_bitfield(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
                 // Demote an atomic Int cell to a plain String first — see
                 // the comment in cmd_setbit for why in-place byte mutation
                 // can't operate directly on the atomic representation.
+                // Track Int(8) → decimal-string payload so live_bytes stays honest.
+                let mut demote_delta: isize = 0;
                 if let Some(entry) = store_db.get_mut(&key) {
                     if let DataType::Int(cell) = &entry.value {
-                        entry.value =
-                            DataType::String(Bytes::from(cell.load().to_string().into_bytes()));
+                        let s = cell.load().to_string().into_bytes();
+                        demote_delta = (s.len() as isize) - 8;
+                        entry.value = DataType::String(Bytes::from(s));
                     }
                 }
+                let mut grow_delta: isize = 0;
                 let old_val = match store_db.get_mut(&key) {
                     None => {
+                        // insert accounts for full entry (overhead + key + bitmap).
                         let byte_len = (bit_offset + bits).div_ceil(8);
                         let mut v = vec![0u8; byte_len];
                         write_bitfield(&mut v, bit_offset, bits, signed, new_val, overflow);
@@ -421,6 +437,7 @@ pub async fn cmd_bitfield(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
                     }
                     Some(entry) => match &mut entry.value {
                         DataType::String(s) => {
+                            let old_len = s.len();
                             let mut v = s.to_vec();
                             let byte_len = (bit_offset + bits).div_ceil(8);
                             if v.len() < byte_len {
@@ -428,21 +445,25 @@ pub async fn cmd_bitfield(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
                             }
                             let old = read_bitfield(&v, bit_offset, bits, signed);
                             write_bitfield(&mut v, bit_offset, bits, signed, new_val, overflow);
+                            grow_delta = (v.len() as isize) - (old_len as isize);
                             entry.value = DataType::String(Bytes::from(v));
                             old
                         }
                         DataType::Bitmap(v) => {
+                            let old_len = v.len();
                             let byte_len = (bit_offset + bits).div_ceil(8);
                             if v.len() < byte_len {
                                 v.resize(byte_len, 0);
                             }
                             let old = read_bitfield(v, bit_offset, bits, signed);
                             write_bitfield(v, bit_offset, bits, signed, new_val, overflow);
+                            grow_delta = (v.len() as isize) - (old_len as isize);
                             old
                         }
                         _ => return Err(NexradeError::WrongType),
                     },
                 };
+                store_db.adjust_live_bytes(demote_delta + grow_delta);
                 responses.push(Resp::int(old_val));
             }
             "INCRBY" => {
@@ -451,14 +472,18 @@ pub async fn cmd_bitfield(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
                 i += 4;
                 let mut store_db = db.store.db(db_index).write_for(&key);
                 // Same Int-cell demotion as BITFIELD SET above.
+                let mut demote_delta: isize = 0;
                 if let Some(entry) = store_db.get_mut(&key) {
                     if let DataType::Int(cell) = &entry.value {
-                        entry.value =
-                            DataType::String(Bytes::from(cell.load().to_string().into_bytes()));
+                        let s = cell.load().to_string().into_bytes();
+                        demote_delta = (s.len() as isize) - 8;
+                        entry.value = DataType::String(Bytes::from(s));
                     }
                 }
+                let mut grow_delta: isize = 0;
                 let new_val = match store_db.get_mut(&key) {
                     None => {
+                        // insert accounts for full entry.
                         let byte_len = (bit_offset + bits).div_ceil(8);
                         let mut v = vec![0u8; byte_len];
                         let result = overflow_add(0, incr, bits, signed, overflow);
@@ -472,6 +497,7 @@ pub async fn cmd_bitfield(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
                     }
                     Some(entry) => match &mut entry.value {
                         DataType::String(s) => {
+                            let old_len = s.len();
                             let mut v = s.to_vec();
                             let byte_len = (bit_offset + bits).div_ceil(8);
                             if v.len() < byte_len {
@@ -485,25 +511,31 @@ pub async fn cmd_bitfield(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
                                 } else {
                                     None
                                 };
+                            grow_delta = (v.len() as isize) - (old_len as isize);
                             entry.value = DataType::String(Bytes::from(v));
                             out
                         }
                         DataType::Bitmap(v) => {
+                            let old_len = v.len();
                             let byte_len = (bit_offset + bits).div_ceil(8);
                             if v.len() < byte_len {
                                 v.resize(byte_len, 0);
                             }
                             let cur = read_bitfield(v, bit_offset, bits, signed);
-                            if let Some(r) = overflow_add(cur, incr, bits, signed, overflow) {
-                                write_bitfield(v, bit_offset, bits, signed, r, overflow);
-                                Some(r)
-                            } else {
-                                None
-                            }
+                            let out =
+                                if let Some(r) = overflow_add(cur, incr, bits, signed, overflow) {
+                                    write_bitfield(v, bit_offset, bits, signed, r, overflow);
+                                    Some(r)
+                                } else {
+                                    None
+                                };
+                            grow_delta = (v.len() as isize) - (old_len as isize);
+                            out
                         }
                         _ => return Err(NexradeError::WrongType),
                     },
                 };
+                store_db.adjust_live_bytes(demote_delta + grow_delta);
                 responses.push(match new_val {
                     Some(v) => Resp::int(v),
                     None => Resp::null(),
@@ -516,6 +548,36 @@ pub async fn cmd_bitfield(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
     }
 
     Ok(Resp::Array(Some(responses)))
+}
+
+/// `BITFIELD_RO key [GET type offset] …`
+///
+/// Read-only BITFIELD: only GET subcommands are allowed. SET/INCRBY/OVERFLOW
+/// are rejected so the command is safe on replicas and under ACL `@read`.
+pub async fn cmd_bitfield_ro(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    if args.len() < 2 {
+        return Err(NexradeError::WrongArity("bitfield_ro".to_string()));
+    }
+    // Reject any write subcommand early with a clear error.
+    let mut i = 2;
+    while i < args.len() {
+        let sub = get_str(args, i, "BITFIELD_RO")?.to_uppercase();
+        match sub.as_str() {
+            "GET" => i += 3,
+            "SET" | "INCRBY" | "OVERFLOW" => {
+                return Err(NexradeError::Generic(
+                    "ERR BITFIELD_RO only supports the GET subcommand".to_string(),
+                ));
+            }
+            _ => {
+                return Err(NexradeError::Generic(format!(
+                    "ERR unknown BITFIELD_RO subcommand '{sub}'"
+                )));
+            }
+        }
+    }
+    // Reuse the full BITFIELD path — GET never mutates.
+    cmd_bitfield(db, args, db_index).await
 }
 
 // ── BITFIELD helpers ──────────────────────────────────────────────────────────

@@ -60,13 +60,22 @@ fn parse_id_bound(s: &str, is_start: bool, allow_dollar: bool) -> Result<StreamI
     })
 }
 
-/// Largest parsed id in the stream, or None if empty / all entries are
-/// malformed. Used for `XADD ... ms-*` validation.
+/// Largest parsed id in the stream for XADD validation.
+/// Prefers the explicit `last_id` (set by XADD / XSETID) over scanning
+/// entries, so XDEL/XTRIM cannot make XADD accept a smaller ID.
 fn last_parsed_id(s: &StreamData) -> Option<StreamId> {
-    s.entries
+    let from_field = StreamId::parse(s.last_generated_id());
+    let from_entries = s
+        .entries
         .iter()
         .filter_map(|e| StreamId::parse(&e.id))
-        .max()
+        .max();
+    match (from_field, from_entries) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
 fn format_stream_entry(entry: &StreamEntry) -> Resp {
@@ -144,10 +153,16 @@ pub async fn cmd_xadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
         id: id.clone(),
         fields,
     };
+    // Content-only payload of the new entry. get_stream_mut insert (empty
+    // shell) is already counted; only the entry payload is incremental.
+    let entry_delta = entry.payload_bytes() as isize;
 
     let mut store_db = db.store.db(db_index).write_for(&key);
     let stream = get_stream_mut!(store_db, key);
     stream.entries.push(entry);
+    stream.last_id = id.clone();
+    stream.entries_added = stream.entries_added.saturating_add(1);
+    store_db.adjust_live_bytes(entry_delta);
 
     // Wake any XREAD/XREADGROUP BLOCK callers waiting on this shard. The
     // re-check inside their wait loop filters by key, so cross-stream
@@ -156,6 +171,71 @@ pub async fn cmd_xadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     db.notify_stream_waiters();
 
     Ok(Resp::bulk_str(id))
+}
+
+// ── XSETID ────────────────────────────────────────────────────────────────────
+
+/// `XSETID key last-id [ENTRIESADDED count] [MAXDELETEDID id]`
+///
+/// Sets the stream's last-generated-id without adding an entry. Used by
+/// replication/migration so subsequent auto-IDs continue past a known top.
+/// Rejects an id smaller than the current last-generated-id (Redis behaviour).
+pub async fn cmd_xsetid(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    if args.len() < 3 {
+        return Err(NexradeError::WrongArity("xsetid".to_string()));
+    }
+    let key = get_bytes_vec(args, 1, "XSETID")?;
+    let new_id_str = get_str(args, 2, "XSETID")?;
+    let new_id = StreamId::parse(new_id_str).ok_or_else(|| {
+        NexradeError::Generic(
+            "ERR Invalid stream ID specified as stream command argument".to_string(),
+        )
+    })?;
+
+    let mut entries_added: Option<u64> = None;
+    let mut i = 3;
+    while i < args.len() {
+        let opt = get_str(args, i, "XSETID")?.to_uppercase();
+        match opt.as_str() {
+            "ENTRIESADDED" => {
+                let n = get_i64(args, i + 1, "XSETID")?;
+                if n < 0 {
+                    return Err(NexradeError::Generic(
+                        "ERR ENTRIESADDED must be a non-negative integer".to_string(),
+                    ));
+                }
+                entries_added = Some(n as u64);
+                i += 2;
+            }
+            // Accepted and ignored for wire compatibility (we don't track
+            // max-deleted-entry-id as durable state yet).
+            "MAXDELETEDID" => {
+                let _ = get_str(args, i + 1, "XSETID")?;
+                i += 2;
+            }
+            _ => return Err(NexradeError::SyntaxError),
+        }
+    }
+
+    let mut store_db = db.store.db(db_index).write_for(&key);
+    let entry = store_db.get_mut(&key).ok_or_else(no_such_key_err)?;
+    let stream = match &mut entry.value {
+        DataType::Stream(s) => s,
+        _ => return Err(NexradeError::WrongType),
+    };
+
+    if let Some(cur) = last_parsed_id(stream) {
+        if new_id < cur {
+            return Err(NexradeError::Generic(
+                "ERR The ID specified in XSETID is smaller than the current top entry".to_string(),
+            ));
+        }
+    }
+    stream.last_id = new_id.to_wire();
+    if let Some(n) = entries_added {
+        stream.entries_added = n;
+    }
+    Ok(Resp::ok())
 }
 
 /// Resolve an explicit `XADD` id spec into a concrete numeric `StreamId`.
@@ -425,11 +505,16 @@ pub async fn cmd_xread(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
         match tokio::time::timeout(timeout_dur, async {
             let _parked = db.park_stream_waiter();
             loop {
-                db.stream_chan.notified().await;
+                // Register before re-check so a producer that notifies
+                // between empty-check and park cannot be lost.
+                let notified = db.stream_chan.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 let snap = snapshot()?;
                 if has_entries(&snap) {
                     return Ok::<Resp, NexradeError>(snap);
                 }
+                notified.await;
             }
         })
         .await
@@ -477,20 +562,28 @@ pub async fn cmd_xtrim(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
     let threshold = get_i64(args, 3, "XTRIM")? as usize;
 
     let mut store_db = db.store.db(db_index).write_for(&key);
-    match store_db.get_mut(&key) {
+    let mut payload_delta: isize = 0;
+    let result = match store_db.get_mut(&key) {
         None => Ok(Resp::int(0)),
         Some(e) => match &mut e.value {
             DataType::Stream(s) => {
                 let old_len = s.entries.len();
                 if strategy == "MAXLEN" && s.entries.len() > threshold {
                     let to_remove = s.entries.len() - threshold;
+                    let dropped: usize = s.entries[..to_remove]
+                        .iter()
+                        .map(StreamEntry::payload_bytes)
+                        .sum();
                     s.entries.drain(..to_remove);
+                    payload_delta = -(dropped as isize);
                 }
                 Ok(Resp::int((old_len - s.entries.len()) as i64))
             }
             _ => Err(NexradeError::WrongType),
         },
-    }
+    };
+    store_db.adjust_live_bytes(payload_delta);
+    result
 }
 
 // ── XDEL ─────────────────────────────────────────────────────────────────────
@@ -502,23 +595,36 @@ pub async fn cmd_xdel(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     let key = get_bytes_vec(args, 1, "XDEL")?;
     let mut store_db = db.store.db(db_index).write_for(&key);
 
-    match store_db.get_mut(&key) {
+    let mut payload_delta: isize = 0;
+    let result = match store_db.get_mut(&key) {
         None => Ok(Resp::int(0)),
         Some(e) => match &mut e.value {
             DataType::Stream(s) => {
                 let mut deleted = 0i64;
                 for i in 2..args.len() {
                     if let Ok(id) = get_str(args, i, "XDEL") {
+                        // Collect payload of matching entries, then retain.
+                        let mut drop_bytes = 0usize;
                         let before = s.entries.len();
-                        s.entries.retain(|e| e.id != id);
+                        s.entries.retain(|e| {
+                            if e.id == id {
+                                drop_bytes += e.payload_bytes();
+                                false
+                            } else {
+                                true
+                            }
+                        });
                         deleted += (before - s.entries.len()) as i64;
+                        payload_delta -= drop_bytes as isize;
                     }
                 }
                 Ok(Resp::int(deleted))
             }
             _ => Err(NexradeError::WrongType),
         },
-    }
+    };
+    store_db.adjust_live_bytes(payload_delta);
+    result
 }
 
 // ── XGROUP ───────────────────────────────────────────────────────────────────
@@ -901,11 +1007,25 @@ pub async fn cmd_xreadgroup(db: &Db, args: &[Resp], db_index: usize) -> Result<R
         match tokio::time::timeout(timeout_dur, async {
             let _parked = db.park_stream_waiter();
             loop {
-                db.stream_chan.notified().await;
+                // Register before re-check (see XREAD).
+                let notified = db.stream_chan.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                #[cfg(not(target_arch = "wasm32"))]
+                let _permit = match db.persistence.enter_mutation() {
+                    Some(p) => p,
+                    None => {
+                        return Err(NexradeError::Generic(
+                            "MISCONF persistence is quiescing; writes are temporarily disabled"
+                                .to_string(),
+                        ))
+                    }
+                };
                 let snap = read_once(&key_specs)?;
                 if has_entries(&snap) {
                     return Ok::<Resp, NexradeError>(snap);
                 }
+                notified.await;
             }
         })
         .await
@@ -1129,20 +1249,21 @@ async fn xinfo_stream(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
             DataType::Stream(s) => {
                 let first = s.entries.first().map(format_stream_entry);
                 let last = s.entries.last().map(format_stream_entry);
-                let last_id = s
-                    .entries
-                    .last()
-                    .map(|e| e.id.clone())
-                    .unwrap_or_else(|| "0-0".to_string());
+                let last_id = s.last_generated_id().to_string();
+                let entries_added = if s.entries_added > 0 {
+                    s.entries_added
+                } else {
+                    s.entries.len() as u64
+                };
                 Ok(Resp::array(vec![
                     Resp::bulk_str("length"),
                     Resp::int(s.entries.len() as i64),
                     Resp::bulk_str("last-generated-id"),
-                    Resp::bulk_str(last_id.clone()),
+                    Resp::bulk_str(last_id),
                     Resp::bulk_str("max-deleted-entry-id"),
                     Resp::bulk_str("0-0"),
                     Resp::bulk_str("entries-added"),
-                    Resp::int(s.entries.len() as i64),
+                    Resp::int(entries_added as i64),
                     Resp::bulk_str("groups"),
                     Resp::int(s.groups.len() as i64),
                     Resp::bulk_str("first-entry"),

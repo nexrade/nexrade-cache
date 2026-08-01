@@ -1,25 +1,22 @@
 //! Hash command handlers.
 
-use std::collections::HashMap;
-
 use bytes::Bytes;
 
 use super::string::format_float;
 
-use crate::command::{get_bytes_vec, get_f64, get_i64};
+use crate::command::{get_bytes_vec, get_f64, get_i64, get_str};
 use crate::db::Db;
 use crate::error::{NexradeError, Result};
+use crate::hash_data::{CompactHashBulkIter, HashData, HashGetAllSnap};
 use crate::resp::Resp;
-use crate::store::Entry;
+use crate::store::{glob_match, Entry};
 use crate::types::DataType;
 
 fn get_or_create_hash<'a>(
     db: &'a mut crate::store::Database,
     key: &[u8],
-) -> Result<&'a mut HashMap<Vec<u8>, Vec<u8>>> {
-    // Single HashMap lookup via `get_or_insert_with` instead of the old
-    // contains_key + insert + get_mut (up to 3 lookups on the hot path).
-    let entry = db.get_or_insert_with(key, || Entry::new(DataType::Hash(HashMap::new())));
+) -> Result<&'a mut HashData> {
+    let entry = db.get_or_insert_with(key, || Entry::new(DataType::Hash(HashData::new())));
     match &mut entry.value {
         DataType::Hash(h) => Ok(h),
         _ => Err(NexradeError::WrongType),
@@ -27,42 +24,52 @@ fn get_or_create_hash<'a>(
 }
 
 pub async fn cmd_hset(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
-    if args.len() < 4 || !args.len() % 2 == 0 {
+    if args.len() < 4 || !args.len().is_multiple_of(2) {
         return Err(NexradeError::WrongArity("hset".to_string()));
     }
     let key = get_bytes_vec(args, 1, "HSET")?;
     let mut store_db = db.store.db(db_index).write_for(&key);
-    let hash = get_or_create_hash(&mut store_db, &key)?;
-
-    let mut added = 0i64;
-    let mut i = 2;
-    while i + 1 < args.len() {
-        let field = get_bytes_vec(args, i, "HSET")?;
-        let val = get_bytes_vec(args, i + 1, "HSET")?;
-        if hash.insert(field, val).is_none() {
-            added += 1;
+    let (added, delta) = {
+        let hash = get_or_create_hash(&mut store_db, &key)?;
+        let mut added = 0i64;
+        let mut delta: isize = 0;
+        let mut i = 2;
+        while i + 1 < args.len() {
+            let field = get_bytes_vec(args, i, "HSET")?;
+            let val = get_bytes_vec(args, i + 1, "HSET")?;
+            let (is_new, d) = hash.insert(field, val);
+            delta += d;
+            if is_new {
+                added += 1;
+            }
+            i += 2;
         }
-        i += 2;
-    }
+        (added, delta)
+    };
+    store_db.adjust_live_bytes(delta);
     Ok(Resp::int(added))
 }
 
 pub async fn cmd_hmset(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     // HMSET is deprecated but still supported (same as HSET)
-    if args.len() < 4 || !args.len() % 2 == 0 {
+    if args.len() < 4 || !args.len().is_multiple_of(2) {
         return Err(NexradeError::WrongArity("hmset".to_string()));
     }
     let key = get_bytes_vec(args, 1, "HMSET")?;
     let mut store_db = db.store.db(db_index).write_for(&key);
-    let hash = get_or_create_hash(&mut store_db, &key)?;
-
-    let mut i = 2;
-    while i + 1 < args.len() {
-        let field = get_bytes_vec(args, i, "HMSET")?;
-        let val = get_bytes_vec(args, i + 1, "HMSET")?;
-        hash.insert(field, val);
-        i += 2;
-    }
+    let delta = {
+        let hash = get_or_create_hash(&mut store_db, &key)?;
+        let mut delta: isize = 0;
+        let mut i = 2;
+        while i + 1 < args.len() {
+            let field = get_bytes_vec(args, i, "HMSET")?;
+            let val = get_bytes_vec(args, i + 1, "HMSET")?;
+            delta += hash.insert(field, val).1;
+            i += 2;
+        }
+        delta
+    };
+    store_db.adjust_live_bytes(delta);
     Ok(Resp::ok())
 }
 
@@ -79,7 +86,7 @@ pub async fn cmd_hget(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
         Some(e) => match &e.value {
             DataType::Hash(h) => Ok(h
                 .get(&field)
-                .map(|v| Resp::bulk(Bytes::from(v.clone())))
+                .map(|v| Resp::bulk(Bytes::from(v)))
                 .unwrap_or(Resp::null())),
             _ => Err(NexradeError::WrongType),
         },
@@ -98,7 +105,7 @@ pub async fn cmd_hmget(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
             let field = get_bytes_vec(args, i, "HMGET").ok()?;
             match store_db.get_ro(&key) {
                 Some(e) => match &e.value {
-                    DataType::Hash(h) => h.get(&field).map(|v| Resp::bulk(Bytes::from(v.clone()))),
+                    DataType::Hash(h) => h.get(&field).map(|v| Resp::bulk(Bytes::from(v))),
                     _ => None,
                 },
                 None => None,
@@ -117,23 +124,34 @@ pub async fn cmd_hdel(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     let key = get_bytes_vec(args, 1, "HDEL")?;
     let mut store_db = db.store.db(db_index).write_for(&key);
 
-    match store_db.get_mut(&key) {
+    let mut emptied = false;
+    let mut payload_delta: isize = 0;
+    let result = match store_db.get_mut(&key) {
         None => Ok(Resp::int(0)),
         Some(e) => match &mut e.value {
             DataType::Hash(h) => {
                 let mut removed = 0i64;
+                let mut delta: isize = 0;
                 for i in 2..args.len() {
                     if let Ok(f) = get_bytes_vec(args, i, "HDEL") {
-                        if h.remove(&f).is_some() {
+                        if let Some((_v, d)) = h.remove(&f) {
                             removed += 1;
+                            delta += d;
                         }
                     }
                 }
+                payload_delta = delta;
+                emptied = h.is_empty();
                 Ok(Resp::int(removed))
             }
             _ => Err(NexradeError::WrongType),
         },
+    };
+    store_db.adjust_live_bytes(payload_delta);
+    if emptied {
+        store_db.remove_empty_key(&key);
     }
+    result
 }
 
 pub async fn cmd_hexists(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
@@ -158,21 +176,48 @@ pub async fn cmd_hgetall(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp
         return Err(NexradeError::WrongArity("hgetall".to_string()));
     }
     let key = get_bytes_vec(args, 1, "HGETALL")?;
-    let store_db = db.store.db(db_index).read_for(&key);
 
-    match store_db.get_ro(&key) {
-        None => Ok(Resp::array(vec![])),
-        Some(e) => match &e.value {
-            DataType::Hash(h) => {
-                let mut items = Vec::with_capacity(h.len() * 2);
-                for (k, v) in h {
-                    items.push(Resp::bulk(Bytes::from(k.clone())));
-                    items.push(Resp::bulk(Bytes::from(v.clone())));
+    let snap = {
+        let store_db = db.store.db(db_index).read_for(&key);
+        match store_db.get_ro(&key) {
+            None => None,
+            Some(e) => match &e.value {
+                DataType::Hash(h) => {
+                    if h.is_empty() {
+                        None
+                    } else {
+                        Some(Ok(h.hgetall_snap()))
+                    }
                 }
-                Ok(Resp::array(items))
+                _ => Some(Err(NexradeError::WrongType)),
+            },
+        }
+    };
+
+    match snap {
+        None => Ok(Resp::array(vec![])),
+        Some(Err(e)) => Err(e),
+        // Array (not Raw) so connection-layer RESP3 can upgrade HGETALL → Map.
+        // Compact still wins: Arc snap under a brief lock, then frame outside.
+        Some(Ok(HashGetAllSnap::Compact {
+            buf,
+            count,
+            need: _,
+        })) => {
+            let mut items = Vec::with_capacity(count * 2);
+            for bulk in CompactHashBulkIter::new(&buf, count) {
+                items.push(Resp::bulk(Bytes::copy_from_slice(bulk)));
             }
-            _ => Err(NexradeError::WrongType),
-        },
+            Ok(Resp::array(items))
+        }
+        Some(Ok(HashGetAllSnap::Hashtable { pairs })) => {
+            let mut items = Vec::with_capacity(pairs.len() * 2);
+            for (k, v) in pairs {
+                items.push(Resp::bulk(Bytes::from(k)));
+                items.push(Resp::bulk(Bytes::from(v)));
+            }
+            Ok(Resp::array(items))
+        }
     }
 }
 
@@ -188,7 +233,8 @@ pub async fn cmd_hkeys(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
         Some(e) => match &e.value {
             DataType::Hash(h) => Ok(Resp::array(
                 h.keys()
-                    .map(|k| Resp::bulk(Bytes::from(k.clone())))
+                    .into_iter()
+                    .map(|k| Resp::bulk(Bytes::from(k)))
                     .collect(),
             )),
             _ => Err(NexradeError::WrongType),
@@ -208,7 +254,8 @@ pub async fn cmd_hvals(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
         Some(e) => match &e.value {
             DataType::Hash(h) => Ok(Resp::array(
                 h.values()
-                    .map(|v| Resp::bulk(Bytes::from(v.clone())))
+                    .into_iter()
+                    .map(|v| Resp::bulk(Bytes::from(v)))
                     .collect(),
             )),
             _ => Err(NexradeError::WrongType),
@@ -241,15 +288,17 @@ pub async fn cmd_hsetnx(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
     let val = get_bytes_vec(args, 3, "HSETNX")?;
 
     let mut store_db = db.store.db(db_index).write_for(&key);
-    let hash = get_or_create_hash(&mut store_db, &key)?;
-
-    match hash.entry(field) {
-        std::collections::hash_map::Entry::Occupied(_) => Ok(Resp::int(0)),
-        std::collections::hash_map::Entry::Vacant(e) => {
-            e.insert(val);
-            Ok(Resp::int(1))
+    let (resp, delta) = {
+        let hash = get_or_create_hash(&mut store_db, &key)?;
+        if hash.contains_key(&field) {
+            (Ok(Resp::int(0)), 0isize)
+        } else {
+            let (_new, d) = hash.insert(field, val);
+            (Ok(Resp::int(1)), d)
         }
-    }
+    };
+    store_db.adjust_live_bytes(delta);
+    resp
 }
 
 pub async fn cmd_hincrby(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
@@ -261,18 +310,20 @@ pub async fn cmd_hincrby(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp
     let delta = get_i64(args, 3, "HINCRBY")?;
 
     let mut store_db = db.store.db(db_index).write_for(&key);
-    let hash = get_or_create_hash(&mut store_db, &key)?;
-
-    let current: i64 = match hash.get(&field) {
-        None => 0,
-        Some(v) => std::str::from_utf8(v)
-            .map_err(|_| NexradeError::NotInteger)?
-            .parse()
-            .map_err(|_| NexradeError::NotInteger)?,
+    let (new_val, payload_delta) = {
+        let hash = get_or_create_hash(&mut store_db, &key)?;
+        let current: i64 = match hash.get(&field) {
+            None => 0,
+            Some(v) => std::str::from_utf8(&v)
+                .map_err(|_| NexradeError::NotInteger)?
+                .parse()
+                .map_err(|_| NexradeError::NotInteger)?,
+        };
+        let new_val = current.checked_add(delta).ok_or(NexradeError::Overflow)?;
+        let (_is_new, d) = hash.insert(field, new_val.to_string().into_bytes());
+        (new_val, d)
     };
-
-    let new_val = current.checked_add(delta).ok_or(NexradeError::Overflow)?;
-    hash.insert(field, new_val.to_string().into_bytes());
+    store_db.adjust_live_bytes(payload_delta);
     Ok(Resp::int(new_val))
 }
 
@@ -285,45 +336,86 @@ pub async fn cmd_hincrbyfloat(db: &Db, args: &[Resp], db_index: usize) -> Result
     let delta = get_f64(args, 3, "HINCRBYFLOAT")?;
 
     let mut store_db = db.store.db(db_index).write_for(&key);
-    let hash = get_or_create_hash(&mut store_db, &key)?;
-
-    let current: f64 = match hash.get(&field) {
-        None => 0.0,
-        Some(v) => std::str::from_utf8(v)
-            .map_err(|_| NexradeError::NotFloat)?
-            .parse()
-            .map_err(|_| NexradeError::NotFloat)?,
+    let (s, payload_delta) = {
+        let hash = get_or_create_hash(&mut store_db, &key)?;
+        let current: f64 = match hash.get(&field) {
+            None => 0.0,
+            Some(v) => std::str::from_utf8(&v)
+                .map_err(|_| NexradeError::NotFloat)?
+                .parse()
+                .map_err(|_| NexradeError::NotFloat)?,
+        };
+        let new_val = current + delta;
+        if new_val.is_nan() || new_val.is_infinite() {
+            return Err(NexradeError::Generic(
+                "increment would produce NaN or Infinity".to_string(),
+            ));
+        }
+        let s = format_float(new_val);
+        let (_is_new, d) = hash.insert(field, s.as_bytes().to_vec());
+        (s, d)
     };
-
-    let new_val = current + delta;
-    if new_val.is_nan() || new_val.is_infinite() {
-        return Err(NexradeError::Generic(
-            "increment would produce NaN or Infinity".to_string(),
-        ));
-    }
-    let s = format_float(new_val);
-    hash.insert(field, s.as_bytes().to_vec());
+    store_db.adjust_live_bytes(payload_delta);
     Ok(Resp::bulk_str(s))
 }
 
+/// `HSCAN key cursor [MATCH pattern] [COUNT count]`
 pub async fn cmd_hscan(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
-    // Simplified HSCAN — returns all fields (cursor always 0)
     if args.len() < 3 {
         return Err(NexradeError::WrongArity("hscan".to_string()));
     }
     let key = get_bytes_vec(args, 1, "HSCAN")?;
-    let mut store_db = db.store.db(db_index).write_for(&key);
+    let cursor: u64 = get_i64(args, 2, "HSCAN")
+        .ok()
+        .map(|n| n.max(0) as u64)
+        .unwrap_or(0);
 
-    match store_db.get(&key) {
+    let mut pattern: Option<Vec<u8>> = None;
+    let mut count: usize = 10;
+    let mut i = 3;
+    while i < args.len() {
+        let opt = get_str(args, i, "HSCAN")?.to_uppercase();
+        match opt.as_str() {
+            "MATCH" => {
+                pattern = Some(get_bytes_vec(args, i + 1, "HSCAN")?);
+                i += 2;
+            }
+            "COUNT" => {
+                let n = get_i64(args, i + 1, "HSCAN")?;
+                if n <= 0 {
+                    return Err(NexradeError::Generic("syntax error".to_string()));
+                }
+                count = n as usize;
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let store_db = db.store.db(db_index).read_for(&key);
+    match store_db.get_ro(&key) {
         None => Ok(Resp::array(vec![Resp::bulk_str("0"), Resp::array(vec![])])),
         Some(e) => match &e.value {
             DataType::Hash(h) => {
-                let mut items = Vec::with_capacity(h.len() * 2);
-                for (k, v) in h {
-                    items.push(Resp::bulk(Bytes::from(k.clone())));
-                    items.push(Resp::bulk(Bytes::from(v.clone())));
+                let pat = pattern.unwrap_or_else(|| b"*".to_vec());
+                let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = h
+                    .to_pairs()
+                    .into_iter()
+                    .filter(|(k, _)| glob_match(&pat, k.as_slice()))
+                    .collect();
+                pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                let start = (cursor as usize).min(pairs.len());
+                let end = (start + count).min(pairs.len());
+                let next = if end >= pairs.len() { 0u64 } else { end as u64 };
+                let mut items = Vec::with_capacity((end - start) * 2);
+                for (k, v) in &pairs[start..end] {
+                    items.push(Resp::bulk(Bytes::copy_from_slice(k)));
+                    items.push(Resp::bulk(Bytes::copy_from_slice(v)));
                 }
-                Ok(Resp::array(vec![Resp::bulk_str("0"), Resp::array(items)]))
+                Ok(Resp::array(vec![
+                    Resp::bulk_str(next.to_string()),
+                    Resp::array(items),
+                ]))
             }
             _ => Err(NexradeError::WrongType),
         },
@@ -346,7 +438,7 @@ pub async fn cmd_hrandfield(db: &Db, args: &[Resp], db_index: usize) -> Result<R
         None => Ok(Resp::null()),
         Some(e) => match &e.value {
             DataType::Hash(h) => {
-                let fields: Vec<_> = h.keys().cloned().collect();
+                let fields = h.keys();
                 match count {
                     None => {
                         let idx = pseudo_rand_idx(fields.len());
@@ -357,7 +449,6 @@ pub async fn cmd_hrandfield(db: &Db, args: &[Resp], db_index: usize) -> Result<R
                     }
                     Some(n) => {
                         let result: Vec<Resp> = if n < 0 {
-                            // Negative count: allow duplicates, return exactly |n| elements.
                             let count = n.unsigned_abs() as usize;
                             (0..count)
                                 .map(|_| {
@@ -369,7 +460,6 @@ pub async fn cmd_hrandfield(db: &Db, args: &[Resp], db_index: usize) -> Result<R
                                 })
                                 .collect()
                         } else {
-                            // Positive count: no duplicates, up to n elements.
                             fields
                                 .into_iter()
                                 .take(n as usize)

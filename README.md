@@ -4,14 +4,14 @@
 
 # nexrade-cache
 
-**v0.2.1**
+**v1.2.1**
 
 nexrade-cache is **a Redis-protocol-compatible cache server built in Rust**. It speaks the
 RESP2 / RESP3 wire format, ships with TLS, Prometheus metrics, Lua scripting, a plugin API,
 and a WebAssembly target — without OpenSSL or other C dependencies. **It is not a 1:1
 implementation of Redis.** It implements the commands and behaviours most commonly used by
-applications and proxies that talk to Redis, with intentional gaps in niche features. Check
-the compatibility matrix to verify your workload before adopting it.
+applications and proxies that talk to Redis, with intentional gaps in niche features —
+see [Supported Commands](#supported-commands) below for the full surface.
 
 ```sh
 nexrade-cache --port 6379 --metrics
@@ -137,13 +137,22 @@ nexrade-cache --config nexrade.toml --port 6380 --requirepass secret
 NEXRADE_PORT=6380 NEXRADE_REQUIREPASS=secret nexrade-cache
 ```
 
-See [`nexrade.example.toml`](nexrade.example.toml) for the full reference.
+See [`nexrade.example.toml`](nexrade.example.toml) for the full reference,
+or [`nexrade.cache.toml`](nexrade.cache.toml) for a **production cache
+profile** (`maxmemory` + `allkeys-lru`, persistence off) — see
+[`examples/12-cache-patterns/`](examples/12-cache-patterns) for matching
+redis-py connection-pool, cache-aside, and eviction-smoke examples.
 
 ---
 
 ## Persistence
 
-nexrade-cache persists data the same way Redis does — no migration needed.
+nexrade-cache persists its own dataset with RDB snapshots and AOF — the same
+*ops model* as Redis, but the on-disk formats are **nexrade-native** (not Redis
+RDB/AOF). To move data **from Redis into nexrade**, use
+[`scripts/migrate_from_redis.py`](scripts/migrate_from_redis.py). For
+nexrade→nexrade opaque blobs, see `DUMP` / `RESTORE`
+(`NEXD` payload — not Redis RDB).
 
 **RDB snapshots** — point-in-time binary snapshots, triggered automatically by save rules or manually:
 
@@ -153,9 +162,28 @@ redis-cli BGSAVE    # background save
 redis-cli LASTSAVE  # timestamp of last successful save
 ```
 
-**AOF (Append-Only File)** — every write command is logged in RESP format and replayed on startup. Set `aof_sync = "always"` for maximum durability or `"everysec"` for a good durability/performance trade-off.
+**AOF (Append-Only File)** — every write command is logged in RESP format and replayed on startup. Set `aof_sync = "always"` for durable acknowledgements, `"everysec"` to accept up to roughly one second of power-loss exposure, or `"no"` only when durability is not required.
 
-Both formats are automatically loaded on startup. RDB is loaded first, then AOF is replayed on top.
+### Recovery-source rule
+
+Current RDB and AOF files are each complete recovery sources. Configure and retain
+**one authoritative source at a time**: RDB-only, AOF-only, or neither for a
+pure cache. nexrade-cache deliberately rejects startup when both an RDB and a
+full legacy AOF exist, because replaying an uncheckpointed full AOF after its
+snapshot would duplicate non-idempotent writes such as `INCR`, `LPUSH`, and
+`XADD`. Choose the artifact you trust, preserve the other until recovery is
+verified, then disable its path before restarting.
+
+Existing configured persistence artifacts are validated before the server binds:
+a corrupt RDB, truncated/malformed AOF, semantic replay error, or unavailable
+AOF writer aborts startup rather than serving an empty or partially replayed
+dataset. `INFO persistence` exposes an AOF I/O failure and disables later
+writes until the operator resolves it.
+
+`BGREWRITEAOF` takes an exclusive persistence window while publishing and
+reopening the log. It favors write safety over rewrite availability: writers
+wait until the handoff is complete, so no acknowledged write is lost in the
+old-file-to-new-file transition.
 
 ---
 
@@ -163,7 +191,10 @@ Both formats are automatically loaded on startup. RDB is loaded first, then AOF 
 
 ### Prometheus
 
-Metrics are exposed at `http://localhost:9091/metrics`:
+Metrics are exposed at `http://localhost:9091/metrics` (bind address and
+port configurable under `[metrics]`; bound to a separate address from
+the Redis data-plane listener so an operator can scope Prometheus to a
+sidecar interface):
 
 ```
 nexrade_commands_total{cmd="SET"}               12345
@@ -173,6 +204,50 @@ nexrade_keyspace_hits_total{db="0"}             99999
 nexrade_keyspace_misses_total{db="0"}           1
 nexrade_db_keys{db="0"}                         10000
 ```
+
+### Operations HTTP (1.2.0)
+
+`/healthz` (liveness), `/readyz` (readiness), and `/metrics` are the
+operator's surface. Bind separately under `[health]` (default disabled)
+and `[metrics]`. The same JSON `HealthReport` is reachable via
+`INFO health`. Readiness reason codes (`aof_failed`, `snapshot_too_old`,
+`replica_link_down`, `replication_lag_exceeded`, …) appear in the JSON
+body and in `INFO health` when `/readyz` returns 503.
+
+### Preflight (1.2.0)
+
+Validate a config without binding listeners, opening files, or starting
+tasks — safe as a deploy-pipeline gate:
+
+```sh
+nexrade-cache --config /etc/nexrade/nexrade.toml --preflight
+```
+
+Exit code 0 means "would start cleanly"; non-zero with per-error
+diagnostics means a startup-relevant problem was found.
+
+### Operator drill (1.2.0)
+
+End-to-end verification of the production profile against the release
+binary:
+
+```sh
+python3 scripts/operator_drill.py --binary ./target/release/nexrade-cache
+```
+
+Runs 12 checks: `--print-config`, `--preflight` (valid / RDB+AOF /
+bad-path), clean start with `/healthz` + `/readyz` + `/metrics`
+returning 200, SIGTERM exit 0, RDB restart preserves keys, corrupt AOF
+rejected, truncated RDB rejected, unwritable persistence path rejected.
+Run locally before any release tag push; CI runs the same script in
+the `ops-drill` job.
+
+### Production profile (1.2.0)
+
+[`nexrade.production.toml`](nexrade.production.toml) is the documented
+standalone profile: loopback operations HTTP, absolute persistence
+paths, RDB-only default, conservative save rules, auth/TLS guidance,
+graceful-shutdown expectations.
 
 ### Structured logs
 
@@ -390,7 +465,7 @@ console.log(val); // active
 
 `SET` `GET` `GETSET` `GETDEL` `GETEX` `MSET` `MSETNX` `MGET`
 `SETNX` `SETEX` `PSETEX` `INCR` `INCRBY` `INCRBYFLOAT`
-`DECR` `DECRBY` `APPEND` `STRLEN` `GETRANGE` `SETRANGE`
+`DECR` `DECRBY` `APPEND` `STRLEN` `GETRANGE` `SETRANGE` `LCS`
 </details>
 
 <details>
@@ -398,7 +473,7 @@ console.log(val); // active
 
 `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` `LPOP` `RPOP`
 `LLEN` `LRANGE` `LINDEX` `LSET` `LINSERT` `LREM` `LTRIM`
-`LMOVE` `RPOPLPUSH` `LPOS` `BLPOP` `BRPOP` `LMPOP` `BLMPOP`
+`LMOVE` `BLMOVE` `RPOPLPUSH` `LPOS` `BLPOP` `BRPOP` `LMPOP` `BLMPOP`
 </details>
 
 <details>
@@ -413,7 +488,7 @@ console.log(val); // active
 <summary>Sets</summary>
 
 `SADD` `SREM` `SISMEMBER` `SMISMEMBER` `SMEMBERS` `SCARD`
-`SUNION` `SUNIONSTORE` `SINTER` `SINTERSTORE` `SDIFF` `SDIFFSTORE`
+`SUNION` `SUNIONSTORE` `SINTER` `SINTERSTORE` `SINTERCARD` `SDIFF` `SDIFFSTORE`
 `SMOVE` `SRANDMEMBER` `SPOP` `SSCAN`
 </details>
 
@@ -423,7 +498,7 @@ console.log(val); // active
 `ZADD` `ZCARD` `ZSCORE` `ZMSCORE` `ZINCRBY` `ZRANK` `ZREVRANK`
 `ZRANGE` `ZREVRANGE` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZRANGEBYLEX`
 `ZCOUNT` `ZLEXCOUNT` `ZREM` `ZREMRANGEBYRANK` `ZREMRANGEBYSCORE`
-`ZPOPMIN` `ZPOPMAX` `ZMPOP` `BZMPOP` `ZRANDMEMBER`
+`ZPOPMIN` `ZPOPMAX` `BZPOPMIN` `BZPOPMAX` `ZMPOP` `BZMPOP` `ZRANDMEMBER`
 `ZUNIONSTORE` `ZINTERSTORE` `ZUNION` `ZINTER` `ZDIFF` `ZDIFFSTORE`
 `ZINTERCARD` `ZSCAN`
 </details>
@@ -432,19 +507,19 @@ console.log(val); // active
 <summary>Streams</summary>
 
 `XADD` `XLEN` `XRANGE` `XREVRANGE` `XREAD` `XTRIM` `XDEL`
-`XGROUP` `XREADGROUP` `XACK` `XPENDING`
+`XGROUP` `XREADGROUP` `XACK` `XPENDING` `XINFO` `XCLAIM` `XAUTOCLAIM`
 </details>
 
 <details>
 <summary>Bitmaps</summary>
 
-`SETBIT` `GETBIT` `BITCOUNT` `BITPOS` `BITOP` `BITFIELD`
+`SETBIT` `GETBIT` `BITCOUNT` `BITPOS` `BITOP` `BITFIELD` `BITFIELD_RO`
 </details>
 
 <details>
 <summary>Geo</summary>
 
-`GEOADD` `GEOPOS` `GEODIST` `GEOHASH` `GEOSEARCH`
+`GEOADD` `GEOPOS` `GEODIST` `GEOHASH` `GEOSEARCH` `GEOSEARCHSTORE`
 `GEORADIUS` `GEORADIUSBYMEMBER`
 </details>
 
@@ -474,120 +549,60 @@ console.log(val); // active
 
 ---
 
-## Multi-core Scaling
-
-Redis processes all commands on a single thread. nexrade-cache uses a **sharded store** that scales write throughput with the number of CPU cores.
-
-### How it works
-
-On startup, nexrade-cache creates `N` independent shards where `N = next_power_of_two(num_cpus)` (clamped between 16 and 64). Each shard has its own `RwLock<Database>`. Keys are routed to shards via a fast FNV-1a hash of the key bytes.
-
-```
-key "user:1"  → shard 3  (RwLock<Database>)
-key "user:2"  → shard 11 (RwLock<Database>)
-key "session" → shard 7  (RwLock<Database>)
-```
-
-Concurrent writes to different keys acquire **different locks** — no contention. On an 8-core machine, independent key workloads can achieve up to 8× the write throughput compared to a single-threaded design.
-
-### Atomic cross-key operations
-
-Operations that touch multiple keys acquire shard locks in a **deterministic sorted order** to prevent deadlocks:
-
-| Operation | Strategy |
-|-----------|-----------|
-| `RENAME` / `RENAMENX` / `COPY` | Lock src shard + dst shard in index order |
-| `LMOVE` / `RPOPLPUSH` | Atomic cross-shard list move |
-| `SMOVE` | Atomic cross-shard set move |
-| `MSET` / `MSETNX` | Try-lock all affected shards; back off and retry the whole sweep on contention instead of blocking while holding earlier shards |
-| `DEL` / `EXISTS` / `MGET` | One shard per key, independent |
-
-### Whole-database operations
-
-`KEYS`, `SCAN`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`, and `RANDOMKEY` iterate or aggregate all shards. RDB persistence uses `snapshot()` which merges all shards for serialization, and distributes entries back to their correct shards on load.
-
----
-
 ## Performance
 
-Measured with `redis-benchmark` against **Redis 7.0.15** on the same machine
-(loopback, no TLS, no persistence). nexrade-cache **0.2.3** release build with
-jemalloc (Linux/macOS). Methodology matches the tables below:
-`-c 50 -n 100000 -q` (no pipeline) and `-c 50 -n 1000000 -P 50 -q` (pipelined).
+Tables below are the stable **single-key / pipe grid** first published around
+**0.5.1** (2-run averages vs **Redis 7.0.15**, loopback, no TLS, no persistence,
+jemalloc on Linux/macOS). Methodology: `-c 50 -n 100000 -q` (no pipeline) and
+`-c 50 -n 1000000 -P 50 -q` (pipelined). **Residual rows were re-checked through
+1.0.0** (no regressions; random pipe MSET improved to **1.06× Redis** at 0.7.1).
 
 **No pipelining** (`-c 50 -n 100000 -q` — the shape most real client traffic
 takes). nexrade-cache **beats Redis on every common single-key command**,
-typically **+7–13%** with lower p50 latency:
+typically **+4–10%** with lower p50 latency:
 
 | Command | nexrade-cache | Redis 7.0.15 | Delta |
 |---------|:---:|:---:|:---:|
-| PING | 236K rps | 211K rps | **+12%** |
-| SET | 239K rps | 215K rps | **+11%** |
-| GET | 234K rps | 209K rps | **+12%** |
-| INCR | 239K rps | 212K rps | **+13%** |
-| LPUSH | 236K rps | 214K rps | **+11%** |
-| SADD | 235K rps | 213K rps | **+10%** |
-| HSET | 239K rps | 218K rps | **+10%** |
-| ZADD | 238K rps | 221K rps | **+7%** |
-| MSET (10 keys) | 244K rps | 276K rps | −12% |
-| LRANGE_100 | 134K rps | 176K rps | −24% |
-| LRANGE_600 | 37K rps | 49K rps | −23% |
+| SET | 234K rps | 214K rps | **+9%** |
+| GET | 233K rps | 214K rps | **+9%** |
+| LPUSH | 235K rps | 220K rps | **+7%** |
+| RPUSH | 234K rps | 220K rps | **+7%** |
+| LPOP | 232K rps | 220K rps | **+6%** |
+| RPOP | 233K rps | 219K rps | **+6%** |
+| SADD | 232K rps | 211K rps | **+10%** |
+| HSET | 233K rps | 217K rps | **+7%** |
+| SPOP | 234K rps | 214K rps | **+9%** |
+| ZADD | 236K rps | 225K rps | **+4%** |
+| MSET (10 keys) | 240K rps | 267K rps | −10% |
+| LRANGE_100 | 140K rps | 178K rps | −21%† |
+| LRANGE_600 | 40K rps | 50K rps | −20%† |
+
+† Multi-client (`-c 50`) non-pipe LRANGE still trails Redis’s single-threaded
+event loop when 50 clients hammer one shared list. **Single-client**
+(`-c 1`) is at parity; pipelined LRANGE_100 is **ahead**. Compact buffers
+are Arc-shared so concurrent LRANGE snaps with a refcount bump (no
+payload memcpy) under a brief lock, then frames outside into a TLS
+buffer — the remaining multi-client gap is concurrency shape, not layout.
 
 **Pipelined** (`-P 50 -c 50 -n 1000000 -q` — many in-flight commands per
-connection). Most hot commands are **at parity or ahead**; several read-side
-commands pull well ahead of Redis:
+connection). Dual-encoding write paths stay competitive with accurate
+`maxmemory` accounting (collections + string/bitmap/stream/geo mutators):
 
 | Command | nexrade-cache | Redis 7.0.15 | Delta |
 |---------|:---:|:---:|:---:|
-| PING | 8.8M rps | 4.1M rps | **+111%** |
-| SET | 3.29M rps | 3.30M rps | ~parity |
-| GET | 5.9M rps | 4.2M rps | **+39%** |
-| INCR | 5.6M rps | 4.0M rps | **+39%** |
-| LPUSH | 2.7M rps | 3.1M rps | −12% |
-| SADD | 4.6M rps | 3.9M rps | **+18%** |
-| HSET | 3.9M rps | 3.1M rps | **+26%** |
-| ZADD | 3.2M rps | 2.8M rps | **+13%** |
-| LRANGE_100 | 371K rps | 322K rps | **+15%** |
-| LRANGE_600 | 53K rps | 54K rps | ~parity |
-| MSET (10 keys) | 1.14M rps | 0.81M rps | **+41%** |
-
-### Remaining gaps (structural, not “one more micro-opt”)
-
-| Gap | Why |
-|-----|-----|
-| Non-pipe `LRANGE` (~−20%) | Redis short lists are often a contiguous **listpack**; we store `VecDeque<Bytes>` and frame each element as its own bulk string. Closing this needs a list-encoding change, not more serialize polish. Pipelined LRANGE is already at/above Redis. |
-| Pipelined `LPUSH` (~−12%) | Multi-threaded shard lock vs Redis’s single-threaded push loop. |
-| Non-pipe `MSET` (~−12%) | Multi-shard try-lock cost that Redis’s single-thread loop doesn’t pay. Pipelined fixed-key MSET is **ahead**. |
-
-The old single-key `INCR` contention gap (previously ~4.5× under heavy same-key
-concurrency) is closed via an atomic CAS fast path that skips the shard’s
-exclusive write lock once a key is promoted to an integer representation.
-
-### Hot-path optimisations
-
-Beyond single-thread throughput, the storage and connection layers avoid the
-big constant-factor sources of overhead:
-
-| Path | Before | After |
-|------|--------|-------|
-| `GET` LRU-clock update | `SystemTime::now()` syscall (~25-50ns) per access | Single relaxed atomic load (~1ns) refreshed by the background tick |
-| LRU eviction selection (`allkeys-lru`) | Scan all entries to find min | Reservoir sample of 5 random entries (Redis default) |
-| Memory check in `evict_if_needed` | Recompute total bytes from every entry | Sum of per-shard atomics (O(shards)) |
-| `SET` / `HSET` / `SADD` / `ZADD` / `LPUSH`/`RPUSH` on existing key | Up to 3 `HashMap` lookups (`contains_key` → `insert` → `get_mut`) | 1 lookup via `entries.entry()` / `Database::get_or_insert_with` |
-| Replica-role / replica-count / `CLIENT TRACKING`-enabled check per command | `parking_lot::RwLock` / broadcast-channel `Mutex` per call | Atomic mirror, single relaxed/acquire load — skipped entirely when nobody's using the feature |
-| Per-command Prometheus metric handle resolution | `with_label_values` (hash + `RwLock::read()` + lookup) × 3 per command | Cached `(cmd_name, handles)` pair, reused across runs of the same command in a pipeline batch |
-| `INCR`/`DECR`/`INCRBY`/`DECRBY` on a promoted key | Exclusive shard write-lock every call | `AtomicIntCell` read-lock CAS fast path; write-lock only for creation/promotion/expiry |
-| `INCR`/`INCRBY`/`DECR`/`DECRBY` integer formatting | `i64::to_string()` (heap-allocating) | `itoa::Buffer` (stack, no allocation) |
-| `MSET`/`MSETNX` shard acquisition | Sequential blocking `write()` per shard (convoy stalls under pipelining) | `try_write` sweep with backoff-and-retry; never holds a shard hostage while waiting on another |
-| `LPUSH` / `XADD` / `ZADD` waiter wake | Always `Notify::notify_waiters` | Atomic waiter count; notify only when someone is parked |
-| ACL check on unrestricted `default` | Users `RwLock` + HashMap every command | Single atomic “open ACL” load |
-| Key extraction for tracking/ACL | Always allocate `Vec<Vec<u8>>` of touched keys | Skipped when ACL is open and no client has TRACKING enabled |
-| `DataType::String` storage | `Vec<u8>` copy on every `SET` | `Bytes` with compact `copy_from_slice` (no parser-buffer pin) |
-| `LRANGE` reply buffer | Allocate+free multi-KB `BytesMut` per call | Thread-local buffer reused via `split().freeze()`; static empty `*0\r\n`; owned `Resp::Raw` write |
-| Global allocator (Linux/macOS) | System allocator | `tikv-jemallocator` (matches Redis) |
-
-See `crates/nexrade-core/tests/perf_tier2.rs` for the micro-benchmark suite; the
-`estimated_memory_bytes()` × 10k call cost went from O(10M) entries to ~9 ms total.
+| SET | 3.58M rps | 3.42M rps | **+4.7%** |
+| GET | 6.85M rps | 4.31M rps | **+59%** |
+| LPUSH | 3.28M rps | 2.94M rps | **+12%** |
+| RPUSH | 3.46M rps | 3.32M rps | **+4%** |
+| LPOP | 4.32M rps | 2.77M rps | **+56%** |
+| RPOP | 4.33M rps | 2.93M rps | **+48%** |
+| SADD | 4.95M rps | 3.92M rps | **+26%** |
+| HSET | 4.18M rps | 3.10M rps | **+35%** |
+| SPOP | 5.99M rps | 4.47M rps | **+34%** |
+| ZADD | 4.49M rps | 2.72M rps | **+65%** |
+| LRANGE_100 | 392K rps | 323K rps | **+21%** |
+| LRANGE_600 | 54K rps | 53K rps | **+3%** |
+| MSET (10 keys) | 1.29M rps | 887K rps | **+45%** |
 
 ---
 
@@ -642,15 +657,6 @@ nexrade-cli      Server binary + interactive CLI client
 
 All crates are independent. Use `nexrade-core` as a pure library, add `nexrade-server` for networking, and opt into the rest as needed.
 
-### Internals at a glance
-
-| Component | Detail |
-|-----------|--------|
-| Store | `ShardedDatabase` — N shards (FNV-1a key routing), each `RwLock<Database>` |
-| Replication | `ReplicationState` (Arc-shared) — broadcast channel, offset, replica list |
-| Connection | Tokio task per client; detects PSYNC and enters streaming mode for replicas |
-| Replica task | Background task connecting to primary: PING → REPLCONF → PSYNC → stream |
-
 ---
 
 ## Windows Service
@@ -673,6 +679,24 @@ nexrade-cache.exe --uninstall-service
 ### Windows ANSI Color Support
 
 nexrade-cache and nexrade-cli automatically enable ANSI escape code support on Windows 10+, providing colored output in PowerShell, Command Prompt, and Windows Terminal.
+
+---
+
+## Verification
+
+Client wire smokes and the operations drill, all CI-gated:
+
+```sh
+# Three independent RESP parsers against one release binary
+python3 scripts/redis_py_smoke.py            # 31 PASS + 5 SKIP
+python3 scripts/redis_py_cluster_smoke.py    # 13 PASS
+python3 scripts/raw_resp_smoke.py            # 10 PASS (no client lib)
+
+# End-to-end operations drill (print-config, preflight, health/ready/
+# metrics, clean shutdown, RDB restore, damaged-input rejection)
+cargo build --release -p nexrade-cache
+python3 scripts/operator_drill.py --binary ./target/release/nexrade-cache
+```
 
 ---
 

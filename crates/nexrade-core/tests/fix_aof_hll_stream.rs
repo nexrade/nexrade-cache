@@ -352,8 +352,14 @@ fn build_db_with_all_types() -> Db {
         });
         let mut group =
             nexrade_core::types::ConsumerGroup::new(b"g1".to_vec(), "1700000000001-0".to_string());
-        // Pretend one pending entry exists (this won't be preserved by AOF
-        // rewrite, but the group state is).
+        // One pending entry — AOF rewrite now restores PEL via XCLAIM FORCE.
+        group.consumers.insert(
+            b"c1".to_vec(),
+            nexrade_core::types::Consumer {
+                name: b"c1".to_vec(),
+                pending_ids: vec!["1700000000000-0".to_string()],
+            },
+        );
         group.pending.insert(
             "1700000000000-0".to_string(),
             nexrade_core::types::PendingEntry {
@@ -463,11 +469,34 @@ async fn aof_rewrite_round_trip_all_types() {
         .iter()
         .filter(|c| c.first().and_then(|a| a.as_str()) == Some("XGROUP"))
         .collect();
-    assert_eq!(xgroup_cmds.len(), 1);
-    assert_eq!(xgroup_cmds[0][1].as_str(), Some("CREATE"));
-    assert_eq!(xgroup_cmds[0][2].as_str(), Some("a_stream"));
-    assert_eq!(xgroup_cmds[0][3].as_str(), Some("g1"));
-    assert_eq!(xgroup_cmds[0][4].as_str(), Some("1700000000001-0"));
+    // At least CREATE; may also include CREATECONSUMER for PEL consumers.
+    assert!(
+        !xgroup_cmds.is_empty(),
+        "expected at least one XGROUP command"
+    );
+    let create = xgroup_cmds
+        .iter()
+        .find(|c| c.get(1).and_then(|a| a.as_str()) == Some("CREATE"))
+        .expect("XGROUP CREATE");
+    assert_eq!(create[2].as_str(), Some("a_stream"));
+    assert_eq!(create[3].as_str(), Some("g1"));
+    assert_eq!(create[4].as_str(), Some("1700000000001-0"));
+
+    // XCLAIM must appear to restore the PEL entry.
+    let xclaim_cmds: Vec<&Vec<Resp>> = cmds
+        .iter()
+        .filter(|c| c.first().and_then(|a| a.as_str()) == Some("XCLAIM"))
+        .collect();
+    assert_eq!(
+        xclaim_cmds.len(),
+        1,
+        "expected one XCLAIM for the PEL entry"
+    );
+    assert_eq!(xclaim_cmds[0][1].as_str(), Some("a_stream"));
+    assert_eq!(xclaim_cmds[0][2].as_str(), Some("g1"));
+    assert_eq!(xclaim_cmds[0][3].as_str(), Some("c1"));
+    // id is at index 5 (after min-idle-time 0).
+    assert_eq!(xclaim_cmds[0][5].as_str(), Some("1700000000000-0"));
 
     // Now simulate replay by executing the rewritten commands on a fresh DB.
     let replay_db = Db::default();
@@ -544,7 +573,7 @@ async fn aof_rewrite_round_trip_all_types() {
     assert_eq!(groups_len, 1);
     assert_eq!(g1_last.as_deref(), Some("1700000000001-0"));
 
-    // XPENDING is empty after replay (pending state is not preserved).
+    // XPENDING must restore the pending entry after PEL-aware rewrite.
     let xpending = run(
         &replay_db,
         vec![str_arg("XPENDING"), str_arg("a_stream"), str_arg("g1")],
@@ -553,7 +582,10 @@ async fn aof_rewrite_round_trip_all_types() {
     if let Resp::Array(Some(arr)) = xpending {
         // Summary form: [count, min, max, consumers[]].
         let count_str = resp_to_string(&arr[0]);
-        assert_eq!(count_str, "0", "expected 0 pending after rewrite replay");
+        assert_eq!(
+            count_str, "1",
+            "expected 1 pending after PEL-aware rewrite replay"
+        );
     } else {
         panic!("unexpected XPENDING output");
     }

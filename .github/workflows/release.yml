@@ -138,6 +138,8 @@ jobs:
           cp target/${{ matrix.target }}/release/nexrade-cache${{ matrix.exe_suffix }} dist/
           cp target/${{ matrix.target }}/release/nexrade-cli${{ matrix.exe_suffix }} dist/
           cp nexrade.example.toml dist/nexrade.toml
+          cp nexrade.cache.toml dist/nexrade.cache.toml
+          cp nexrade.production.toml dist/nexrade.production.toml
           cp README.md dist/
           cp LICENSE-MIT LICENSE-APACHE dist/
 
@@ -157,6 +159,8 @@ jobs:
           Copy-Item "target\${{ matrix.target }}\release\nexrade-cache${{ matrix.exe_suffix }}" dist\
           Copy-Item "target\${{ matrix.target }}\release\nexrade-cli${{ matrix.exe_suffix }}" dist\
           Copy-Item nexrade.example.toml dist\nexrade.toml
+          Copy-Item nexrade.cache.toml dist\nexrade.cache.toml
+          Copy-Item nexrade.production.toml dist\nexrade.production.toml
           Copy-Item README.md dist\
           Copy-Item LICENSE-MIT, LICENSE-APACHE dist\
 
@@ -420,7 +424,9 @@ jobs:
             Each archive contains:
             - `nexrade-cache` — server binary (drop-in Redis replacement)
             - `nexrade-cli` — interactive CLI client
-            - `nexrade.toml` — example config file
+            - `nexrade.toml` — example config (general-purpose)
+            - `nexrade.cache.toml` — pure-cache profile (no persistence)
+            - `nexrade.production.toml` — standalone production profile (RDB-only default, loopback operations HTTP, auth+TLS guidance)
             - `README.md`
 
           files: |

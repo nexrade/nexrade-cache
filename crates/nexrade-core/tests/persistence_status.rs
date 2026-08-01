@@ -150,6 +150,57 @@ async fn aof_last_write_status_reports_aof_off() {
 }
 
 #[tokio::test]
+async fn aof_failure_latches_misconf_and_surfaces_info() {
+    let db = Db::new(nexrade_core::db::ServerConfig::default());
+    db.stats.aof_enabled.store(true, Ordering::Relaxed);
+    db.fail_aof("test append", "disk full");
+
+    let rejected = run(&db, cmd(&["SET", "k", "v"])).await;
+    match rejected {
+        Resp::Error(message) => assert!(message.starts_with("MISCONF"), "{message}"),
+        other => panic!("failed AOF must reject writes, got {other:?}"),
+    }
+
+    let info = run(&db, cmd(&["INFO", "persistence"])).await;
+    let bulk = match &info {
+        Resp::BulkString(Some(b)) => String::from_utf8_lossy(b).into_owned(),
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        info_field(&bulk, "aof_last_write_status").as_deref(),
+        Some("err")
+    );
+    assert_eq!(info_field(&bulk, "aof_write_failed").as_deref(), Some("1"));
+    assert_eq!(
+        info_field(&bulk, "aof_last_write_error").as_deref(),
+        Some("test append: disk full")
+    );
+}
+
+#[tokio::test]
+async fn persistence_quiesce_waits_for_admitted_mutation() {
+    let db = Db::new(nexrade_core::db::ServerConfig::default());
+    let mutation = db
+        .persistence
+        .enter_mutation()
+        .expect("running coordinator admits writes");
+    let clone = db.clone();
+    let task = tokio::spawn(async move { clone.persistence.quiesce().await });
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(
+        !task.is_finished(),
+        "quiesce must wait until the admitted mutation completes"
+    );
+    drop(mutation);
+    drop(task.await.expect("quiesce task"));
+    assert!(
+        db.persistence.enter_mutation().is_some(),
+        "dropping the quiesce guard must reopen admission"
+    );
+}
+
+#[tokio::test]
 async fn aof_rewrite_concurrency_lock_works() {
     // Only one BGREWRITEAOF at a time — concurrent rewrites would race
     // on the file rename. Verify a second BGREWRITEAOF is rejected while

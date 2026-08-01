@@ -153,6 +153,27 @@ python3 examples/11-python-patterns/patterns.py
 
 ---
 
+## 12-cache-patterns — Production Cache Setup (redis-py)
+Patterns for running nexrade-cache as a **cache** in front of a real
+datastore, matched to the `nexrade.cache.toml` profile at the repo root
+(`maxmemory` + `allkeys-lru`, persistence off).
+
+```sh
+# Start with the cache profile
+./target/release/nexrade-cache --config nexrade.cache.toml --metrics-port 0 &
+
+python3 examples/12-cache-patterns/connection_pool.py   # pooled connections, health checks, CLIENT SETINFO
+python3 examples/12-cache-patterns/cache_aside.py       # get-or-load with TTL + stampede-safe refresh + invalidation
+python3 examples/12-cache-patterns/maxmemory_eviction.py --port 6379  # confirms allkeys-lru eviction under a tiny cap
+```
+
+**Requires:** `pip install redis`
+
+`maxmemory_eviction.py` calls `CONFIG SET` on the target server — point it
+at a throwaway/dev instance, not production.
+
+---
+
 ## Environment Variables
 
 All shell/Python examples respect these variables:

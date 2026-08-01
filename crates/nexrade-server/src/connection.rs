@@ -86,6 +86,27 @@ impl Drop for ConnectionCleanup {
     }
 }
 
+/// Format a Redis-compatible MONITOR line from the request args.
+/// Shape: `timestamp [db client] "cmd" "arg1" "arg2" ...`
+fn format_monitor_line(db_index: usize, addr: SocketAddr, args: &[Resp]) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let mut out = format!("{now:.6} [{db_index} {addr}]");
+    for a in args {
+        let s = match a {
+            Resp::BulkString(Some(b)) => String::from_utf8_lossy(b).into_owned(),
+            Resp::SimpleString(s) => s.clone(),
+            Resp::Integer(n) => n.to_string(),
+            _ => "?".to_string(),
+        };
+        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+        out.push_str(&format!(" \"{escaped}\""));
+    }
+    out
+}
+
 /// State for a single connected client.
 pub struct Connection {
     db: Db,
@@ -168,8 +189,11 @@ impl Connection {
             authenticated: !requires_auth,
             authenticated_user: "default".to_string(),
             parser: RespParser::new(),
-            read_buf: BytesMut::with_capacity(4096),
-            write_buf: SegBuf::with_capacity(4096),
+            // 0.7.2: 16 KiB start capacity for pipeline batches under
+            // redis-benchmark -P 50 (a 50× SET batch is ~1–2 KiB of
+            // request / reply framing; headroom avoids mid-batch growth).
+            read_buf: BytesMut::with_capacity(16 * 1024),
+            write_buf: SegBuf::with_capacity(16 * 1024),
             transaction: Transaction::new(),
             subscriptions: Vec::new(),
             pattern_subscriptions: Vec::new(),
@@ -184,7 +208,7 @@ impl Connection {
             metrics,
             cached_handles: None,
             resp_version: 2,
-            last_cmd: String::with_capacity(8),
+            last_cmd: String::with_capacity(16),
             last_write_instant: Instant::now(),
         }
     }
@@ -313,27 +337,76 @@ impl Connection {
                     continue;
                 }
 
-                let cmd_name = if let Some(src) = args[0].as_str() {
-                    // Inlined uppercase conversion into a small stack-only
-                    // buffer. Owned `String` (not borrowed from `self.cmd_buf`)
-                    // so subsequent `&mut self` calls don't conflict.
-                    // Cmd names are short (<16 bytes typical); the
-                    // per-command `String` allocation is dwarfed by the
-                    // savings from no longer re-parsing the cmd name
-                    // inside dispatch.
-                    let mut out = String::with_capacity(src.len().max(8));
-                    out.push_str(src);
-                    out.make_ascii_uppercase();
-                    out
-                } else {
-                    String::new()
+                // 0.7.2: stack-first uppercase. Redis command names are short
+                // (≤ 32 bytes covers the full table + most MODULE names);
+                // avoid a heap `String` alloc per command under
+                // redis-benchmark -P 50. Heap path is only for the rare
+                // long name so subsequent `&mut self` calls never conflict
+                // with a self-borrowed buffer.
+                //
+                // We keep `cmd_name` as an owned `String` because metrics /
+                // slowlog / cached_handles still need ownership on rare
+                // paths. The win vs. the previous code is a single exact-
+                // size alloc (`to_ascii_uppercase`) instead of
+                // `with_capacity(max(8))` + `push_str` + `make_ascii_uppercase`
+                // (which could reallocate on long names and always paid the
+                // capacity-guess overhead). Short names (the hot path) go
+                // through a stack buffer first so the final `String` is
+                // built from already-uppercased bytes with no intermediate
+                // mutability pass.
+                let cmd_name: String = match args[0].as_str() {
+                    Some(src) if src.len() <= 32 => {
+                        let mut buf = [0u8; 32];
+                        let n = src.len();
+                        buf[..n].copy_from_slice(src.as_bytes());
+                        for b in &mut buf[..n] {
+                            *b = b.to_ascii_uppercase();
+                        }
+                        // SAFETY: src was valid UTF-8; ASCII uppercasing
+                        // preserves validity.
+                        // from_utf8 is infallible here.
+                        String::from_utf8(buf[..n].to_vec()).unwrap_or_default()
+                    }
+                    Some(src) => src.to_ascii_uppercase(),
+                    None => String::new(),
                 };
 
                 // SUBSCRIBE takes over the connection — flush current batch first.
-                if (cmd_name == "SUBSCRIBE" || cmd_name == "PSUBSCRIBE") && self.authenticated {
+                // SSUBSCRIBE is accepted as a standalone alias of SUBSCRIBE so
+                // cluster-aware clients that issue sharded subscribe still work.
+                if (cmd_name == "SUBSCRIBE" || cmd_name == "PSUBSCRIBE" || cmd_name == "SSUBSCRIBE")
+                    && self.authenticated
+                {
                     self.db.stats.record_command();
+                    // SSUBSCRIBE behaves like SUBSCRIBE (not pattern).
                     subscribe_args = Some((args, cmd_name == "PSUBSCRIBE"));
                     break 'inner;
+                }
+
+                // MONITOR takes over the connection: after +OK, stream every
+                // subsequent server command as a Redis-compatible monitor line.
+                if cmd_name == "MONITOR" && self.authenticated {
+                    self.db.stats.record_command();
+                    // Flush any pending batch output first.
+                    self.write_buf.finalize();
+                    if !self.write_buf.is_empty() {
+                        if let Err(e) = self.stream.write_all_buf(&mut self.write_buf).await {
+                            error!("write error to {}: {}", self.addr, e);
+                            break 'outer;
+                        }
+                        self.write_buf.clear();
+                    }
+                    // Reply OK then enter monitor mode until disconnect.
+                    let ok = Resp::ok();
+                    self.write_buf.clear();
+                    ok.write_to_for_version(&mut self.write_buf, self.resp_version);
+                    self.write_buf.finalize();
+                    if let Err(e) = self.stream.write_all_buf(&mut self.write_buf).await {
+                        error!("write error to {}: {}", self.addr, e);
+                        break 'outer;
+                    }
+                    self.run_monitor_mode().await;
+                    break 'outer;
                 }
 
                 // PSYNC takes over the connection — flush current batch and enter
@@ -367,6 +440,12 @@ impl Connection {
                 // into dispatch below, but for slowlog we only need
                 // the length.
                 let args_count = args.len();
+                // MONITOR needs full args before dispatch consumes them.
+                let monitor_line = if cmd_name != "MONITOR" && self.db.monitor.has_subscribers() {
+                    Some(format_monitor_line(self.db_index, self.addr, &args))
+                } else {
+                    None
+                };
                 // Must be computed before `args` moves into dispatch below —
                 // see `resp3_should_nest_pairs` doc comment.
                 let resp3_nest_pairs = Connection::resp3_should_nest_pairs(&cmd_name, &args);
@@ -537,7 +616,17 @@ impl Connection {
                     };
                     Metrics::record_with_handles(handles, elapsed.as_secs_f64(), is_error);
                 }
-                if elapsed.as_micros() as u64 >= self.db.slowlog.threshold_us() {
+                // 0.7.4: feed the dedicated latency monitor on every timed
+                // command (independent of the slowlog threshold) so
+                // LATENCY LATEST / HISTORY / HISTOGRAM always have data
+                // when metrics or slowlog is enabled.
+                let us = elapsed.as_micros() as u64;
+                if us > 0 {
+                    // Event name is the lowercased command (Redis convention).
+                    let event = cmd_name.to_ascii_lowercase();
+                    self.db.latency.record(&event, us);
+                }
+                if us >= self.db.slowlog.threshold_us() {
                     let sl = &self.db.slowlog;
                     // Slow path: `args` was moved into dispatch above and
                     // already dropped, so we synthesize a minimal
@@ -546,6 +635,11 @@ impl Connection {
                     // full arg payload is dispensable for the 99% case.
                     let sl_args = vec![cmd_name.clone(), format!("({} args)", args_count)];
                     sl.record(elapsed, sl_args, self.addr.to_string());
+                }
+
+                // Fan out to MONITOR clients (skip MONITOR itself).
+                if let Some(line) = monitor_line {
+                    self.db.monitor.publish(line);
                 }
 
                 let response = Connection::upgrade_to_resp3(
@@ -912,7 +1006,7 @@ impl Connection {
             self.db.pubsub.unsubscribe(&ch);
         }
         for pat in self.pattern_subscriptions.drain(..) {
-            self.db.pubsub.unsubscribe(&pat);
+            self.db.pubsub.punsubscribe(&pat);
         }
 
         // Re-auth required when requirepass is set; otherwise stay as default.
@@ -946,7 +1040,11 @@ impl Connection {
             };
 
             if !target.contains(&channel_vec) {
-                let mut rx = self.db.pubsub.subscribe(channel_vec.clone());
+                let mut rx = if is_pattern {
+                    self.db.pubsub.psubscribe(channel_vec.clone())
+                } else {
+                    self.db.pubsub.subscribe(channel_vec.clone())
+                };
                 target.push(channel_vec.clone());
 
                 let tx = self.pubsub_tx.clone();
@@ -1014,7 +1112,11 @@ impl Connection {
 
         for channel in channels_to_unsub {
             target.retain(|s| s != &channel);
-            self.db.pubsub.unsubscribe(&channel);
+            if is_pattern {
+                self.db.pubsub.punsubscribe(&channel);
+            } else {
+                self.db.pubsub.unsubscribe(&channel);
+            }
             let count = target.len() as i64;
             let kind = if is_pattern {
                 "punsubscribe"
@@ -1038,15 +1140,78 @@ impl Connection {
         }
     }
 
+    /// Stream MONITOR lines until the client disconnects (or issues QUIT).
+    /// Holds a `MonitorGuard` so the server-wide subscriber count stays honest.
+    async fn run_monitor_mode(&mut self) {
+        let (mut rx, _guard) = self.db.monitor.subscribe();
+        loop {
+            tokio::select! {
+                line = rx.recv() => {
+                    match line {
+                        Ok(line) => {
+                            // Redis MONITOR replies are simple strings: +line\r\n
+                            let frame = Resp::SimpleString(line);
+                            self.write_buf.clear();
+                            frame.write_to_for_version(&mut self.write_buf, self.resp_version);
+                            self.write_buf.finalize();
+                            if self.stream.write_all_buf(&mut self.write_buf).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+                read = self.stream.read_buf(&mut self.read_buf) => {
+                    match read {
+                        Ok(0) => return, // client closed
+                        Ok(_) => {
+                            // Drain any client input; honour QUIT by exiting.
+                            self.parser.feed(&self.read_buf);
+                            self.read_buf.clear();
+                            while let Ok(Some(resp)) = self.parser.parse_one() {
+                                if let Resp::Array(Some(a)) = resp {
+                                    let cmd = a.first().and_then(|x| x.as_str()).unwrap_or("").to_ascii_uppercase();
+                                    if cmd == "QUIT" || cmd == "RESET" {
+                                        let _ = self.stream
+                                            .write_all(&Resp::ok().serialize_for_version(self.resp_version))
+                                            .await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+            }
+        }
+    }
+
     async fn run_subscribe_mode(&mut self) {
         loop {
             tokio::select! {
                 Some(msg) = self.pubsub_rx.recv() => {
-                    let payload = vec![
-                        Resp::bulk_str("message"),
-                        Resp::bulk(Bytes::from(msg.channel)),
-                        Resp::bulk(Bytes::from(msg.payload)),
-                    ];
+                    use nexrade_core::pubsub::MessageKind;
+                    let payload = match msg.kind {
+                        MessageKind::PMessage => {
+                            // Redis: ["pmessage", pattern, channel, payload]
+                            vec![
+                                Resp::bulk_str("pmessage"),
+                                Resp::bulk(Bytes::from(msg.channel)),
+                                Resp::bulk(Bytes::from(msg.source)),
+                                Resp::bulk(Bytes::from(msg.payload)),
+                            ]
+                        }
+                        _ => {
+                            // Redis: ["message", channel, payload]
+                            vec![
+                                Resp::bulk_str("message"),
+                                Resp::bulk(Bytes::from(msg.channel)),
+                                Resp::bulk(Bytes::from(msg.payload)),
+                            ]
+                        }
+                    };
                     let frame = if self.resp_version >= 3 {
                         Resp::Push(payload)
                     } else {
@@ -1082,11 +1247,19 @@ impl Connection {
                         let cmd = args[0].as_str().unwrap_or("").to_ascii_uppercase();
 
                         match cmd.as_str() {
-                            "SUBSCRIBE" | "PSUBSCRIBE" => {
-                                self.do_subscribe(&args, cmd == "PSUBSCRIBE").await;
+                            "SUBSCRIBE" | "PSUBSCRIBE" | "SSUBSCRIBE" => {
+                                self.do_subscribe(
+                                    &args,
+                                    cmd == "PSUBSCRIBE",
+                                )
+                                .await;
                             }
-                            "UNSUBSCRIBE" | "PUNSUBSCRIBE" => {
-                                self.do_unsubscribe(&args, cmd == "PUNSUBSCRIBE").await;
+                            "UNSUBSCRIBE" | "PUNSUBSCRIBE" | "SUNSUBSCRIBE" => {
+                                self.do_unsubscribe(
+                                    &args,
+                                    cmd == "PUNSUBSCRIBE",
+                                )
+                                .await;
                                 if self.subscriptions.is_empty() {
                                     return;
                                 }
@@ -1173,7 +1346,12 @@ impl Connection {
         }
 
         // Step 3 — Register replica and subscribe to the broadcast channel.
-        let replica_id = self.db.replication.register_replica(self.addr);
+        // 0.8.0: seed the replica offset at the FULLRESYNC point so WAIT
+        // sees a freshly synced replica as caught up (was always 0).
+        let replica_id = self
+            .db
+            .replication
+            .register_replica(self.addr, current_offset);
         let mut rx = match self.db.replication.subscribe_propagation() {
             Some(r) => r,
             None => {
@@ -1480,7 +1658,7 @@ impl Connection {
     fn resp3_should_nest_pairs(cmd_name: &str, args: &[Resp]) -> bool {
         match cmd_name {
             "ZRANGE" | "ZREVRANGE" | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" | "ZINTER" | "ZUNION"
-            | "ZDIFF" => args.iter().skip(1).any(|a| {
+            | "ZDIFF" | "ZRANDMEMBER" => args.iter().skip(1).any(|a| {
                 a.as_str()
                     .is_some_and(|s| s.eq_ignore_ascii_case("WITHSCORES"))
             }),
@@ -1498,6 +1676,8 @@ impl Connection {
     /// - `HGETALL` in RESP3 returns a Map (`%N`), not a flat array of
     ///   `[field, value, field, value, ...]`. redis-py 8.0+ raises on the
     ///   legacy shape when running in RESP3 mode.
+    /// - `CONFIG GET` / `MEMORY STATS` in RESP3 also return a Map (redis-py 8
+    ///   `parse_config_get_resp3_to_resp2_legacy` / memory stats expect `.items()`).
     /// - `HKEYS`, `HVALS`, `SMEMBERS` in RESP3 return a Set (`~N`).
     /// - `XREAD` / `XREADGROUP` in RESP3 return a Map `{stream: entries}`
     ///   instead of an array of `[stream, entries]` pairs.
@@ -1524,12 +1704,19 @@ impl Connection {
         // confirmed via redis-benchmark (105-115k -> 80-82k rps, 3 rounds).
         match (cmd_name, resp) {
             ("HGETALL", Resp::Array(Some(items))) if items.len() % 2 == 0 => {
-                let mut pairs = Vec::with_capacity(items.len() / 2);
-                let mut iter = items.into_iter();
-                while let (Some(k), Some(v)) = (iter.next(), iter.next()) {
-                    pairs.push((k, v));
-                }
-                Resp::Map(pairs)
+                Self::flat_pairs_to_map(items)
+            }
+            // CONFIG GET / MEMORY STATS: flat [k,v,k,v,…] → Map in RESP3.
+            // redis-py 8 always routes these through a map-aware callback.
+            ("CONFIG", Resp::Array(Some(items))) if items.len() % 2 == 0 => {
+                // Only GET returns a kv array; SET/REWRITE return simple OK.
+                Self::flat_pairs_to_map(items)
+            }
+            ("MEMORY", Resp::Array(Some(items))) if items.len() % 2 == 0 => {
+                // MEMORY STATS is a flat kv array; USAGE is Integer, HELP is
+                // array of bulks (odd length or non-kv) — those fall through
+                // when len is odd / not even.
+                Self::flat_pairs_to_map(items)
             }
             ("HKEYS" | "HVALS" | "SMEMBERS", Resp::Array(Some(items))) => Resp::Set(items),
             ("XREAD" | "XREADGROUP", Resp::Array(Some(streams))) => {
@@ -1548,7 +1735,7 @@ impl Connection {
             }
             (
                 "ZRANGE" | "ZREVRANGE" | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" | "ZINTER" | "ZUNION"
-                | "ZDIFF" | "ZPOPMIN" | "ZPOPMAX",
+                | "ZDIFF" | "ZPOPMIN" | "ZPOPMAX" | "ZRANDMEMBER",
                 Resp::Array(Some(items)),
             ) if nest_pairs && items.len() % 2 == 0 => {
                 // Flat alternating [member, score, ...] → nested [[member, score], ...].
@@ -1561,6 +1748,16 @@ impl Connection {
             }
             (_, other) => other,
         }
+    }
+
+    /// Flat `[k, v, k, v, …]` array → RESP3 Map. Caller guarantees even length.
+    fn flat_pairs_to_map(items: Vec<Resp>) -> Resp {
+        let mut pairs = Vec::with_capacity(items.len() / 2);
+        let mut iter = items.into_iter();
+        while let (Some(k), Some(v)) = (iter.next(), iter.next()) {
+            pairs.push((k, v));
+        }
+        Resp::Map(pairs)
     }
 
     // ── HELLO / protocol negotiation ──────────────────────────────────────────

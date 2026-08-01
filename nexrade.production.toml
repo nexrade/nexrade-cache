@@ -1,0 +1,180 @@
+# nexrade-cache — production **standalone** profile
+#
+# Use this when nexrade-cache is a standalone durable cache backing a
+# service (single primary, optional replica). It is the configuration
+# behind `docs/backup-restore.md` and `scripts/operator_drill.py`.
+#
+# Distinct from `nexrade.cache.toml` (pure cache, no persistence, no
+# replica tracking) and `nexrade.example.toml` (general-purpose, all
+# defaults visible). This profile is opinionated about:
+#
+#   - explicit absolute persistence paths owned by the service user,
+#   - enforcement of auth + TLS when the port is reachable beyond
+#     a trusted private network,
+#   - the operations HTTP surface bound to loopback only,
+#   - default RDB-only authoritative recovery (RDB + AOF simultaneously
+#     is rejected by `--preflight` until checkpointed AOF is supported),
+#   - graceful shutdown on SIGTERM/SIGINT so the listener drains before
+#     the process exits.
+#
+# Start with:
+#   nexrade-cache --config nexrade.production.toml
+# Verify (non-mutating) with:
+#   nexrade-cache --config nexrade.production.toml --preflight
+
+# ─── Network ──────────────────────────────────────────────────────────────────
+
+# Bind to a private/VPC interface only. Use a security group or service
+# mesh to enforce auth at the network layer. The default Redis port
+# is kept for drop-in compatibility with existing clients.
+bind = "127.0.0.1"
+port = 6379
+
+databases = 16
+max_clients = 10000
+
+# Auth: MANDATORY here. If your port is reachable from anything beyond
+# a fully trusted network, leaving this empty lets anyone read/write
+# every key. Generate with `openssl rand -hex 32` and inject via your
+# secret manager (Vault, AWS Secrets Manager, env var, ...).
+# requirepass = "set-me-via-secret-manager"
+
+loglevel = "notice"
+hz = 10
+
+# ─── Persistence ──────────────────────────────────────────────────────────────
+#
+# Default authoritative recovery mode is RDB-only. This is the supported
+# combination as of 1.2.0:
+#
+#   - RDB path set + AOF path blank   → RDB-only (recommended)
+#   - RDB path blank + AOF path set   → AOF-only (allowed; verify with
+#                                       `--preflight` first)
+#   - Both set                        → `--preflight` exits non-zero
+#                                       (the snapshot load followed by
+#                                       AOF replay is not implemented)
+#   - Both blank                      → ephemeral; no recovery
+#
+# Use absolute paths under a directory owned by the service user. The
+# default-relative `"nexrade.rdb"` writes next to the working directory
+# of the process, which is rarely what you want in production.
+
+[persistence]
+rdb_path = "/var/lib/nexrade/nexrade.rdb"
+aof_path = ""   # set to e.g. /var/lib/nexrade/nexrade.aof for AOF-only
+
+# RDB fsync policy (`no`|`everysec`|`always`) — only applies when AOF
+# is enabled. Left at the safe default for both modes.
+aof_sync = "everysec"
+
+# Auto-save rules: [[seconds, min_changes], ...]
+# Conservative defaults for a durable cache:
+#   - After 15 min if at least 1 key changed
+#   - After 5 min if at least 100 keys changed
+#   - After 1 min if at least 1000 keys changed
+# Tighten if your workload is write-heavy and you can afford the
+# checkpoint cost; loosen if you'd rather take a longer tail on restart.
+save_rules = [
+    [900, 1],
+    [300, 100],
+    [60, 1000],
+]
+
+# ─── TLS ──────────────────────────────────────────────────────────────────────
+#
+# Enable TLS for any port reachable beyond a trusted private network.
+# The TLS port defaults to 6380 to match Redis 6+ conventions; the
+# plain port above should be bound to a private interface only.
+
+[tls]
+enabled = true
+port = 6380
+# cert = "/etc/nexrade/tls/cert.pem"
+# key  = "/etc/nexrade/tls/key.pem"
+#
+# Generate a self-signed cert for tests:
+#   openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
+# Rotate via your certificate manager in production.
+
+# ─── Operations HTTP surface (NEW in 1.2.0) ──────────────────────────────────
+#
+# `/metrics`, `/healthz`, `/readyz` are the operator's surface. Bind to
+# loopback only — they are intended for a sidecar (Prometheus, kube
+# probes, monitoring agent) on the same host, not direct internet
+# access. If you need remote access, put a reverse proxy in front and
+# authenticate at that layer.
+
+[metrics]
+enabled = true
+bind = "127.0.0.1"
+port = 9091
+
+[health]
+# `/healthz` and `/readyz`. Defaults to disabled so an upgrade within
+# 1.x does not unexpectedly open a port. The production profile
+# enables it explicitly.
+enabled = true
+bind = "127.0.0.1"
+port = 9090
+
+# Readiness gating: a snapshot older than 1 hour, or a replica ACK
+# older than 10 seconds, will make `/readyz` return 503. Set a field
+# to `0` to disable that check.
+max_snapshot_age_secs = 3600
+max_replication_lag_secs = 10
+
+# ─── Lua scripting ────────────────────────────────────────────────────────────
+
+[lua]
+time_limit_ms = 5000
+
+# ─── Slow log ─────────────────────────────────────────────────────────────────
+
+[slowlog]
+log_slower_than = 10000
+max_len = 128
+
+# ─── Memory ───────────────────────────────────────────────────────────────────
+#
+# Cap memory if you have a hard host or container limit. Default is
+# unlimited (== available memory), which is appropriate for a
+# dedicated cache host but unsafe in a shared container.
+# max_memory = 4294967296
+# maxmemory_policy = "allkeys-lru"
+
+# ─── Dual-encoding thresholds ─────────────────────────────────────────────────
+#
+# Defaults match Redis listpack thresholds and are almost always right.
+# Only override if `MEMORY USAGE` / `OBJECT ENCODING` shows your
+# actual key shapes promoting to the large encoding more than expected:
+#   list_max_listpack_entries (default 512)
+#   list_max_listpack_size    (default 8192)
+#   list_max_listpack_value   (default 256)
+#   hash_max_listpack_entries (default 512)
+#   hash_max_listpack_size    (default 8192)
+#   hash_max_listpack_value   (default 64)
+#   set_max_listpack_entries  (default 512)
+#   set_max_listpack_size     (default 8192)
+#   set_max_listpack_value    (default 64)
+#   zset_max_listpack_entries (default 128)
+#   zset_max_listpack_size    (default 8192)
+#   zset_max_listpack_value   (default 64)
+
+# ─── Replication ──────────────────────────────────────────────────────────────
+#
+# Replication is configured at runtime via REPLICAOF:
+#   redis-cli -p 6379 REPLICAOF <primary-host> <primary-port>
+#   redis-cli -p 6379 REPLICAOF NO ONE
+# Replica tracking (offsets, ACK ages) is exposed in INFO replication
+# and the [health] check (max_replication_lag_secs above).
+
+# ─── Advanced ─────────────────────────────────────────────────────────────────
+
+tcp_backlog = 511
+
+# Idle connection timeout (seconds). 0 disables — fine for a cache
+# behind a connection-pooled client (redis-py ConnectionPool, go-redis,
+# lettuce) that manages its own pool lifecycle. Set a positive value
+# here only if you expect long-lived idle connections from misbehaving
+# clients.
+timeout = 0

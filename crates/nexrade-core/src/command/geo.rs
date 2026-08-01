@@ -164,6 +164,10 @@ pub async fn cmd_geoadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
 
     let mut added = 0i64;
     let mut changed = 0i64;
+    // Payload model for Geo matches estimate_entry_size: member name bytes
+    // plus a fixed 24 B per coordinate slot. Only *new* members grow the
+    // counter; overwrites keep the same slot size (Δ0 for coords).
+    let mut payload_delta: isize = 0;
 
     let mut store_db = db.store.db(db_index).write_for(&key);
     let geo = get_geo_mut!(store_db, key);
@@ -199,6 +203,15 @@ pub async fn cmd_geoadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
         }
         if !exists {
             added += 1;
+            // member name is moved into the map; count its length + fixed
+            // coordinate slot (estimate_entry_size uses len * 24 for Geo —
+            // that undercounts name bytes today; we track names so
+            // maxmemory at least sees growth, while full-remove still uses
+            // the coarse estimate). Prefer consistency with insert of a
+            // multi-member geo: estimate uses members.len()*24 only.
+            // Track the fixed slot only so add + eventual DEL net correctly
+            // under the existing estimate model.
+            payload_delta += 24;
         } else {
             changed += 1;
         }
@@ -211,6 +224,7 @@ pub async fn cmd_geoadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
         );
         i += 3;
     }
+    store_db.adjust_live_bytes(payload_delta);
 
     Ok(Resp::Integer(if ch { added + changed } else { added }))
 }
@@ -677,4 +691,183 @@ pub async fn cmd_geosearch(db: &Db, args: &[Resp], db_index: usize) -> Result<Re
         unit: unit_str.as_str(),
     };
     Ok(Resp::array(geo_search_results(geo, &opts)))
+}
+
+/// `GEOSEARCHSTORE destination source FROMMEMBER member | FROMLONLAT lon lat
+///   BYRADIUS radius unit | BYBOX w h unit [ASC|DESC] [COUNT n] [STOREDIST]`
+///
+/// Same search as GEOSEARCH, but writes matching members into `destination`
+/// as a geo key (or, with STOREDIST, a zset of member → distance). Returns
+/// the number of stored elements.
+pub async fn cmd_geosearchstore(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
+    if args.len() < 7 {
+        return Err(NexradeError::WrongArity("geosearchstore".to_string()));
+    }
+    let dest = get_str(args, 1, "GEOSEARCHSTORE")?.as_bytes().to_vec();
+    let key = get_str(args, 2, "GEOSEARCHSTORE")?.as_bytes().to_vec();
+
+    let (center_lon, center_lat, mut idx) = match args
+        .get(3)
+        .and_then(|a| a.as_str())
+        .map(|s| s.to_uppercase())
+        .as_deref()
+    {
+        Some("FROMLONLAT") => {
+            let lon: f64 = args
+                .get(4)
+                .and_then(|a| a.as_str())
+                .and_then(|s| s.parse().ok())
+                .ok_or(NexradeError::NotFloat)?;
+            let lat: f64 = args
+                .get(5)
+                .and_then(|a| a.as_str())
+                .and_then(|s| s.parse().ok())
+                .ok_or(NexradeError::NotFloat)?;
+            (lon, lat, 6usize)
+        }
+        Some("FROMMEMBER") => {
+            let member = args[4]
+                .as_bytes()
+                .map(|b| b.to_vec())
+                .unwrap_or_else(|| args[4].as_str().unwrap_or("").as_bytes().to_vec());
+            let store_db = db.store.db(db_index).read_for(&key);
+            let entry = store_db
+                .get_ro(&key)
+                .ok_or_else(|| NexradeError::Generic("no such key".to_string()))?;
+            let geo = get_geo_ro(entry)?;
+            let pt = geo.members.get(&member).ok_or_else(|| {
+                NexradeError::Generic("could not decode requested zset member".to_string())
+            })?;
+            (pt.longitude, pt.latitude, 5usize)
+        }
+        _ => return Err(NexradeError::SyntaxError),
+    };
+
+    let (radius_m, unit_str) = match args
+        .get(idx)
+        .and_then(|a| a.as_str())
+        .map(|s| s.to_uppercase())
+        .as_deref()
+    {
+        Some("BYRADIUS") => {
+            let r: f64 = args
+                .get(idx + 1)
+                .and_then(|a| a.as_str())
+                .and_then(|s| s.parse().ok())
+                .ok_or(NexradeError::NotFloat)?;
+            let u = args
+                .get(idx + 2)
+                .and_then(|a| a.as_str())
+                .ok_or(NexradeError::SyntaxError)?;
+            let rm = to_meters(r, u)?;
+            idx += 3;
+            (rm, u.to_string())
+        }
+        Some("BYBOX") => {
+            let w: f64 = args
+                .get(idx + 1)
+                .and_then(|a| a.as_str())
+                .and_then(|s| s.parse().ok())
+                .ok_or(NexradeError::NotFloat)?;
+            let h: f64 = args
+                .get(idx + 2)
+                .and_then(|a| a.as_str())
+                .and_then(|s| s.parse().ok())
+                .ok_or(NexradeError::NotFloat)?;
+            let u = args
+                .get(idx + 3)
+                .and_then(|a| a.as_str())
+                .ok_or(NexradeError::SyntaxError)?;
+            let wm = to_meters(w, u)?;
+            let hm = to_meters(h, u)?;
+            let rm = ((wm / 2.0).powi(2) + (hm / 2.0).powi(2)).sqrt();
+            idx += 4;
+            (rm, u.to_string())
+        }
+        _ => return Err(NexradeError::SyntaxError),
+    };
+
+    let mut asc = false;
+    let mut desc = false;
+    let mut count: Option<usize> = None;
+    let mut storedist = false;
+    while idx < args.len() {
+        match args[idx].as_str().unwrap_or("").to_uppercase().as_str() {
+            "ASC" => asc = true,
+            "DESC" => desc = true,
+            "STOREDIST" => storedist = true,
+            "COUNT" => {
+                idx += 1;
+                count = args
+                    .get(idx)
+                    .and_then(|a| a.as_str())
+                    .and_then(|s| s.parse().ok());
+            }
+            "WITHCOORD" | "WITHDIST" | "WITHHASH" => {
+                return Err(NexradeError::Generic(
+                    "ERR GEOSEARCHSTORE does not support WITHDIST/WITHCOORD/WITHHASH".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    let hits: Vec<(Vec<u8>, f64, f64, f64)> = {
+        let store_db = db.store.db(db_index).read_for(&key);
+        let entry = match store_db.get_ro(&key) {
+            Some(e) => e,
+            None => {
+                drop(store_db);
+                let mut dest_shard = db.store.db(db_index).write_for(&dest);
+                dest_shard.remove(&dest);
+                return Ok(Resp::int(0));
+            }
+        };
+        let geo = get_geo_ro(entry)?;
+        let mut hits: Vec<(Vec<u8>, f64, f64, f64)> = geo
+            .members
+            .iter()
+            .filter_map(|(member, pt)| {
+                let dist = haversine_m(center_lon, center_lat, pt.longitude, pt.latitude);
+                if dist <= radius_m {
+                    Some((member.clone(), dist, pt.longitude, pt.latitude))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if asc {
+            hits.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        } else if desc {
+            hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        if let Some(n) = count {
+            hits.truncate(n);
+        }
+        hits
+    };
+
+    let n = hits.len() as i64;
+    let mut dest_shard = db.store.db(db_index).write_for(&dest);
+    if storedist {
+        let mut z = crate::types::ZSetData::new();
+        for (member, dist, _, _) in hits {
+            z.insert(member, from_meters(dist, &unit_str));
+        }
+        dest_shard.insert(dest, Entry::new(DataType::ZSet(z)));
+    } else {
+        let mut g = GeoData::new();
+        for (member, _, lon, lat) in hits {
+            g.members.insert(
+                member,
+                GeoPoint {
+                    longitude: lon,
+                    latitude: lat,
+                },
+            );
+        }
+        dest_shard.insert(dest, Entry::new(DataType::Geo(g)));
+    }
+    Ok(Resp::int(n))
 }

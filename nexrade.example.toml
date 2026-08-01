@@ -57,8 +57,26 @@ port = 6380
 
 [metrics]
 enabled = true
+# Bind to a private/VPC interface only. Use a sidecar or security group
+# to enforce auth at the network layer.
+# bind = "127.0.0.1"
 # Prometheus metrics endpoint: http://host:port/metrics
 port = 9091
+
+# ─── Operations HTTP surface (1.2.0) ────────────────────────────────────────────
+#
+# `/healthz` and `/readyz` are the operator's surface. Disabled by default
+# so an upgrade within 1.x does not unexpectedly open a port. Bind to
+# loopback in production; remote access should go through an authenticated
+# reverse proxy. These endpoints are plaintext and unauthenticated —
+# Redis `requirepass` and `[tls]` do not apply to them.
+
+[health]
+# enabled = false                  # set to true to bind
+# bind = "127.0.0.1"               # loopback by default
+# port = 9090                      # readiness probe port
+# max_snapshot_age_secs = 3600     # 0 disables
+# max_replication_lag_secs = 10    # 0 disables
 
 # Set NEXRADE_LOG_JSON=1 for structured JSON logging (for Loki/Datadog/etc.)
 
@@ -80,6 +98,38 @@ max_len = 128
 
 # Maximum memory usage (bytes). 0 = unlimited.
 # max_memory = 0
+
+# ─── List dual-encoding (listpack / linkedlist) ─────────────────────────────────
+# Short lists use a contiguous Compact blob (OBJECT ENCODING listpack).
+# Promote to linkedlist when any threshold is exceeded; demote after shrink.
+
+# Max elements before promote (default 512)
+# list_max_listpack_entries = 512
+# Max total element payload bytes before promote (default 8192)
+# list_max_listpack_size = 8192
+# Max single element bytes before promote (default 256)
+# list_max_listpack_value = 256
+# After pop/trim, demote linkedlist → listpack when ≤ this many entries
+# (and size/elem still fit). Default 128; 0 disables demote.
+# list_demote_entries = 128
+
+# ─── Hash dual-encoding (listpack / hashtable) ──────────────────────────────────
+# hash_max_listpack_entries = 512
+# hash_max_listpack_size = 8192
+# hash_max_listpack_value = 64
+# hash_demote_entries = 128
+
+# ─── Set dual-encoding (listpack / hashtable) ───────────────────────────────────
+# set_max_listpack_entries = 512
+# set_max_listpack_size = 8192
+# set_max_listpack_value = 64
+# set_demote_entries = 128
+
+# ─── Sorted set dual-encoding (listpack / skiplist) ─────────────────────────────
+# zset_max_listpack_entries = 128
+# zset_max_listpack_size = 8192
+# zset_max_listpack_value = 64
+# zset_demote_entries = 64
 
 # ─── Replication ────────────────────────────────────────────────────────────────
 
