@@ -12,6 +12,7 @@ use crate::hash_data::{hash_thresholds, set_hash_thresholds};
 use crate::list_data::{list_thresholds, set_list_thresholds};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::persistence::Snapshot;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::replication::ReplicationRole;
 use crate::resp::Resp;
 use crate::set_data::{set_set_thresholds, set_thresholds};

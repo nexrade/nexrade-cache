@@ -9,4 +9,10 @@ targets = [
     "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc",
     "aarch64-pc-windows-msvc",
+    # Needed by the `wasm-check` CI job and by `wasm-pack build`. Declared
+    # here rather than only in the workflow because this file pins the
+    # channel to 1.87: a workflow step that installs a target for `stable`
+    # still gets sent back to 1.87 by this pin, so the target would be
+    # missing and the build fails with "can't find crate for `core`".
+    "wasm32-unknown-unknown",
 ]

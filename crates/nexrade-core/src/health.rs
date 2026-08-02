@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::Db;
 use crate::persistence::PersistenceConfig;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::replication::ReplicationRole;
 
 /// Lifecycle phase. Stored in `Db`; transitions are explicit and serialised
@@ -348,6 +349,7 @@ impl Default for LifecycleState {
 /// Build the canonical health report from live `Db` state. Returns a fresh
 /// snapshot on every call. The result is the single source of truth for
 /// HTTP, `INFO health`, and Prometheus operational gauges.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn health_report(db: &Db) -> HealthReport {
     let config = db.config.lock();
     let lifecycle = db.lifecycle();
@@ -522,6 +524,27 @@ pub fn health_report(db: &Db) -> HealthReport {
     }
 }
 
+/// WASM builds have no persistence coordinator, replication state, or
+/// lifecycle tracker on `Db` (all three are `#[cfg(not(wasm32))]`), so
+/// there is nothing live to sample. Report the static default: not
+/// ready, and `live` only in the sense that the module loaded.
+#[cfg(target_arch = "wasm32")]
+pub fn health_report(_db: &Db) -> HealthReport {
+    HealthReport {
+        live: true,
+        ready: false,
+        phase: HealthPhase::Recovering,
+        reasons: vec![ReadinessReasonDetail {
+            code: ReadinessReason::PersistenceQuiescing,
+            message: "health reporting is not available in WASM mode".to_string(),
+        }],
+        persistence: PersistenceHealth::default(),
+        replication: ReplicationHealth::default(),
+        active_background_job: ActiveBackgroundJob::None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn build_replication_health(
     config: &crate::db::ServerConfig,
     db: &Db,

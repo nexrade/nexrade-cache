@@ -103,6 +103,45 @@ jobs:
       - name: Run all tests
         run: cargo test --workspace --all-features
 
+  # ─── WASM target check ──────────────────────────────────────────────────────
+  # `cargo build/test --workspace` builds every crate for the HOST target, so
+  # it silently skips all `#[cfg(target_arch = "wasm32")]` branches. A missing
+  # cfg gate on a wasm-gated item (e.g. importing `crate::replication`, which
+  # is `#[cfg(not(wasm32))]`) therefore compiles fine on the host and only
+  # breaks for wasm consumers.
+  #
+  # The full wasm-pack build lives in examples.yml, but that workflow is gated
+  # to main/master — so on a feature branch the breakage stayed invisible
+  # until after merge. This job is a cheap `cargo check` that runs on every
+  # branch and catches the same class of error in ~1 min.
+  wasm-check:
+    name: WASM target check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # rust-toolchain.toml pins the channel to 1.87 and now lists
+      # wasm32-unknown-unknown in its `targets`, so rustup provisions the
+      # target for the pinned toolchain automatically. Installing for
+      # `stable` here instead would be a no-op: the pin sends cargo back to
+      # 1.87, which would then be missing the target ("can't find crate for
+      # `core`"). Pinning the action to the same version keeps the two in
+      # agreement.
+      - name: Install Rust 1.87 + wasm32 target
+        uses: dtolnay/rust-toolchain@1.87.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm-check
+
+      - name: Check nexrade-core for wasm32
+        run: cargo check -p nexrade-core --target wasm32-unknown-unknown
+
+      - name: Check nexrade-wasm for wasm32
+        run: cargo check -p nexrade-wasm --target wasm32-unknown-unknown --features wasm
+
   # ─── Client wire smokes (1.0.0) ────────────────────────────────────────────
   # Three independent parsers against one release binary:
   #   1. scripts/redis_py_smoke.py          — redis-py sync + asyncio (31+5)
