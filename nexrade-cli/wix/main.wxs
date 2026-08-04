@@ -6,7 +6,7 @@
 <?endif ?>
 
 <Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'
-     xmlns:firewall='http://schemas.microsoft.com/wix/2006/wi/wixfirewall'>
+     xmlns:firewall='http://schemas.microsoft.com/wix/FirewallExtension'>
 
     <Product
         Id='*'
@@ -123,12 +123,12 @@
                              which already defaults to 6399. -->
                     <Component Id='NexradeCacheFirewall' Guid='*' Win64='yes'>
                         <Condition><![CDATA[INSTALLFIREWALL]]></Condition>
-                        <firewall:Firewall Id='NexradeCacheFirewallRule'
+                        <firewall:FirewallException Id='NexradeCacheFirewallRule'
                                            Name='nexrade-cache'
                                            Port='[INSTALLPORT]'
                                            Protocol='tcp'
                                            Profile='all'
-                                           Scope='all'
+                                           Scope='any'
                                            Description='Inbound TCP for nexrade-cache (Redis-compatible cache)'/>
                     </Component>
 

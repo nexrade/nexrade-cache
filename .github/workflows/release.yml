@@ -305,7 +305,7 @@ jobs:
 
       # WixFirewallExtension is shipped as a separate DLL alongside candle.exe,
       # not in the Chocolatey wixtoolset package. The MSI uses it for the
-      # `<firewall:Firewall>` element that adds/removes the Windows Firewall
+      # `<firewall:FirewallException>` element that adds/removes the Windows Firewall
       # inbound rule tied to the operator-supplied port from the installer
       # dialog. The wix314-binaries.zip artifact on the upstream wix3 release
       # contains the matching 3.14.x build.
@@ -332,7 +332,7 @@ jobs:
 
       - name: Build MSI
         run: |
-          # WixFirewallExtension provides the `<firewall:Firewall>` schema.
+          # WixFirewallExtension provides the `<firewall:FirewallException>` schema.
           # candle.exe/light.exe parse `-ext` by taking arg.Substring(1) and
           # comparing the result to the literal "ext", then consuming the NEXT
           # argv element as the extension name. So `-ext` and the name must
@@ -343,7 +343,7 @@ jobs:
           # candle see the single token `ext WixFirewallExtension`, fail the
           # "ext" comparison, and emit CNDL1098 ("not a valid command line
           # argument") -- the extension then never loads and the
-          # <firewall:Firewall> element fails with CNDL0200.
+          # <firewall:FirewallException> element fails with CNDL0200.
           cargo wix --package nexrade-cache --no-build --nocapture `
             --target ${{ matrix.target }} `
             --compiler-arg "-ext" --compiler-arg "WixFirewallExtension" `
