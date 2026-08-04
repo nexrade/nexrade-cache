@@ -17,6 +17,8 @@
 /// # Example
 ///
 /// ```no_run
+/// use nexrade_cache::windows_ansi::enable_ansi_support;
+///
 /// enable_ansi_support();
 /// println!("\x1b[31mRed text\x1b[0m");
 /// println!("\x1b[1;32mBold green text\x1b[0m");

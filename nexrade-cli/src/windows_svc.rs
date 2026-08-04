@@ -37,6 +37,16 @@ const SERVICE_NAME: &str = "nexrade-cache";
 const SERVICE_DISPLAY: &str = "Nexrade Cache";
 const SERVICE_DESCRIPTION: &str = "High-performance Redis-compatible cache server (nexrade-cache)";
 
+/// How long a stop may spend on the graceful flush (drain tasks, final RDB
+/// save, AOF fsync) before we give up and exit anyway.
+///
+/// Bounded deliberately: a stop that never completes leaves the service in
+/// StopPending, which Windows treats as un-stoppable *and* un-deletable — the
+/// exact state that made an earlier build impossible for the installer to
+/// remove. 30s covers a large snapshot on slow disks while staying well inside
+/// the SCM's tolerance.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ─── Install / Uninstall ──────────────────────────────────────────────────────
 
 /// Install nexrade-cache as an auto-start Windows service.
@@ -236,18 +246,39 @@ fn run_service(config: ServerConfig) -> Result<()> {
         .context("set StartPending")?;
 
     // Start the tokio runtime + server on a background thread so this thread
-    // remains available for SCM control events. The handle is intentionally
-    // dropped (the thread runs detached): `start_server` -> `listener.run()`
-    // loops for the life of the process and has no graceful-shutdown hook, so
-    // there is nothing to join on at stop time — see the stop handling below.
+    // remains available for SCM control events.
+    //
+    // `start_server_with` hands back the `Db` as soon as it exists so the stop
+    // path below can trigger the same graceful shutdown as the `SHUTDOWN`
+    // command. `server_done` reports when the server has finished unwinding
+    // (including its RDB save / AOF fsync) so we can wait for durability
+    // rather than guessing.
+    let (db_tx, db_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("tokio runtime");
-        rt.block_on(crate::start_server(config))
-            .expect("server exited with error");
+        let result = rt.block_on(crate::start_server_with(config, |db| {
+            let _ = db_tx.send(db);
+        }));
+        if let Err(ref e) = result {
+            eprintln!("server exited with error: {e:#}");
+        }
+        // Signal completion regardless of outcome; the stop path only needs to
+        // know the shutdown sequence has finished running.
+        let _ = done_tx.send(result.is_ok());
     });
+
+    // The server sends its `Db` almost immediately, but bound the wait so a
+    // failure to bind (port in use) can't leave us blocked here forever with
+    // the SCM still waiting on StartPending.
+    let db = db_rx.recv_timeout(Duration::from_secs(30)).ok();
+    if db.is_none() {
+        eprintln!("warning: server did not report readiness within 30s; \
+                   stop will terminate without a graceful flush");
+    }
 
     // Report Running.
     let running = ServiceStatus {
@@ -266,13 +297,60 @@ fn run_service(config: ServerConfig) -> Result<()> {
     // Wait for stop signal from SCM.
     let _ = stop_rx.recv();
 
-    // Report Stopped immediately. We do NOT try to join the server thread:
-    // `listener.run()` never returns on its own, so joining here would hang
-    // the service in STOP_PENDING forever (SCM then refuses both further
-    // stops — error 1061 — and any restart — error 1056). Reporting Stopped
-    // and then terminating the process is the correct shutdown for a service
-    // whose workload has no cooperative-cancellation path: the OS reclaims
-    // the listener sockets and tokio runtime on exit.
+    // Tell the SCM we heard it and are working on it. Without this the service
+    // sits in Running until we report Stopped, and any stop taking longer than
+    // the SCM's patience looks like a hang. `wait_hint` must cover the worst
+    // realistic flush; SCM only requires that we keep advancing `checkpoint`
+    // or report a terminal state before it elapses.
+    let stop_pending = ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::StopPending,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 1,
+        wait_hint: SHUTDOWN_TIMEOUT + Duration::from_secs(5),
+        process_id: None,
+    };
+    status_handle
+        .set_service_status(stop_pending)
+        .context("set StopPending")?;
+
+    // Trigger the graceful path: this is the same notify the `SHUTDOWN`
+    // command uses, so the listener stops accepting, drains background tasks,
+    // writes a final RDB snapshot if there are dirty keys, and fsyncs the AOF.
+    // Skipping this (the previous behaviour: report Stopped, then exit
+    // immediately) dropped anything not yet persisted — with the default
+    // `appendfsync everysec` that is up to a second of acknowledged writes.
+    let flushed = match db {
+        Some(ref db) => {
+            db.shutdown.notify_one();
+            // Bounded: a wedged flush must not hold the service in
+            // StopPending forever — that is what made the old build
+            // undeletable by the installer (SCM refuses to remove a service
+            // stuck mid-stop). On timeout we exit anyway and accept the data
+            // loss, which is strictly no worse than the old unconditional
+            // kill.
+            match done_rx.recv_timeout(SHUTDOWN_TIMEOUT) {
+                Ok(true) => true,
+                Ok(false) => {
+                    eprintln!("graceful shutdown reported an error; see the log above");
+                    false
+                }
+                Err(_) => {
+                    eprintln!(
+                        "graceful shutdown did not finish within {}s; forcing exit \
+                         (recent writes may be lost)",
+                        SHUTDOWN_TIMEOUT.as_secs()
+                    );
+                    false
+                }
+            }
+        }
+        None => false,
+    };
+
+    // Report Stopped only after the flush has finished (or definitively
+    // failed), so `Stop-Service` returning means the data is actually on disk.
     let stopped = ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Stopped,
@@ -286,9 +364,10 @@ fn run_service(config: ServerConfig) -> Result<()> {
         .set_service_status(stopped)
         .context("set Stopped")?;
 
-    // Terminate now that SCM has been told we're stopped. Returning would also
-    // work (the detached server thread does not keep the process alive past
-    // `main`), but an explicit exit removes any ambiguity and guarantees the
-    // listener's port is released promptly for the next start.
+    // Terminate now that SCM has been told we're stopped. Exit code stays 0
+    // even on a failed flush: a non-zero code would trip the restart-on-
+    // failure actions configured at install time, and restarting after an
+    // operator-requested stop is the wrong response.
+    let _ = flushed;
     std::process::exit(0);
 }

@@ -167,6 +167,12 @@ async fn lmove_across_compact_lists() {
 #[test]
 fn list_data_unit_promote_and_range() {
     use bytes::Bytes;
+    // Takes LP_LOCK like the other threshold-sensitive tests: this asserts a
+    // 4-element list is still Compact, which only holds at the default
+    // MAX_ENTRIES. `config_set_listpack_entries_retunes_promote` drops that
+    // global to 3, so without the lock the two racing in parallel make this
+    // fail intermittently.
+    let _guard = LP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut l = ListData::new();
     for s in [b"a" as &[u8], b"b", b"c", b"d"] {
         l.push_back(Bytes::copy_from_slice(s));

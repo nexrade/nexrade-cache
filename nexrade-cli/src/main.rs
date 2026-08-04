@@ -318,11 +318,27 @@ fn resolve_persistence_path(path: &str) -> String {
 /// Start the server with the given config.  Called from both `main()` and the
 /// Windows service thread.
 pub(crate) async fn start_server(config: ServerConfig) -> Result<()> {
+    start_server_with(config, |_| {}).await
+}
+
+/// `start_server`, but invokes `on_db` with a clone of the [`Db`] as soon as it
+/// exists — before the listener starts serving.
+///
+/// The Windows service needs this: its SCM stop handler runs on a different
+/// thread than the tokio runtime and must be able to call
+/// `db.shutdown.notify_one()` to trigger the same graceful path as the
+/// `SHUTDOWN` command (drain tasks, save RDB, fsync AOF). Without a handle it
+/// could only kill the process, losing anything not yet persisted.
+pub(crate) async fn start_server_with<F>(config: ServerConfig, on_db: F) -> Result<()>
+where
+    F: FnOnce(Db),
+{
     // Print banner
     print_banner(&config);
 
     // Initialize the database
     let db = Db::new(config.clone());
+    on_db(db.clone());
 
     // Start metrics server (Prometheus /metrics). Both metrics and
     // health servers are spawned as background tasks: their `start`
@@ -1247,6 +1263,15 @@ enabled = true
             health_port: None,
             health_max_snapshot_age: None,
             health_max_replication_lag: None,
+            // Declared #[cfg(windows)] on `Cli`, so they must be gated here
+            // too or this literal fails to compile on a Windows host (E0063).
+            // The ubuntu-only CI test job cannot catch that.
+            #[cfg(windows)]
+            install_service: false,
+            #[cfg(windows)]
+            uninstall_service: false,
+            #[cfg(windows)]
+            service: false,
         };
         let cfg = config_from_cli(&cli).unwrap();
         assert_eq!(cfg.bind, "10.0.0.5");
@@ -1301,6 +1326,15 @@ port = 9099
             health_port: None,
             health_max_snapshot_age: None,
             health_max_replication_lag: None,
+            // Declared #[cfg(windows)] on `Cli`, so they must be gated here
+            // too or this literal fails to compile on a Windows host (E0063).
+            // The ubuntu-only CI test job cannot catch that.
+            #[cfg(windows)]
+            install_service: false,
+            #[cfg(windows)]
+            uninstall_service: false,
+            #[cfg(windows)]
+            service: false,
         };
         let cfg = config_from_cli(&cli).unwrap();
         assert_eq!(cfg.bind, "0.0.0.0");
@@ -1359,6 +1393,15 @@ enabled = false
             health_port: None,
             health_max_snapshot_age: None,
             health_max_replication_lag: None,
+            // Declared #[cfg(windows)] on `Cli`, so they must be gated here
+            // too or this literal fails to compile on a Windows host (E0063).
+            // The ubuntu-only CI test job cannot catch that.
+            #[cfg(windows)]
+            install_service: false,
+            #[cfg(windows)]
+            uninstall_service: false,
+            #[cfg(windows)]
+            service: false,
         };
         let cfg = config_from_cli(&cli).unwrap();
         assert!(
