@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(not(target_arch = "wasm32"))]
 use bytes::Bytes;
+#[cfg(not(target_arch = "wasm32"))]
 use crc32fast::Hasher;
+#[cfg(not(target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
 #[cfg(not(target_arch = "wasm32"))]
 use tracing::info;
@@ -529,45 +531,89 @@ impl AofWriter {
 #[cfg(not(target_arch = "wasm32"))]
 /// AOF reader — replays commands from the file.
 pub struct AofReader {
-    data: Vec<u8>,
-    pos: usize,
+    reader: BufReader<File>,
+    /// Parser holding fed-but-unconsumed bytes. This **must** persist across
+    /// `next_command` calls: one 8 KiB read usually spans many commands, so a
+    /// per-call parser silently discarded every command after the first one
+    /// in each chunk.
+    parser: crate::resp::RespParser,
+    /// Raw bytes mirroring `parser`'s unconsumed buffer, so a command can be
+    /// returned with its exact original framing.
+    pending: Vec<u8>,
+    /// File offset of `pending[0]`, for error messages.
+    consumed: usize,
+    /// Set once the file has signalled EOF; `pending` then drains without
+    /// further reads.
+    eof: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl AofReader {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path.as_ref())?;
-        let mut reader = BufReader::new(file);
-        let mut data = Vec::new();
-        reader.read_to_end(&mut data)?;
-        Ok(Self { data, pos: 0 })
+        Ok(Self {
+            reader: BufReader::new(file),
+            parser: crate::resp::RespParser::new(),
+            pending: Vec::new(),
+            consumed: 0,
+            eof: false,
+        })
     }
 
     /// Read the next raw RESP command. `Ok(None)` is the only clean EOF;
     /// an incomplete tail or malformed command is a recovery error rather
     /// than a silently accepted partial replay.
+    ///
+    /// Memory: bounded by the largest single RESP command plus one 8 KiB
+    /// read chunk — each command is drained before the next is parsed, so a
+    /// multi-GB AOF does not need multi-GB of memory.
     pub fn next_command(&mut self) -> Result<Option<Vec<u8>>> {
-        if self.pos >= self.data.len() {
-            return Ok(None);
-        }
-        let mut parser = crate::resp::RespParser::new();
-        let start = self.pos;
+        // 8 KiB chunk matches the connection read_buf and is well below
+        // the largest realistic single command (multi-frame blobs span
+        // multiple reads below).
+        let mut scratch = [0u8; 8 * 1024];
         loop {
-            if self.pos >= self.data.len() {
+            // Try to satisfy the call from bytes already buffered.
+            if !self.pending.is_empty() {
+                let before = self.parser.buffered_len();
+                match self.parser.parse_one() {
+                    Ok(Some(_)) => {
+                        // The parser advanced past exactly one command; the
+                        // same number of raw bytes is that command's framing.
+                        let len = before - self.parser.buffered_len();
+                        debug_assert!(len > 0 && len <= self.pending.len());
+                        let cmd: Vec<u8> = self.pending.drain(..len).collect();
+                        self.consumed += len;
+                        return Ok(Some(cmd));
+                    }
+                    Ok(None) => { /* incomplete — need more bytes */ }
+                    Err(e) => {
+                        return Err(crate::error::NexradeError::Generic(format!(
+                            "AOF parse error at byte {}: {e}",
+                            self.consumed
+                        )));
+                    }
+                }
+            }
+
+            if self.eof {
+                // No more bytes will arrive. An empty buffer is the clean end
+                // of the file; leftovers are a truncated or corrupt frame.
+                if self.pending.is_empty() {
+                    return Ok(None);
+                }
                 return Err(crate::error::NexradeError::Generic(format!(
-                    "AOF is truncated at byte {start}: incomplete RESP command"
+                    "AOF is truncated at byte {}: incomplete RESP command",
+                    self.consumed
                 )));
             }
-            parser.feed(&self.data[self.pos..self.pos + 1]);
-            self.pos += 1;
-            match parser.parse_one() {
-                Ok(Some(_)) => return Ok(Some(self.data[start..self.pos].to_vec())),
-                Ok(None) => continue,
-                Err(e) => {
-                    return Err(crate::error::NexradeError::Generic(format!(
-                        "AOF parse error at byte {start}: {e}"
-                    )));
-                }
+
+            let n = self.reader.read(&mut scratch)?;
+            if n == 0 {
+                self.eof = true;
+            } else {
+                self.parser.feed(&scratch[..n]);
+                self.pending.extend_from_slice(&scratch[..n]);
             }
         }
     }
@@ -595,12 +641,14 @@ pub struct PersistenceConfig {
     pub aof_sync: AofSync,
     /// RDB save rules: (seconds, min_changes)
     pub rdb_save_rules: Vec<(u64, usize)>,
-    /// Maximum snapshot age before instance becomes not ready.
-    /// If None, snapshot age is not checked for readiness.
-    pub max_snapshot_age_secs: Option<u64>,
-    /// Maximum replication lag before instance becomes not ready.
-    /// If None, replication lag is not checked for readiness.
-    pub max_replication_lag_secs: Option<u64>,
+    // max_snapshot_age_secs and max_replication_lag_secs used to live
+    // here as well, but `HealthConfig` is the sole owner (1.2.1+).
+    // Threshold values flow through `[health]` in TOML, `--health-*` on
+    // the CLI, and `health.max_snapshot_age_secs` /
+    // `max_replication_lag_secs` at runtime. Keeping duplicates here
+    // would have been a footgun: whichever side was read by the
+    // health snapshot would silently shadow the other, and there was
+    // no migration story if defaults ever diverged.
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -617,8 +665,6 @@ impl Default for PersistenceConfig {
             aof_path: None,
             aof_sync: AofSync::EverySec,
             rdb_save_rules: vec![(900, 1), (300, 10), (60, 10000)],
-            max_snapshot_age_secs: Some(3600),
-            max_replication_lag_secs: Some(10),
         }
     }
 }

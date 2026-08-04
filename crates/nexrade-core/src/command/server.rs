@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 use crate::cluster;
 use crate::command::{get_bytes_vec, get_i64, get_str};
 use crate::conn_registry::{format_client_list_line, CLIENT_FLAG_NO_EVICT};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::db::unix_secs;
 use crate::db::Db;
 use crate::error::{NexradeError, Result};
@@ -60,10 +61,12 @@ pub async fn cmd_flushall(db: &Db, _args: &[Resp]) -> Result<Resp> {
     Ok(Resp::ok())
 }
 
-/// Map the `bgsave_last_status` numeric (0 ok, 1 err) to Redis's string form
-/// for the `INFO persistence` section. Anything other than the explicit
-/// error code is reported as `ok` so a stale value never misleads the
-/// operator.
+// Map the `bgsave_last_status` numeric (0 ok, 1 err) to Redis's string form
+// for the `INFO persistence` section. Anything other than the explicit
+// error code is reported as `ok` so a stale value never misleads the
+// operator. Host-only: the whole INFO persistence block is gated to
+// `#[cfg(not(target_arch = "wasm32"))]`, so the helpers are too.
+#[cfg(not(target_arch = "wasm32"))]
 fn bgsave_status_str(code: u8) -> &'static str {
     if code == 1 {
         "err"
@@ -75,6 +78,7 @@ fn bgsave_status_str(code: u8) -> &'static str {
 /// Same shape for `aof_rewrite_last_status`. `in_progress` is a separate
 /// flag (`aof_rewrite_in_progress`), so a stale 0 doesn't conflict with an
 /// actively-running rewrite — the field name is past-tense.
+#[cfg(not(target_arch = "wasm32"))]
 fn aof_rewrite_status_str(code: u8) -> &'static str {
     if code == 1 {
         "err"
@@ -86,6 +90,7 @@ fn aof_rewrite_status_str(code: u8) -> &'static str {
 /// `aof_last_write_status` — `ok` when AOF is enabled and the last append
 /// (or ALWAYS fsync) succeeded; `err` when AOF is disabled or the last
 /// write failed.
+#[cfg(not(target_arch = "wasm32"))]
 fn aof_last_write_status(db: &Db) -> &'static str {
     if !db.stats.aof_enabled.load(Ordering::Relaxed) {
         return "err";
@@ -2117,7 +2122,7 @@ pub async fn cmd_role(db: &Db) -> Result<Resp> {
 // ── Replication commands ──────────────────────────────────────────────────────
 
 #[cfg(not(target_arch = "wasm32"))]
-/// REPLICAOF NO ONE | REPLICAOF <host> <port>
+/// `REPLICAOF NO ONE` | `REPLICAOF <host> <port>`
 pub async fn cmd_replicaof(db: &Db, args: &[Resp]) -> Result<Resp> {
     if args.len() < 2 {
         return Err(NexradeError::WrongArity("replicaof".to_string()));
@@ -2150,7 +2155,7 @@ pub async fn cmd_replicaof(db: &Db, args: &[Resp]) -> Result<Resp> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-/// REPLCONF <subcommand> [<arg> ...]
+/// `REPLCONF <subcommand> [<arg> ...]`
 pub async fn cmd_replconf(
     db: &Db,
     args: &[Resp],
@@ -2184,7 +2189,7 @@ pub async fn cmd_replconf(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-/// PSYNC <replid> <offset>
+/// `PSYNC <replid> <offset>`
 ///
 /// Returns `Ok(Resp::SimpleString("PSYNC_FULLRESYNC"))` as a sentinel so the
 /// connection handler can take over and stream the RDB + ongoing commands.

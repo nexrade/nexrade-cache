@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::db::Db;
-use crate::persistence::PersistenceConfig;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::replication::ReplicationRole;
 
@@ -611,16 +610,4 @@ fn build_replication_health(
         seconds_since_primary_stream: None,
     };
     (health, blocks_ready)
-}
-
-impl PersistenceConfig {
-    /// Backwards-compatible accessors used by the old 0.x-style tests that
-    /// still reference the duplicate threshold fields. The single source of
-    /// truth is `HealthConfig`; these just forward to it.
-    pub fn max_snapshot_age_secs(&self) -> Option<u64> {
-        self.max_snapshot_age_secs
-    }
-    pub fn max_replication_lag_secs(&self) -> Option<u64> {
-        self.max_replication_lag_secs
-    }
 }

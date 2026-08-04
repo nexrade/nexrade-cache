@@ -19,6 +19,166 @@ use crate::error::{NexradeError, Result};
 use crate::persistence::AofSync;
 use crate::resp::Resp;
 
+/// How long a write waits for an in-flight persistence capture to finish
+/// before giving up and reporting `MISCONF`.
+///
+/// The capture itself is an in-memory `snapshot_dbs()` (file I/O happens
+/// after the guard drops), so it completes in well under a millisecond for
+/// typical datasets. This ceiling exists only so a genuinely stuck
+/// coordinator still surfaces an error instead of hanging the client
+/// forever; it is not a latency target for the normal path.
+#[cfg(not(target_arch = "wasm32"))]
+const PERSISTENCE_QUIESCE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Encode a SCAN-family element as an opaque cursor token.
+///
+/// The token is a 64-bit FNV-1a hash of the element bytes, and callers
+/// iterate in **hash order** rather than byte order. That combination is
+/// what makes a resumable cursor possible within the constraints:
+///
+/// * **Must be a decimal integer on the wire.** Cursors are opaque to
+///   *application* code, but not to client libraries: `redis-py` runs
+///   `int(cursor)` on the reply before handing it back, and other
+///   clients parse into an integer type. A hex or byte-encoded cursor
+///   raises `ValueError: invalid literal for int()` and breaks every
+///   standard client, so the encoding cannot carry the raw key bytes.
+/// * **Order-preserving in the iteration order.** Since SCAN promises no
+///   particular ordering, we sort by `(token(k), k)` and let the hash
+///   define the sequence. The cursor is then a position in that order,
+///   so when the boundary element disappears mid-iteration (TTL, `DEL`,
+///   a concurrent writer) the server resumes at the first element whose
+///   token sorts after it instead of restarting at page 1 — the original
+///   cursor bug, where a vanished boundary silently re-served the prefix
+///   that had already been handed out.
+/// * **Never collides with the terminator.** `0` is reserved to mean
+///   "iteration complete", so the whole low 32-bit range is lifted out of
+///   the way (see below) — a live element never hashes to 0.
+///
+/// The predecessor hashed the element but then searched a *byte*-sorted
+/// list for an exact token match, mixing two incompatible orderings, and
+/// parsed the cursor through `get_i64` — where the ~35% of `u64` hashes
+/// above `i64::MAX` overflowed and silently reset the scan to 0.
+///
+/// Known limit: two distinct elements with the same 64-bit hash that
+/// straddle a page boundary can leave the second unreturned. At 64 bits
+/// that is negligible, and it is the only ordering-related omission left.
+///
+/// # Why this is the same hash the store shards on
+///
+/// This is bit-for-bit `store::fnv1a` (same offset basis, same prime), and
+/// that is load-bearing rather than incidental: `ShardedDatabase::shard_idx`
+/// is `fnv1a(key) & (num_shards - 1)`, so **the low bits of a token are
+/// exactly the shard index of its key**. `scan_page` relies on that to page
+/// one shard at a time instead of locking the whole keyspace. Changing
+/// either hash without the other silently breaks that correspondence.
+///
+/// The reserved-value remap must therefore preserve the low bits. Sending a
+/// hash of 0 to `1` would move it from shard 0 to shard 1; adding `2^32`
+/// keeps every low bit intact (`(1 << 32) & (n - 1) == 0` for any
+/// `n <= 2^32`), which is why the whole sub-`2^32` range is shifted up
+/// rather than special-casing 0 alone.
+pub(crate) fn scan_cursor_token(key: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    for &b in key {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    // Keep the low 32 bits clear of the "iteration complete" sentinel while
+    // preserving them exactly, so shard_idx(key) survives the remap.
+    if h < (1u64 << 32) {
+        h + (1u64 << 32)
+    } else {
+        h
+    }
+}
+
+/// Sort key defining the order `SCAN` walks the keyspace in.
+///
+/// This is `scan_cursor_token(key).reverse_bits()`, and the reversal is the
+/// whole point — do not "simplify" it away.
+///
+/// A token's *low* bits are the shard index (see `scan_cursor_token`).
+/// Reversing moves them to the *top* of the sort key, which buys two
+/// properties that ordering by the raw token does not have:
+///
+/// * **Shard contiguity.** Every shard's keys form exactly one contiguous
+///   run, so `SCAN` can hold a single shard's read lock, drain it, and move
+///   on. Ordering by the raw token interleaves shards (the shard bits are
+///   the least significant, so they change fastest), which would force every
+///   page to touch every shard.
+/// * **Immunity to a change in shard count.** The ordering never references
+///   `num_shards`, and growing the shard count only *subdivides* an existing
+///   run instead of interleaving it. This matters because the shard count is
+///   derived from the CPU count (`store::compute_num_shards`) and is never
+///   persisted, so a client can legitimately resume a cursor against a
+///   server that has a different number of shards — after a restart on
+///   another host, say. Ordering by `(shard_idx, token)` looks equivalent
+///   but silently omits up to ~75% of the keyspace when that happens.
+///
+/// This is the same reverse-binary trick real Redis uses for its bucket
+/// cursors, arrived at from the other direction. The visible consequence is
+/// that shards are visited in bit-reversed index order (0, 32, 16, 48, …)
+/// rather than 0, 1, 2, … — irrelevant, because `SCAN` guarantees no
+/// particular ordering.
+pub(crate) fn scan_order_key(key: &[u8]) -> u64 {
+    scan_cursor_token(key).reverse_bits()
+}
+
+/// Parse a client-supplied SCAN cursor.
+///
+/// Returns `None` for cursor `0` (start of iteration) and for anything
+/// unparseable, which Redis also treats as a fresh scan rather than an
+/// error. Accepts the full `u64` range: the tokens we hand out routinely
+/// exceed `i64::MAX`, so parsing through a signed type would reject or
+/// wrap the majority of live cursors.
+pub(crate) fn decode_scan_cursor(token: &str) -> Option<u64> {
+    match token.trim().parse::<u64>() {
+        Ok(0) | Err(_) => None,
+        Ok(n) => Some(n),
+    }
+}
+
+/// Order a SCAN-family element list into the sequence cursors index into.
+///
+/// Ordering is by `(token, bytes)`: the token defines the walk, and the
+/// byte tie-break keeps equal-hash elements in a stable, deterministic
+/// order across rounds (the store's iteration order is not).
+///
+/// Done as a byte sort followed by a *stable* cached-key sort on the
+/// token, so the hash is computed once per element rather than on every
+/// comparison — `sort_by` would recompute it ~2n·log n times, and this
+/// list is materialised on every SCAN call.
+pub(crate) fn scan_sort_by_token(keys: &mut [Vec<u8>]) {
+    keys.sort_unstable();
+    keys.sort_by_cached_key(|k| scan_cursor_token(k));
+}
+
+/// Resolve a cursor to a start offset in a `scan_sort_by_token`-ordered list.
+///
+/// Resumes at the first element whose token is strictly greater than the
+/// cursor, so iteration advances whether or not the boundary element is
+/// still present.
+pub(crate) fn scan_start_offset(keys: &[Vec<u8>], cursor: Option<u64>) -> usize {
+    match cursor {
+        None => 0,
+        Some(c) => keys.partition_point(|k| scan_cursor_token(k) <= c),
+    }
+}
+
+/// `scan_start_offset` for element lists that carry a payload alongside the
+/// element (HSCAN's `(field, value)`, ZSCAN's `(member, score)`).
+pub(crate) fn scan_start_offset_by<T, F>(items: &[T], cursor: Option<u64>, elem: F) -> usize
+where
+    F: Fn(&T) -> &Vec<u8>,
+{
+    match cursor {
+        None => 0,
+        Some(c) => items.partition_point(|it| scan_cursor_token(elem(it)) <= c),
+    }
+}
+
 /// Parse the command name from a RESP array into a fresh uppercase
 /// `String`. The caller may reuse the same `String` allocation across
 /// calls — see `parse_cmd_name_into` below for the hot-path version.
@@ -56,7 +216,7 @@ pub fn get_bytes(args: &[Resp], idx: usize, cmd: &str) -> Result<bytes::Bytes> {
         .ok_or_else(|| NexradeError::WrongArity(cmd.to_lowercase()))
 }
 
-/// Get a bytes argument as Vec<u8>.
+/// Get a bytes argument as `Vec<u8>`.
 pub fn get_bytes_vec(args: &[Resp], idx: usize, cmd: &str) -> Result<Vec<u8>> {
     args.get(idx)
         .and_then(|a| match a {
@@ -181,7 +341,14 @@ async fn dispatch_inner_callable(
     db: &Db,
     args: Vec<Resp>,
     db_index: usize,
-    peer_addr: Option<std::net::SocketAddr>,
+    // Forwards through to `dispatch_tracked`, which in turn forwards
+    // through to per-command handlers that read it on host
+    // (e.g. `cmd_replconf`). The body itself only forwards. The wasm
+    // build has no such handlers, so the parameter is unused there;
+    // cfg_attr gates the unused-variable suppression to wasm only.
+    #[cfg_attr(target_arch = "wasm32", allow(unused_variables))] peer_addr: Option<
+        std::net::SocketAddr,
+    >,
     user: &str,
 ) -> Resp {
     let mut cmd_buf = String::with_capacity(8);
@@ -200,7 +367,13 @@ pub async fn dispatch_tracked(
     db: &Db,
     args: Vec<Resp>,
     db_index: usize,
-    peer_addr: Option<std::net::SocketAddr>,
+    // Read in the per-command dispatch arm (e.g. `cmd_replconf`).
+    // The body itself does not reference it; on wasm the consumer is
+    // not built, so the allow(dead_code) below scopes the suppression
+    // to the wasm build only.
+    #[cfg_attr(target_arch = "wasm32", allow(unused_variables))] peer_addr: Option<
+        std::net::SocketAddr,
+    >,
     user: &str,
     client_id: u64,
     cmd: &str,
@@ -231,9 +404,24 @@ pub async fn dispatch_tracked(
     // atomic fast path and keep the permit through AOF append/fsync.
     // Blocking commands (BLPOP, BRPOP, BLMOVE, BLMPOP, BZMPOP, XREADGROUP)
     // acquire the permit only at their actual mutation, not while parked.
+    //
+    // The capture window is short (in-memory `snapshot_dbs()`; the file I/O
+    // runs after the guard drops), so a writer that arrives during it waits
+    // rather than failing. Erroring here meant a routine background BGSAVE
+    // rejected concurrent writes — a benchmark writing through one auto-save
+    // saw ~54% of writes fail with `MISCONF`. `MISCONF` is meant to signal
+    // "persistence is broken, an operator must intervene" (the AOF-failure
+    // latch above), not "the server is mid-checkpoint".
+    //
+    // The timeout keeps the genuinely-stuck case reportable: if a quiesce
+    // outlasts it, we still return MISCONF rather than blocking forever.
     #[cfg(not(target_arch = "wasm32"))]
     let _persistence_write_permit = if is_write && !is_blocking_write_command(cmd) {
-        match db.persistence.enter_mutation() {
+        match db
+            .persistence
+            .enter_mutation_waiting(PERSISTENCE_QUIESCE_WRITE_TIMEOUT)
+            .await
+        {
             Some(permit) => Some(permit),
             None => {
                 return Resp::Error(
@@ -399,7 +587,15 @@ async fn dispatch_inner(
     db: &Db,
     args: Vec<Resp>,
     db_index: usize,
-    peer_addr: Option<std::net::SocketAddr>,
+    // Read by the per-command dispatch arm (e.g. `cmd_replconf`); the
+    // body itself only does ACL / dispatch work and does not reference
+    // it, but the parameter is forwarded to per-command handlers that
+    // need it. The wasm build does not include those handlers, so the
+    // parameter is unused there; allow(dead_code) suppresses that
+    // warning on wasm only.
+    #[cfg_attr(target_arch = "wasm32", allow(unused_variables))] peer_addr: Option<
+        std::net::SocketAddr,
+    >,
     authenticated_user: &str,
     client_id: u64,
     keys: &[&[u8]],

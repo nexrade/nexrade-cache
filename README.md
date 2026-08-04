@@ -4,7 +4,7 @@
 
 # nexrade-cache
 
-**v1.2.1**
+**v1.2.3**
 
 nexrade-cache is **a Redis-protocol-compatible cache server built in Rust**. It speaks the
 RESP2 / RESP3 wire format, ships with TLS, Prometheus metrics, Lua scripting, a plugin API,
@@ -660,6 +660,32 @@ All crates are independent. Use `nexrade-core` as a pure library, add `nexrade-s
 ---
 
 ## Windows Service
+
+The Windows MSI installer (`nexrade-cache-*.msi`) and the manual `nexrade-cache.exe` flags install nexrade-cache as a Windows service identically — the MSI dialog value and the `--port` flag are both written into the same `--service --port <port>` launch command the SCM runs on every boot.
+
+### MSI installer
+
+The MSI shows a **Port Number and Firewall Exception** dialog during installation, matching the Redis 3 install UX:
+
+- **Port to run nexrade-cache on:** defaults to `6399` — an offset from Redis's `6379` so a coexisting Redis keeps working. Override before clicking Next.
+- **Add an exception to the Windows Firewall:** ticked by default. Untick to skip the firewall rule.
+
+When ticked, the MSI adds an inbound TCP rule for the chosen port via the WiX firewall extension; the rule is removed automatically when the MSI is uninstalled. The chosen port is passed to the installed Windows Service via `--service --port <port>`.
+
+```powershell
+# Verify the dialog flow on a fresh VM (defaults; port 6399, firewall ON)
+Start-Process "nexrade-cache-1.2.3-x86_64.msi"
+Test-NetConnection -Port 6399 -InformationLevel Quiet  # True
+netsh advfirewall firewall show rule name=nexrade-cache
+
+# Confirm cleanup on uninstall
+msiexec /x nexrade-cache-1.2.3-x86_64.msi /q
+netsh advfirewall firewall show rule name=nexrade-cache  # "No rules match the specified criteria."
+```
+
+The dialog port value is **not** written into `nexrade.toml` — operators who need it there as well can set `[server].port` in their config; the dialog value and the config file are independent, matching Redis's behaviour.
+
+### Manual install (no MSI)
 
 ```powershell
 # Install and start as a Windows Service (run as Administrator)

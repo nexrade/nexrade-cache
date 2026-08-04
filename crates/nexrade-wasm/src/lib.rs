@@ -97,6 +97,16 @@ pub mod wasm_bindings {
         store: NexradeStore,
     }
 
+    // Not inside the `#[wasm_bindgen]` block: the JS side reaches the
+    // constructor through `new()`, and `wasm_bindgen` does not export trait
+    // impls. This exists so the Rust-side type satisfies `Default` like any
+    // other no-argument constructor.
+    impl Default for NexradeWasm {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     #[wasm_bindgen]
     impl NexradeWasm {
         /// Create a new in-memory store.

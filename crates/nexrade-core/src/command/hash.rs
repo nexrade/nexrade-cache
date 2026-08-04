@@ -4,7 +4,10 @@ use bytes::Bytes;
 
 use super::string::format_float;
 
-use crate::command::{get_bytes_vec, get_f64, get_i64, get_str};
+use crate::command::{
+    decode_scan_cursor, get_bytes_vec, get_f64, get_i64, get_str, scan_cursor_token,
+    scan_start_offset_by,
+};
 use crate::db::Db;
 use crate::error::{NexradeError, Result};
 use crate::hash_data::{CompactHashBulkIter, HashData, HashGetAllSnap};
@@ -365,10 +368,9 @@ pub async fn cmd_hscan(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
         return Err(NexradeError::WrongArity("hscan".to_string()));
     }
     let key = get_bytes_vec(args, 1, "HSCAN")?;
-    let cursor: u64 = get_i64(args, 2, "HSCAN")
-        .ok()
-        .map(|n| n.max(0) as u64)
-        .unwrap_or(0);
+    // Hex-encoded boundary field bytes (opaque to clients). Empty
+    // cursor means "start from the beginning". See `decode_scan_cursor`.
+    let cursor: Option<u64> = get_str(args, 2, "HSCAN").ok().and_then(decode_scan_cursor);
 
     let mut pattern: Option<Vec<u8>> = None;
     let mut count: usize = 10;
@@ -403,10 +405,21 @@ pub async fn cmd_hscan(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
                     .into_iter()
                     .filter(|(k, _)| glob_match(&pat, k.as_slice()))
                     .collect();
-                pairs.sort_by(|a, b| a.0.cmp(&b.0));
-                let start = (cursor as usize).min(pairs.len());
+                // Field-space cursor, not an offset — see `scan_cursor_token`.
+                // Ordering by the cursor token makes the token a position in
+                // the walked order, so a deleted boundary field cannot shift
+                // the resume point.
+                // Byte sort then a stable cached-key sort on the token:
+                // one hash per element instead of one per comparison.
+                pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                pairs.sort_by_cached_key(|p| scan_cursor_token(&p.0));
+                let start = scan_start_offset_by(&pairs, cursor, |p| &p.0);
                 let end = (start + count).min(pairs.len());
-                let next = if end >= pairs.len() { 0u64 } else { end as u64 };
+                let next = if end >= pairs.len() {
+                    0
+                } else {
+                    scan_cursor_token(&pairs[end - 1].0)
+                };
                 let mut items = Vec::with_capacity((end - start) * 2);
                 for (k, v) in &pairs[start..end] {
                     items.push(Resp::bulk(Bytes::copy_from_slice(k)));

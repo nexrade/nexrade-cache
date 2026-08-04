@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 
-use crate::command::{get_bytes_vec, get_i64, get_str};
+use crate::command::{decode_scan_cursor, get_bytes_vec, get_i64, get_str, scan_order_key};
 use crate::db::Db;
 use crate::error::{NexradeError, Result};
 use crate::expiry::Expiry;
@@ -368,10 +368,12 @@ pub async fn cmd_scan(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     if args.len() < 2 {
         return Err(NexradeError::WrongArity("scan".to_string()));
     }
-    let cursor: u64 = get_i64(args, 1, "SCAN")
-        .ok()
-        .map(|n| if n < 0 { 0 } else { n as u64 })
-        .unwrap_or(0);
+    // Cursor is an opaque decimal u64 (see `scan_cursor_token`). Parsed
+    // via `get_str` + `decode_scan_cursor` rather than `get_i64` because
+    // the tokens we emit routinely exceed `i64::MAX` — the previous
+    // signed parse overflowed on ~35% of hashes and silently restarted
+    // the scan from page 1.
+    let cursor: Option<u64> = get_str(args, 1, "SCAN").ok().and_then(decode_scan_cursor);
 
     let mut pattern: Option<Vec<u8>> = None;
     let mut count: usize = 10;
@@ -402,32 +404,45 @@ pub async fn cmd_scan(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     }
 
     let sdb = db.store.db(db_index);
-    // Materialise the full key list once per SCAN round-trip and paginate
-    // deterministically. The cursor is a `u64` position into that sorted
-    // list — Redis clients treat any non-zero cursor as opaque, so this
-    // value is just a stable "resume here" token.
+    // Page directly out of the store rather than materialising the keyspace.
+    //
+    // The cursor is a *key-space* position, not an index into a list. It used
+    // to be a plain offset, which silently broke the SCAN guarantee ("every
+    // key present for the whole iteration is returned at least once") whenever
+    // keys were deleted mid-iteration — the canonical `scan_iter` +
+    // pipelined-delete cleanup pattern. Deleting the first page shrank the
+    // list under the cursor, every later key shifted down into the slots
+    // already passed, and the next round started beyond the new end: it
+    // returned nothing, reported cursor 0 ("done"), and half the keyspace was
+    // never visited. Seeding 40 keys and deleting each page returned 20 of 40.
+    //
+    // Anchoring the cursor to the boundary *element* means deletions cannot
+    // shift the resume point. The cursor stays a decimal integer on the wire
+    // (client libraries call `int()` on it) and is the `scan_order_key` of the
+    // last key handed out; `scan_page` resumes at the first key ordered after
+    // it. See `scan_order_key` for why that ordering is bit-reversed.
+    //
+    // The previous implementation called `keys_matching()` — write-locking all
+    // 64-256 shards and sorting the whole keyspace — on every call, which made
+    // a full traversal O(n^2). `scan_page` serves a page from a single shard
+    // under a read lock.
     let pat = pattern.unwrap_or_else(|| b"*".to_vec());
-    let mut keys = sdb.keys_matching(&pat);
-    keys.sort();
+    let (keys, next) = sdb.scan_page(
+        cursor.unwrap_or(0),
+        count,
+        &pat,
+        scan_order_key,
+        // TYPE is checked inside the shard guard, so it costs no extra locks.
+        // The old code took one `read_for` per surviving key.
+        |_, entry| match type_filter {
+            Some(ref t) => entry.value.type_name() == t.as_str(),
+            None => true,
+        },
+    );
 
-    if let Some(ref t) = type_filter {
-        let sdb2 = db.store.db(db_index);
-        keys.retain(|k| {
-            sdb2.read_for(k)
-                .get_ro(k)
-                .map(|e| e.value.type_name() == t.as_str())
-                .unwrap_or(false)
-        });
-    }
-
-    // Honour the `cursor` (start position). Cursor 0 = start from beginning.
-    let start = (cursor as usize).min(keys.len());
-    let end = (start + count).min(keys.len());
-    let next = if end >= keys.len() { 0u64 } else { end as u64 };
-
-    let page: Vec<Resp> = keys[start..end]
-        .iter()
-        .map(|k| Resp::bulk(Bytes::from(k.clone())))
+    let page: Vec<Resp> = keys
+        .into_iter()
+        .map(|k| Resp::bulk(Bytes::from(k)))
         .collect();
     Ok(Resp::array(vec![
         Resp::bulk_str(next.to_string()),

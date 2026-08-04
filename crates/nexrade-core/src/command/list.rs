@@ -1,5 +1,6 @@
 //! List command handlers.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 use bytes::Bytes;

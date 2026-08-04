@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-cache"
-version = "1.2.1"
+version = "1.2.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-core"
-version = "1.2.1"
+version = "1.2.3"
 dependencies = [
  "anyhow",
  "atoi",
@@ -1072,7 +1072,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-lua"
-version = "1.2.1"
+version = "1.2.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1088,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-metrics"
-version = "1.2.1"
+version = "1.2.3"
 dependencies = [
  "anyhow",
  "nexrade-core",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-plugin"
-version = "1.2.1"
+version = "1.2.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1115,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-server"
-version = "1.2.1"
+version = "1.2.3"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-tls"
-version = "1.2.1"
+version = "1.2.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1154,7 +1154,7 @@ dependencies = [
 
 [[package]]
 name = "nexrade-wasm"
-version = "1.2.1"
+version = "1.2.3"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",

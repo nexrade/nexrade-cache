@@ -85,9 +85,15 @@ jobs:
 
       - name: Start nexrade-cache
         run: |
+          # `--rdb-path ""` and `--aof-path ""` disable persistence so the
+          # benchmark is apples-to-apples with Redis (which has no
+          # `--save ''` here). Without this, nexrade pays auto-snapshot
+          # cost that Redis does not, and the ratio is artificially low.
           ./target/release/nexrade-cache \
             --port $NEXRADE_PORT \
-            --metrics-port 9399 &
+            --metrics-port 9399 \
+            --rdb-path "" \
+            --aof-path "" &
           echo "NEXRADE_PID=$!" >> $GITHUB_ENV
           sleep 1
           ./target/release/nexrade-cli -p $NEXRADE_PORT PING
@@ -333,8 +339,19 @@ jobs:
       - name: Start nexrade-cache
         shell: pwsh
         run: |
+          # Match the Linux invocation: disable persistence so nexrade
+          # is benchmarked against Redis on equal terms.
+          #
+          # Passed via environment, not -ArgumentList. Start-Process joins
+          # -ArgumentList into a single command string, so an empty element
+          # is either dropped or needs manual quoting; the previous
+          # "--rdb-path '' --aof-path ''" form reached the process as two
+          # literal apostrophes, creating a file *named* '' and leaving RDB
+          # snapshotting enabled for the whole run.
+          $env:NEXRADE_RDB_PATH = ''
+          $env:NEXRADE_AOF_PATH = ''
           $proc = Start-Process -FilePath "$PWD\target\release\nexrade-cache.exe" `
-            -ArgumentList "--port $env:NEXRADE_PORT --metrics-port 9399" `
+            -ArgumentList @('--port', "$env:NEXRADE_PORT", '--metrics-port', '9399') `
             -WindowStyle Hidden `
             -PassThru
           echo "NEXRADE_PID=$($proc.Id)" >> $env:GITHUB_ENV

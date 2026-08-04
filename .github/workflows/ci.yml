@@ -11,6 +11,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "scripts/**"
+      - "examples/**"
       - "nexrade.example.toml"
       - "nexrade.cache.toml"
       - "nexrade.production.toml"
@@ -26,6 +27,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "scripts/**"
+      - "examples/**"
       - "nexrade.example.toml"
       - "nexrade.cache.toml"
       - "nexrade.production.toml"
@@ -141,6 +143,84 @@ jobs:
 
       - name: Check nexrade-wasm for wasm32
         run: cargo check -p nexrade-wasm --target wasm32-unknown-unknown --features wasm
+
+  # ─── Python examples (fast subset) ──────────────────────────────────────────
+  # The full examples suite lives in examples.yml, but that workflow is gated
+  # to main/master because it takes ~20 min (wasm-pack compiles from source).
+  # That gating let three real bugs ship green on feature branches:
+  #   * SCAN cursor skipped half the keyspace when deleting mid-iteration —
+  #     caught only by examples/11-python-patterns/patterns.py
+  #   * HSCAN/SSCAN/ZSCAN carried the same flaw
+  #   * nexrade-core stopped compiling for wasm32
+  #
+  # The Python examples are the cheap, high-signal part: they need only a
+  # debug binary and a running server (no wasm-pack, no per-example cargo
+  # builds), and they exercise real client behaviour that `cargo test` does
+  # not. Running them on every branch costs ~2 min and closes the gap.
+  # examples.yml keeps the heavy wasm/embedded/plugin coverage on main.
+  python-examples:
+    name: Python examples (fast subset)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python-examples
+
+      # Debug build, not --release: these examples only need the binary to
+      # run correctly, and skipping lto/codegen-units=1 saves several minutes.
+      - name: Build debug binaries
+        run: cargo build --package nexrade-cache
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install redis-py
+        run: pip install "redis>=5,<9"
+
+      # nexrade-cli speaks the same RESP protocol as redis-cli; exposing it
+      # under that name avoids a flaky apt-get install of redis-tools.
+      - name: Expose nexrade-cli as redis-cli
+        run: |
+          mkdir -p /tmp/bin
+          printf '#!/bin/bash\nexec "%s/target/debug/nexrade-cli" "$@"\n' \
+            "$(pwd)" > /tmp/bin/redis-cli
+          chmod +x /tmp/bin/redis-cli
+          echo "/tmp/bin" >> $GITHUB_PATH
+
+      - name: Run Python examples
+        run: |
+          set -euo pipefail
+          ./target/debug/nexrade-cache --port 6379 --log-level warn &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 50); do
+            if python3 -c "import socket; s=socket.create_connection(('127.0.0.1',6379),1); s.close()" 2>/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          redis-cli ping
+
+          # 03-pubsub needs a backgrounded subscriber.
+          python3 examples/03-pubsub/subscriber.py news &
+          SUB_PID=$!
+          sleep 0.5
+          python3 examples/03-pubsub/publisher.py
+          sleep 0.5
+          kill $SUB_PID 2>/dev/null || true
+
+          python3 examples/04-transactions/atomic-ops.py
+          python3 examples/06-streams/producer-consumer.py
+          python3 examples/07-pipeline/benchmark.py
+          # The SCAN-cursor regression surfaced here first.
+          python3 examples/11-python-patterns/patterns.py
 
   # ─── Client wire smokes (1.0.0) ────────────────────────────────────────────
   # Three independent parsers against one release binary:

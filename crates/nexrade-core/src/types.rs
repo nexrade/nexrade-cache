@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -142,7 +143,7 @@ pub enum DataType {
     ZSet(ZSetData),
     /// Hash map of field → value — see [`HashData`].
     Hash(HashData),
-    /// Bit array (stored as Vec<u8>)
+    /// Bit array (stored as `Vec<u8>`)
     Bitmap(Vec<u8>),
     /// HyperLogLog approximation (stored as raw bytes)
     HyperLogLog(Vec<u8>),

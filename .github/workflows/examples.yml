@@ -35,8 +35,21 @@ jobs:
   run-all-examples:
     name: Run all examples
     runs-on: ubuntu-latest
-    # Only run on push to main — examples take ~20 min and are redundant on PRs
-    # where cargo test already validates the core logic.
+    # Main-only: the full suite takes ~20 min, dominated by wasm-pack
+    # compiling from source plus the per-example cargo builds.
+    #
+    # This used to be justified as "redundant on PRs where cargo test
+    # already validates the core logic" — that turned out to be false.
+    # cargo test builds for the host only and drives the library directly,
+    # so it missed a SCAN cursor bug that dropped half the keyspace, the
+    # same flaw in HSCAN/SSCAN/ZSCAN, and nexrade-core failing to compile
+    # for wasm32. All three shipped green on a feature branch.
+    #
+    # The cheap, high-signal part (Python examples against a running
+    # server) now runs on every branch via the `python-examples` job in
+    # ci.yml, and wasm32 is covered by `wasm-check` there. What remains
+    # here is the genuinely expensive coverage: wasm-pack, 08-embedded,
+    # 09-plugin, and the shell-based examples.
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
 
     steps:

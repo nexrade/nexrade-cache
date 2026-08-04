@@ -200,6 +200,113 @@ async fn persistence_quiesce_waits_for_admitted_mutation() {
     );
 }
 
+/// Regression: a write arriving during a background snapshot must WAIT for
+/// the capture, not fail with `MISCONF`.
+///
+/// A benchmark writing through a single auto-BGSAVE previously saw ~54% of
+/// writes rejected (2.39M of 4.43M), because dispatch called the
+/// non-blocking `enter_mutation()` and turned `None` straight into a
+/// client-visible error. `MISCONF` is meant for "persistence is broken,
+/// operator must intervene" — not for a routine mid-checkpoint moment.
+#[tokio::test]
+async fn write_waits_out_quiesce_instead_of_failing() {
+    let db = Db::new(nexrade_core::db::ServerConfig::default());
+
+    // Close admission, as a background snapshot capture does.
+    let quiesce = db.persistence.quiesce().await;
+
+    // The non-blocking path refuses — this is what dispatch used to call.
+    assert!(
+        db.persistence.enter_mutation().is_none(),
+        "sanity: quiesce closes the non-blocking admission path"
+    );
+
+    // The waiting path must block rather than return None...
+    let clone = db.clone();
+    let waiter = tokio::spawn(async move {
+        clone
+            .persistence
+            .enter_mutation_waiting(std::time::Duration::from_secs(5))
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !waiter.is_finished(),
+        "a write arriving during quiesce must wait, not fail immediately"
+    );
+
+    // ...and succeed once the capture finishes.
+    drop(quiesce);
+    let permit = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+        .await
+        .expect("waiter must resolve promptly after quiesce ends")
+        .expect("waiter task");
+    assert!(
+        permit.is_some(),
+        "reopening admission must hand the waiting write a permit"
+    );
+}
+
+/// The end-to-end version of the above, through `dispatch`.
+///
+/// This is the test that actually pins the fix: the previous one exercises
+/// `enter_mutation_waiting` directly, so it passes even if dispatch is still
+/// wired to the non-blocking `enter_mutation()`. Here a real `SET` is issued
+/// while a capture is in flight and must succeed rather than return MISCONF.
+#[tokio::test]
+async fn dispatch_set_waits_out_quiesce_instead_of_returning_misconf() {
+    let db = Db::new(nexrade_core::db::ServerConfig::default());
+    let quiesce = db.persistence.quiesce().await;
+
+    // Issue a real write through the same path a client uses.
+    let clone = db.clone();
+    let writer = tokio::spawn(async move { run(&clone, cmd(&["SET", "quiesce:key", "v"])).await });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !writer.is_finished(),
+        "SET during a capture must wait, not return MISCONF immediately"
+    );
+
+    drop(quiesce);
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+        .await
+        .expect("SET must complete once the capture finishes")
+        .expect("writer task");
+
+    match reply {
+        Resp::SimpleString(s) => assert_eq!(s, "OK", "SET should succeed after the capture"),
+        Resp::Error(e) => panic!("SET was rejected during a routine capture: {e}"),
+        other => panic!("unexpected SET reply: {other:?}"),
+    }
+
+    // And the value really landed.
+    let got = run(&db, cmd(&["GET", "quiesce:key"])).await;
+    match got {
+        Resp::BulkString(Some(b)) => assert_eq!(&b[..], b"v"),
+        other => panic!("expected the written value, got {other:?}"),
+    }
+}
+
+/// The timeout is a real ceiling: a quiesce that never ends still surfaces
+/// an error rather than hanging the client forever.
+#[tokio::test]
+async fn write_gives_up_if_quiesce_outlasts_timeout() {
+    let db = Db::new(nexrade_core::db::ServerConfig::default());
+    let _quiesce = db.persistence.quiesce().await; // held for the whole test
+
+    let permit = db
+        .persistence
+        .enter_mutation_waiting(std::time::Duration::from_millis(100))
+        .await;
+
+    assert!(
+        permit.is_none(),
+        "a quiesce outlasting the timeout must still report failure"
+    );
+}
+
 #[tokio::test]
 async fn aof_rewrite_concurrency_lock_works() {
     // Only one BGREWRITEAOF at a time — concurrent rewrites would race

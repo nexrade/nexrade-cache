@@ -37,7 +37,7 @@ pub enum Resp {
     Push(Vec<Resp>),
     /// Pre-serialized RESP bytes — written as-is, no framing added.
     /// Used by commands that serialize directly into a buffer for performance
-    /// (e.g. LRANGE avoids building an intermediate Vec<Resp>).
+    /// (e.g. LRANGE avoids building an intermediate `Vec<Resp>`).
     Raw(Bytes),
 }
 
@@ -576,6 +576,15 @@ impl RespParser {
         self.buf.extend_from_slice(data);
     }
 
+    /// Number of fed-but-unparsed bytes still buffered.
+    ///
+    /// Lets a caller that needs a command's *raw* framing (AOF replay)
+    /// recover its byte length from the drop in this value across a
+    /// `parse_one`, rather than re-encoding the parsed value.
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Try to parse one complete RESP value from the buffer.
     /// Returns Ok(Some(value)) if a complete value was parsed,
     /// Ok(None) if more data is needed,
@@ -607,6 +616,11 @@ enum ParseError {
     Invalid(String),
 }
 
+/// Parse a single RESP value from `buf`.
+///
+/// Returns `(value, consumed)` where `consumed` is the number of
+/// leading bytes the value occupied. Errors as `ParseError::Incomplete`
+/// when `buf` does not end on a frame boundary.
 fn parse_resp(buf: &[u8]) -> std::result::Result<(Resp, usize), ParseError> {
     if buf.is_empty() {
         return Err(ParseError::Incomplete);

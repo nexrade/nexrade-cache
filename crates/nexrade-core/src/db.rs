@@ -4,10 +4,13 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize,
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::SystemTime;
 
 use parking_lot::Mutex;
-use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard};
+use tokio::sync::Notify;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::acl::AclManager;
 use crate::cluster::generate_node_id;
@@ -51,6 +54,50 @@ impl PersistenceCoordinator {
             active_mutations: AtomicUsize::new(0),
             drained: Notify::new(),
             exclusive: Arc::new(AsyncMutex::new(())),
+        }
+    }
+
+    /// Admit one write, waiting out a transient quiesce instead of failing.
+    ///
+    /// A background snapshot closes admission only for the duration of the
+    /// in-memory `snapshot_dbs()` capture (file I/O happens after the guard
+    /// is dropped), so the window is short and bounded. Rejecting writes
+    /// during it surfaced to clients as
+    /// `MISCONF persistence is quiescing` — which is wrong: `MISCONF` means
+    /// persistence is *broken and needs an operator*, not that the server is
+    /// mid-checkpoint. Redis blocks the writer for the equivalent window
+    /// rather than erroring, and a routine `BGSAVE` must not fail user
+    /// writes.
+    ///
+    /// Waits up to `timeout` for admission to reopen. Returns `None` only if
+    /// the quiesce outlasts the timeout, in which case the caller still
+    /// surfaces `MISCONF` — that residual case means persistence really is
+    /// stuck, which is what the error is for.
+    pub async fn enter_mutation_waiting(
+        self: &Arc<Self>,
+        timeout: std::time::Duration,
+    ) -> Option<PersistenceMutation> {
+        // Fast path: no quiesce in flight. This is the overwhelmingly
+        // common case and costs the same as `enter_mutation`.
+        if let Some(permit) = self.enter_mutation() {
+            return Some(permit);
+        }
+        // Slow path: a capture is in flight. Wait for the guard to reopen
+        // admission, re-arming the notification before each re-check so a
+        // wake between attempts is never missed.
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.drained.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(permit) = self.enter_mutation() {
+                return Some(permit);
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                // Timed out — fall through to one last attempt so a reopen
+                // racing the deadline still succeeds.
+                return self.enter_mutation();
+            }
         }
     }
 

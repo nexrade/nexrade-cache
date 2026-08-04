@@ -75,7 +75,7 @@ pub fn set_list_thresholds(t: ListThresholds) {
 /// (catastrophic under redis-benchmark after the list exceeds Compact caps).
 ///
 /// **Wire format**: `items` only (`bytes` is `#[serde(skip)]` and recomputed
-/// on load via [`LinkedList::from_deque`]-style rebuild in a custom
+/// on load via a `LinkedList::from_deque`-style rebuild in a custom
 /// deserializer). ListData uses the default (externally tagged) enum
 /// representation — bincode cannot round-trip `#[serde(tag = "e")]` enums
 /// with non-trivial content (`AnyNotSupported`).

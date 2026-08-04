@@ -272,11 +272,26 @@ fn config_from_cli(cli: &Cli) -> Result<ServerConfig> {
     // or wherever a service manager's default CWD is. Anchor them to the
     // executable's own directory instead, so the save file always lands
     // next to the binary regardless of how/where it was launched.
+    //
+    // An empty string (`--rdb-path ""`) is the documented "disable
+    // persistence" sentinel — skip the resolution so it doesn't get
+    // joined to the exe directory and end up as a real file path.
+    // A listener-side filter also strips empty paths, but doing it
+    // here keeps the recovery-source check from rejecting startup
+    // because two empty paths both resolved to the same file.
     if let Some(ref rdb_path) = config.persistence.rdb_path {
-        config.persistence.rdb_path = Some(resolve_persistence_path(rdb_path));
+        if rdb_path.is_empty() {
+            config.persistence.rdb_path = None;
+        } else {
+            config.persistence.rdb_path = Some(resolve_persistence_path(rdb_path));
+        }
     }
     if let Some(ref aof_path) = config.persistence.aof_path {
-        config.persistence.aof_path = Some(resolve_persistence_path(aof_path));
+        if aof_path.is_empty() {
+            config.persistence.aof_path = None;
+        } else {
+            config.persistence.aof_path = Some(resolve_persistence_path(aof_path));
+        }
     }
 
     Ok(config)
@@ -1292,6 +1307,70 @@ port = 9099
         assert_eq!(cfg.max_clients, 500);
         assert!(!cfg.metrics_enabled);
         assert_eq!(cfg.metrics_port, 9099);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // `--rdb-path ""` and `--aof-path ""` are the documented "disable
+    // persistence" sentinels. Resolution must treat them as None, not as
+    // a relative path to be joined to the executable directory — otherwise
+    // both empty paths resolve to the same file and the recovery-source
+    // rule rejects startup with "both RDB and AOF exist".
+    #[test]
+    fn empty_persistence_paths_disable_persistence() {
+        let path = temp_config(
+            "empty_persistence",
+            r##"
+bind = "127.0.0.1"
+port = 16499
+
+[persistence]
+rdb_path = "nexrade.rdb"
+aof_path = ""
+
+[metrics]
+enabled = false
+"##,
+        );
+        let cli = Cli {
+            config: Some(path.to_str().unwrap().to_string()),
+            bind: None,
+            port: None,
+            databases: None,
+            requirepass: None,
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
+            tls_port: None,
+            metrics: None,
+            metrics_bind: None,
+            metrics_port: None,
+            log_level: "info".to_string(),
+            log_json: false,
+            max_clients: None,
+            maxmemory: None,
+            maxmemory_policy: None,
+            timeout: None,
+            rdb_path: Some("".to_string()),
+            aof_path: Some("".to_string()),
+            print_config: false,
+            preflight: false,
+            health: false,
+            health_bind: None,
+            health_port: None,
+            health_max_snapshot_age: None,
+            health_max_replication_lag: None,
+        };
+        let cfg = config_from_cli(&cli).unwrap();
+        assert!(
+            cfg.persistence.rdb_path.is_none(),
+            "--rdb-path \"\" must disable RDB, got {:?}",
+            cfg.persistence.rdb_path
+        );
+        assert!(
+            cfg.persistence.aof_path.is_none(),
+            "--aof-path \"\" must disable AOF, got {:?}",
+            cfg.persistence.aof_path
+        );
         std::fs::remove_file(&path).ok();
     }
 }

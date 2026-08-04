@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 
-use crate::command::get_f64;
+use crate::command::{decode_scan_cursor, get_f64, scan_cursor_token, scan_start_offset_by};
 
 use crate::command::string::format_float;
 use crate::command::{get_bytes_vec, get_i64, get_str};
@@ -1222,10 +1222,7 @@ pub async fn cmd_zscan(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
         return Err(NexradeError::WrongArity("zscan".to_string()));
     }
     let key = get_bytes_vec(args, 1, "ZSCAN")?;
-    let cursor: u64 = get_i64(args, 2, "ZSCAN")
-        .ok()
-        .map(|n| n.max(0) as u64)
-        .unwrap_or(0);
+    let cursor: Option<u64> = get_str(args, 2, "ZSCAN").ok().and_then(decode_scan_cursor);
 
     let mut pattern: Option<Vec<u8>> = None;
     let mut count: usize = 10;
@@ -1260,10 +1257,20 @@ pub async fn cmd_zscan(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
                     .into_iter()
                     .filter(|(m, _)| glob_match(&pat, m.as_slice()))
                     .collect();
-                pairs.sort_by(|a, b| a.0.cmp(&b.0));
-                let start = (cursor as usize).min(pairs.len());
+                // Member-space cursor, see `scan_cursor_token`. Ordering by
+                // the token makes the cursor a position in the walked order,
+                // so a removed boundary member cannot shift the resume point.
+                // Byte sort then a stable cached-key sort on the token:
+                // one hash per element instead of one per comparison.
+                pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                pairs.sort_by_cached_key(|p| scan_cursor_token(&p.0));
+                let start = scan_start_offset_by(&pairs, cursor, |p| &p.0);
                 let end = (start + count).min(pairs.len());
-                let next = if end >= pairs.len() { 0u64 } else { end as u64 };
+                let next = if end >= pairs.len() {
+                    0
+                } else {
+                    scan_cursor_token(&pairs[end - 1].0)
+                };
                 let mut items = Vec::with_capacity((end - start) * 2);
                 for (m, score) in &pairs[start..end] {
                     items.push(Resp::bulk(Bytes::from(m.clone())));

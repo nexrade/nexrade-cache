@@ -5,7 +5,8 @@
     <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
 <?endif ?>
 
-<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'
+     xmlns:firewall='http://schemas.microsoft.com/wix/2006/wi/wixfirewall'>
 
     <Product
         Id='*'
@@ -20,7 +21,7 @@
             Keywords='Installer'
             Description='nexrade-cache — Redis-compatible cache server written in Rust'
             Manufacturer='Nexrade'
-            InstallerVersion='450'
+            InstallerVersion='500'
             Languages='1033'
             Compressed='yes'
             InstallScope='perMachine'
@@ -87,7 +88,7 @@
                                 Start='auto'
                                 ErrorControl='normal'
                                 Account='LocalSystem'
-                                Arguments='--service'>
+                                Arguments='--service --port [INSTALLPORT]'>
                                 <ServiceConfig
                                     DelayedAutoStart='yes'
                                     OnInstall='yes'
@@ -111,6 +112,24 @@
                             DiskId='1'
                             Source='nexrade.example.toml'
                             KeyPath='yes'/>
+                    </Component>
+
+                    <!-- Optional Windows Firewall inbound rule, added only
+                             when the operator leaves the dialog checkbox
+                             ticked. WiX creates the rule on install and
+                             removes it on uninstall automatically. The
+                             Port value comes from the [INSTALLPORT]
+                             property the operator entered in the dialog,
+                             which already defaults to 6399. -->
+                    <Component Id='NexradeCacheFirewall' Guid='*' Win64='yes'>
+                        <Condition><![CDATA[INSTALLFIREWALL]]></Condition>
+                        <firewall:Firewall Id='NexradeCacheFirewallRule'
+                                           Name='nexrade-cache'
+                                           Port='[INSTALLPORT]'
+                                           Protocol='tcp'
+                                           Profile='all'
+                                           Scope='all'
+                                           Description='Inbound TCP for nexrade-cache (Redis-compatible cache)'/>
                     </Component>
 
                 </Directory>
@@ -189,6 +208,7 @@
             <ComponentRef Id='binary1'/>
             <ComponentRef Id='ConfigExample'/>
             <ComponentRef Id='ApplicationShortcuts'/>
+            <ComponentRef Id='NexradeCacheFirewall'/>
 
             <Feature
                 Id='Environment'
@@ -230,11 +250,67 @@
 
         <!-- ── Installer UI ──────────────────────────────────────────── -->
         <UI>
+            <!--
+                Custom dialog: Redis 3-style "Port Number and Firewall
+                Exception" screen, inserted between CustomizeDlg
+                (feature tree) and VerifyReadyDlg. Captures the listener
+                port and an opt-out firewall checkbox, both consumed by
+                downstream components.
+            -->
+            <Dialog Id='PortFirewallDlg' Width='370' Height='270' Title='nexrade-cache Setup'>
+                <Control Id='BannerBitmap' Type='Bitmap' Width='370' Height='58' X='0' Y='0'
+                         TabSkip='no' Text='WixUIBannerBmp'/>
+                <Control Id='BannerText' Type='Text' X='15' Y='9' Width='340' Height='15'
+                         Transparent='yes' Text='{\WixUI_Font_Title}Port Number and Firewall Exception'/>
+                <Control Id='BodyText' Type='Text' X='25' Y='60' Width='320' Height='28'
+                         Text='Select whether to add an exception to the Windows Firewall for nexrade-cache.'/>
+                <Control Id='PortLabel' Type='Text' X='25' Y='110' Width='220' Height='17'
+                         Text='Port to run nexrade-cache on:'/>
+                <Control Id='PortEdit' Type='Edit' Width='80' Height='17' X='250' Y='108'
+                         Property='INSTALLPORT' Indirect='no'/>
+                <Control Id='FirewallCheckBox' Type='CheckBox' Width='320' Height='17' X='25' Y='140'
+                         Property='INSTALLFIREWALL' CheckBoxValue='EnableFirewall'
+                         Text='Add an exception to the Windows Firewall.'/>
+                <Control Id='BottomLine' Type='Line' X='0' Y='234' Width='370' Height='0'/>
+                <Control Id='Back' Type='PushButton' X='180' Y='243' Width='56' Height='17'
+                         Text='&amp;Back'>
+                    <Publish Event='NewDialog' Value='CustomizeDlg'>1</Publish>
+                </Control>
+                <Control Id='Next' Type='PushButton' X='236' Y='243' Width='56' Height='17'
+                         Default='yes' Text='&amp;Next'>
+                    <Publish Event='NewDialog' Value='VerifyReadyDlg'>1</Publish>
+                </Control>
+                <Control Id='Cancel' Type='PushButton' X='304' Y='243' Width='56' Height='17'
+                         Cancel='yes' Text='Cancel'>
+                    <Publish Event='EndDialog' Value='Exit'>1</Publish>
+                </Control>
+            </Dialog>
+
             <UIRef Id='WixUI_FeatureTree'/>
             <!-- Skip the EULA dialog (go straight to feature selection) -->
             <Publish Dialog='WelcomeDlg'  Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
             <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg'  Order='99'>1</Publish>
+            <!-- Insert the port + firewall dialog after the feature tree.
+                 Order='99' so we deterministically win over WixUI_FeatureTree's
+                 built-in CustomizeDlg Next -> VerifyReadyDlg publish (which
+                 ships with the implicit default Order=1). Without the explicit
+                 Order, both rules match the same condition (1) and the
+                 declaration-order tiebreak is not guaranteed across MSI runtime
+                 versions; with Order=99 ours is evaluated last and wins. -->
+            <Publish Dialog='CustomizeDlg'     Control='Next' Event='NewDialog' Value='PortFirewallDlg' Order='99'>1</Publish>
+            <Publish Dialog='PortFirewallDlg'   Control='Back' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
         </UI>
+
+        <!-- Defaults for the dialog. INSTALLPORT: 6399 — chosen offset so
+             a co-existing Redis on 6379 keeps working. The operator can
+             override. INSTALLFIREWALL defaults to EnableFirewall (defined
+             below) so the checkbox is ticked out of the box; unticking it
+             leaves the firewall component un-installed via its
+             <Condition>. EnableFirewall is the value the checkbox writes
+             when ticked. -->
+        <Property Id='INSTALLPORT' Value='6399'/>
+        <Property Id='INSTALLFIREWALL' Value='EnableFirewall'/>
+        <Property Id='EnableFirewall' Value='1'/>
 
         <!-- ── Custom banner image (493×58 px) ──────────────────────── -->
         <WixVariable Id='WixUIBannerBmp' Value='nexrade-cli\wix\Banner.bmp'/>

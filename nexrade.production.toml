@@ -103,6 +103,13 @@ port = 6380
 # probes, monitoring agent) on the same host, not direct internet
 # access. If you need remote access, put a reverse proxy in front and
 # authenticate at that layer.
+#
+# Important: `[tls].enabled = true` covers the Redis listener (port 6379)
+# and TLS listener (6380) ONLY. The operations listeners above are
+# plaintext and unauthenticated; the [tls] block does not apply to
+# them. Treat loopback binding as the security boundary — if your
+# sidecar needs the data over the network, terminate TLS at a reverse
+# proxy and authenticate at that layer.
 
 [metrics]
 enabled = true

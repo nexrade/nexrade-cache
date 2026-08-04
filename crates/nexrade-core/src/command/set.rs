@@ -4,7 +4,10 @@ use std::collections::HashSet;
 
 use bytes::Bytes;
 
-use crate::command::{get_bytes_vec, get_i64, get_str};
+use crate::command::{
+    decode_scan_cursor, get_bytes_vec, get_i64, get_str, scan_cursor_token, scan_sort_by_token,
+    scan_start_offset,
+};
 use crate::db::Db;
 use crate::error::{NexradeError, Result};
 use crate::resp::Resp;
@@ -464,10 +467,7 @@ pub async fn cmd_sscan(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
         return Err(NexradeError::WrongArity("sscan".to_string()));
     }
     let key = get_bytes_vec(args, 1, "SSCAN")?;
-    let cursor: u64 = get_i64(args, 2, "SSCAN")
-        .ok()
-        .map(|n| n.max(0) as u64)
-        .unwrap_or(0);
+    let cursor: Option<u64> = get_str(args, 2, "SSCAN").ok().and_then(decode_scan_cursor);
 
     let mut pattern: Option<Vec<u8>> = None;
     let mut count: usize = 10;
@@ -502,13 +502,18 @@ pub async fn cmd_sscan(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
                     .into_iter()
                     .filter(|m| glob_match(&pat, m.as_slice()))
                     .collect();
-                members.sort();
-                let start = (cursor as usize).min(members.len());
+                scan_sort_by_token(&mut members);
+                // Member-space cursor, see `scan_cursor_token` for the
+                // hex-encoded boundary scheme. See D1/D2 fix: deletions
+                // cannot shift the resume point because the token is the
+                // boundary itself, not a hash.
+                let start = scan_start_offset(&members, cursor);
+                let start = start.min(members.len());
                 let end = (start + count).min(members.len());
                 let next = if end >= members.len() {
-                    0u64
+                    0
                 } else {
-                    end as u64
+                    scan_cursor_token(&members[end - 1])
                 };
                 let items: Vec<Resp> = members[start..end]
                     .iter()

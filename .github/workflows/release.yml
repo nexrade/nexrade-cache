@@ -303,6 +303,24 @@ jobs:
           $wixPath = (Get-ChildItem "C:\Program Files (x86)\WiX Toolset*" | Sort-Object Name -Descending | Select-Object -First 1).FullName
           "$wixPath\bin" | Out-File -Append -FilePath $env:GITHUB_PATH
 
+      # WixFirewallExtension is shipped as a separate DLL alongside candle.exe,
+      # not in the Chocolatey wixtoolset package. The MSI uses it for the
+      # `<firewall:Firewall>` element that adds/removes the Windows Firewall
+      # inbound rule tied to the operator-supplied port from the installer
+      # dialog. The wix314-binaries.zip artifact on the upstream wix3 release
+      # contains the matching 3.14.x build.
+      - name: Install WixFirewallExtension
+        run: |
+          $wixPath = (Get-ChildItem "C:\Program Files (x86)\WiX Toolset*" | Sort-Object Name -Descending | Select-Object -First 1).FullName
+          $extPath = Join-Path $wixPath "bin\WixFirewallExtension.dll"
+          if (-not (Test-Path $extPath)) {
+            $zip = "$env:RUNNER_TEMP\wix314-binaries.zip"
+            Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip" -OutFile $zip
+            Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\wix314" -Force
+            Get-ChildItem "$env:RUNNER_TEMP\wix314\WixFirewallExtension.dll" -ErrorAction Stop | Copy-Item -Destination $extPath -Force
+          }
+          if (-not (Test-Path $extPath)) { throw "WixFirewallExtension.dll not found at $extPath" }
+
       - name: Install cargo-wix
         run: |
           if (-not (Get-Command cargo-wix -ErrorAction SilentlyContinue)) {
@@ -314,8 +332,22 @@ jobs:
 
       - name: Build MSI
         run: |
+          # WixFirewallExtension provides the `<firewall:Firewall>` schema.
+          # candle.exe/light.exe parse `-ext` by taking arg.Substring(1) and
+          # comparing the result to the literal "ext", then consuming the NEXT
+          # argv element as the extension name. So `-ext` and the name must
+          # arrive as two separate argv elements. cargo-wix appends each
+          # --compiler-arg / --linker-arg occurrence as exactly one argv
+          # element (num_args(1) + ArgAction::Append), so each flag needs its
+          # own occurrence. Bundling them as "-ext WixFirewallExtension" makes
+          # candle see the single token `ext WixFirewallExtension`, fail the
+          # "ext" comparison, and emit CNDL1098 ("not a valid command line
+          # argument") -- the extension then never loads and the
+          # <firewall:Firewall> element fails with CNDL0200.
           cargo wix --package nexrade-cache --no-build --nocapture `
             --target ${{ matrix.target }} `
+            --compiler-arg "-ext" --compiler-arg "WixFirewallExtension" `
+            --linker-arg "-ext" --linker-arg "WixFirewallExtension" `
             --output "nexrade-cache-${{ github.ref_name }}-${{ matrix.arch }}.msi"
 
       - name: Checksum

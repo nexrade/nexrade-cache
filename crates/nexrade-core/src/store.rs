@@ -173,7 +173,7 @@ impl Database {
 
     /// Delete a key that a caller already observed to be empty under a live
     /// borrow (Redis-style empty-collection GC). The removed shell + key
-    /// overhead leave `live_bytes` via [`remove`]. Callers gate this on an
+    /// overhead leave `live_bytes` via `remove`. Callers gate this on an
     /// `is_empty()` flag captured while the value was borrowed, so the hot
     /// non-empty path pays nothing here.
     #[inline]
@@ -936,6 +936,13 @@ pub struct ShardedDatabase {
 
 impl ShardedDatabase {
     pub fn new(num_shards: usize) -> Self {
+        // `shard_idx` masks with `num_shards - 1`, and `scan_page` recovers the
+        // shard index from a cursor's top bits via `trailing_zeros()`. Both are
+        // silently wrong for a non-power-of-two, and this constructor is public.
+        debug_assert!(
+            num_shards.is_power_of_two(),
+            "num_shards must be a power of two, got {num_shards}"
+        );
         // All shards share the same atomic clock source so a single
         // `Arc<AtomicU32>` load from any shard returns the current LRU
         // timestamp. Defaults to 0; the Store wires the real atomic in.
@@ -1090,6 +1097,102 @@ impl ShardedDatabase {
             keys.extend(shard.write().keys_matching(pattern));
         }
         keys
+    }
+
+    /// One `SCAN` page, in `command::scan_order_key` order.
+    ///
+    /// Returns `(page, next_cursor)`, where a `next_cursor` of `0` means the
+    /// iteration is complete. `cursor` is the order key of the last element
+    /// already handed out (`0` to start); every element returned has an order
+    /// key strictly greater than it.
+    ///
+    /// This exists because the obvious implementation — `keys_matching()` then
+    /// sort, then slice out one page — re-materialises and re-sorts the entire
+    /// keyspace on *every* call, making a full traversal O(n²) and write-locking
+    /// all 64-256 shards each time. Here the order key's top bits are the shard
+    /// index (see `command::scan_order_key`), so one shard's keys are contiguous
+    /// in the ordering and a page can be served from a single shard under a
+    /// single **read** lock.
+    ///
+    /// Two properties worth not breaking:
+    ///
+    /// * **Expired entries are skipped, not deleted.** `SCAN` is flagged
+    ///   `readonly`, so it takes read locks and leaves reclamation to the
+    ///   active expiry cycle and lazy-on-access. (`keys_matching`, used by
+    ///   `KEYS`, still reaps — it already held a write lock.)
+    /// * **The page fills across shards.** `COUNT` is a hard cap that callers
+    ///   treat as a real page size, and shards are mostly empty for small
+    ///   keyspaces — 25 keys over 64 shards occupy ~21 of them — so stopping at
+    ///   the first shard boundary would need one round per shard and blow the
+    ///   round ceilings the SCAN tests assert. Advancing costs at most
+    ///   `shard_count()` cheap read locks: a bounded constant, not O(n).
+    pub fn scan_page(
+        &self,
+        cursor: u64,
+        count: usize,
+        pattern: &[u8],
+        order_key: impl Fn(&[u8]) -> u64,
+        mut keep: impl FnMut(&[u8], &Entry) -> bool,
+    ) -> (Vec<Vec<u8>>, u64) {
+        let count = count.max(1);
+        let shift = self.num_shards.trailing_zeros();
+
+        // Shards are visited in bit-reversed index order, because the order key
+        // is a bit-reversed hash: step `i` of the walk is shard
+        // `reverse(i)`, which is the shard whose keys sort next.
+        let shard_for_step =
+            |step: usize| -> usize { ((step as u64).reverse_bits() >> (64 - shift)) as usize };
+
+        // The cursor's top `shift` bits are the bit-reversed shard index, i.e.
+        // exactly the step number the cursor was produced at.
+        let start_step = if cursor == 0 {
+            0
+        } else {
+            (cursor >> (64 - shift)) as usize
+        };
+
+        let mut page = Vec::with_capacity(count.min(1024));
+        // `None` once we move past the shard the cursor came from: later shards
+        // must start from their beginning, not from the incoming cursor.
+        // Getting this wrong silently skips the prefix of every later shard.
+        let mut within = Some(cursor);
+
+        for step in start_step..self.num_shards {
+            let idx = shard_for_step(step);
+            let guard = self.shards[idx].read();
+
+            let mut batch: Vec<(u64, &Vec<u8>)> = guard
+                .entries
+                .iter()
+                .filter(|(k, e)| {
+                    // Expired entries are invisible but not reaped here.
+                    !e.is_expired() && glob_match(pattern, k) && keep(k, e)
+                })
+                .map(|(k, _)| (order_key(k), k))
+                .filter(|(ok, _)| match within {
+                    Some(c) => *ok > c,
+                    None => true,
+                })
+                .collect();
+            batch.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+
+            for (ok, k) in batch {
+                page.push(k.clone());
+                if page.len() == count {
+                    // Mid-shard stop: hand back this element's order key. Its
+                    // top bits re-encode this same step, so the next call
+                    // resumes in this shard.
+                    return (page, ok);
+                }
+            }
+
+            drop(guard);
+            // Past the resume shard from here on.
+            within = None;
+        }
+
+        // Every shard drained.
+        (page, 0)
     }
 
     pub fn estimated_memory_bytes(&self) -> usize {
@@ -3031,5 +3134,171 @@ mod tests {
             DataType::String(v) => assert_eq!(v.as_ref(), b"a"),
             _ => unreachable!(),
         }
+    }
+
+    // ── scan_page ─────────────────────────────────────────────────────────────
+
+    /// Drive `scan_page` to completion the way `cmd_scan` does.
+    fn drive_scan(sdb: &ShardedDatabase, count: usize, pattern: &[u8]) -> (Vec<Vec<u8>>, usize) {
+        let mut cursor = 0u64;
+        let mut all = Vec::new();
+        let mut rounds = 0usize;
+        loop {
+            rounds += 1;
+            assert!(rounds < 100_000, "scan_page must terminate");
+            let (page, next) = sdb.scan_page(
+                cursor,
+                count,
+                pattern,
+                crate::command::scan_order_key,
+                |_, _| true,
+            );
+            assert!(page.len() <= count, "COUNT must be a hard cap");
+            all.extend(page);
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+        (all, rounds)
+    }
+
+    #[test]
+    fn scan_page_visits_every_key_exactly_once() {
+        for &ns in &[4usize, 16, 64, 256] {
+            let sdb = ShardedDatabase::new(ns);
+            for i in 0..500 {
+                let k = format!("k:{i}").into_bytes();
+                sdb.write_for(&k).insert(
+                    k.clone(),
+                    Entry::new(DataType::String(Bytes::from_static(b"v"))),
+                );
+            }
+            for &count in &[1usize, 7, 100, 1000] {
+                let (mut got, _) = drive_scan(&sdb, count, b"*");
+                let total = got.len();
+                got.sort();
+                got.dedup();
+                assert_eq!(got.len(), 500, "ns={ns} count={count}: missing keys");
+                assert_eq!(
+                    total, 500,
+                    "ns={ns} count={count}: duplicates in a static keyspace"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scan_page_honours_match() {
+        let sdb = ShardedDatabase::new(16);
+        for i in 0..200 {
+            for p in ["a:", "b:"] {
+                let k = format!("{p}{i}").into_bytes();
+                sdb.write_for(&k).insert(
+                    k.clone(),
+                    Entry::new(DataType::String(Bytes::from_static(b"v"))),
+                );
+            }
+        }
+        let (got, _) = drive_scan(&sdb, 10, b"a:*");
+        assert_eq!(got.len(), 200);
+        assert!(got.iter().all(|k| k.starts_with(b"a:")));
+    }
+
+    /// The trap that makes the ordering bit-reversed: the shard count is derived
+    /// from the CPU count and never persisted, so a client can resume a cursor
+    /// against a server with a different number of shards. Ordering by
+    /// `(shard_idx, token)` silently drops most of the keyspace when that
+    /// happens; the bit-reversed order must not.
+    #[test]
+    fn scan_page_cursor_survives_a_shard_count_change() {
+        let build = |ns: usize| {
+            let sdb = ShardedDatabase::new(ns);
+            for i in 0..800 {
+                let k = format!("k:{i}").into_bytes();
+                sdb.write_for(&k).insert(
+                    k.clone(),
+                    Entry::new(DataType::String(Bytes::from_static(b"v"))),
+                );
+            }
+            sdb
+        };
+        for &(a, b) in &[
+            (4usize, 16usize),
+            (16, 4),
+            (16, 64),
+            (64, 16),
+            (64, 256),
+            (256, 64),
+        ] {
+            let (sa, sb) = (build(a), build(b));
+            // Page through, swapping which server serves each round.
+            let mut cursor = 0u64;
+            let mut seen: Vec<Vec<u8>> = Vec::new();
+            let mut rounds = 0;
+            let mut on_a = true;
+            loop {
+                rounds += 1;
+                assert!(
+                    rounds < 10_000,
+                    "must terminate across a shard-count change"
+                );
+                let sdb = if on_a { &sa } else { &sb };
+                let (page, next) =
+                    sdb.scan_page(cursor, 25, b"*", crate::command::scan_order_key, |_, _| {
+                        true
+                    });
+                seen.extend(page);
+                cursor = next;
+                on_a = !on_a;
+                if cursor == 0 {
+                    break;
+                }
+            }
+            seen.sort();
+            seen.dedup();
+            assert_eq!(
+                seen.len(),
+                800,
+                "{a} -> {b}: cursor migration dropped {} keys",
+                800 - seen.len()
+            );
+        }
+    }
+
+    #[test]
+    fn scan_page_skips_expired_without_deleting() {
+        let sdb = ShardedDatabase::new(16);
+        for i in 0..50 {
+            let k = format!("live:{i}").into_bytes();
+            sdb.write_for(&k).insert(
+                k.clone(),
+                Entry::new(DataType::String(Bytes::from_static(b"v"))),
+            );
+        }
+        // Already-past deadline: visible to `len()`, invisible to SCAN.
+        for i in 0..50 {
+            let k = format!("dead:{i}").into_bytes();
+            sdb.write_for(&k).insert(
+                k.clone(),
+                Entry::with_expiry(
+                    DataType::String(Bytes::from_static(b"v")),
+                    Expiry::from_ms(1),
+                ),
+            );
+        }
+        let before = sdb.len();
+        let (got, _) = drive_scan(&sdb, 10, b"*");
+        assert_eq!(got.len(), 50, "expired keys must not be returned");
+        assert!(got.iter().all(|k| k.starts_with(b"live:")));
+        assert_eq!(sdb.len(), before, "SCAN must not delete expired keys");
+    }
+
+    #[test]
+    fn scan_page_terminates_on_an_empty_keyspace() {
+        let sdb = ShardedDatabase::new(64);
+        let (page, next) = sdb.scan_page(0, 10, b"*", crate::command::scan_order_key, |_, _| true);
+        assert!(page.is_empty());
+        assert_eq!(next, 0, "empty keyspace completes in one call");
     }
 }
