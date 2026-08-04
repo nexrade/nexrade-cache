@@ -276,8 +276,10 @@ fn run_service(config: ServerConfig) -> Result<()> {
     // the SCM still waiting on StartPending.
     let db = db_rx.recv_timeout(Duration::from_secs(30)).ok();
     if db.is_none() {
-        eprintln!("warning: server did not report readiness within 30s; \
-                   stop will terminate without a graceful flush");
+        eprintln!(
+            "warning: server did not report readiness within 30s; \
+                   stop will terminate without a graceful flush"
+        );
     }
 
     // Report Running.
