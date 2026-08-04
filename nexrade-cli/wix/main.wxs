@@ -120,8 +120,12 @@
                              removes it on uninstall automatically. The
                              Port value comes from the [INSTALLPORT]
                              property the operator entered in the dialog,
-                             which already defaults to 6399. -->
-                    <Component Id='NexradeCacheFirewall' Guid='*' Win64='yes'>
+                             which already defaults to 6399.
+                             Guid is explicit (not '*'): this component has no
+                             file/registry keypath for light to hash, so an
+                             auto-generated guid is rejected with LGHT0230.
+                             KeyPath='yes' marks the component itself. -->
+                    <Component Id='NexradeCacheFirewall' Guid='37952E97-D87B-5FDC-8CE1-B422BABBF420' Win64='yes' KeyPath='yes'>
                         <Condition><![CDATA[INSTALLFIREWALL]]></Condition>
                         <firewall:FirewallException Id='NexradeCacheFirewallRule'
                                            Name='nexrade-cache'
@@ -258,8 +262,13 @@
                 downstream components.
             -->
             <Dialog Id='PortFirewallDlg' Width='370' Height='270' Title='nexrade-cache Setup'>
+                <!-- Text is the Binary row Id, not the WixVariable name:
+                     WixUIBannerBmp is the variable that overrides the
+                     bitmap's *source file*, while the row WixUIExtension
+                     actually emits is WixUI_Bmp_Banner. Naming the variable
+                     here links with LGHT0094 (unresolved Binary symbol). -->
                 <Control Id='BannerBitmap' Type='Bitmap' Width='370' Height='58' X='0' Y='0'
-                         TabSkip='no' Text='WixUIBannerBmp'/>
+                         TabSkip='no' Text='WixUI_Bmp_Banner'/>
                 <Control Id='BannerText' Type='Text' X='15' Y='9' Width='340' Height='15'
                          Transparent='yes' Text='{\WixUI_Font_Title}Port Number and Firewall Exception'/>
                 <Control Id='BodyText' Type='Text' X='25' Y='60' Width='320' Height='28'
@@ -298,7 +307,9 @@
                  declaration-order tiebreak is not guaranteed across MSI runtime
                  versions; with Order=99 ours is evaluated last and wins. -->
             <Publish Dialog='CustomizeDlg'     Control='Next' Event='NewDialog' Value='PortFirewallDlg' Order='99'>1</Publish>
-            <Publish Dialog='PortFirewallDlg'   Control='Back' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
+            <!-- PortFirewallDlg's own Back/Next publishes are declared inline
+                 on its <Control> elements above; repeating the Back rule here
+                 would emit a duplicate ControlEvent row (LGHT0091). -->
         </UI>
 
         <!-- Defaults for the dialog. INSTALLPORT: 6399 — chosen offset so
