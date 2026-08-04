@@ -73,12 +73,32 @@
                         </Component>
 
                         <!-- Windows Service (optional) -->
+                        <!--
+                            The service runs the SAME nexrade-cache.exe image as
+                            the foreground server, not a renamed copy. We earlier
+                            installed both files, which had two problems: it doubled
+                            disk usage, and crucially the MSI cannot replace the
+                            service binary while it is the running executable image
+                            — Windows holds an OPEN_EXECUTING_IMAGE lock on it and
+                            the file-copy step in the installer hangs indefinitely
+                            (status bar stops at "Copying new files Size: [6]").
+                            Reusing the existing binary avoids both.
+                        -->
                         <Component Id='NexradeCacheService' Guid='4B2F8E3D-9A1C-4E7F-B5D6-8C9E2A4F6B1D'>
-                            <File Id='ServiceBinary'
-                                Name='nexrade-cache-service.exe'
-                                DiskId='1'
-                                Source='$(var.CargoTargetBinDir)\nexrade-cache.exe'
-                                KeyPath='yes'/>
+                            <!-- Registry value used as the component KeyPath. The
+                                 service image file cannot be the keypath: the
+                                 service is "installed" by the SCM at runtime, not
+                                 by writing a file, so MSI needs a different
+                                 per-component identity anchor. A version marker
+                                 under HKLM\Software\nexrade-cache also makes
+                                 upgrade detection unambiguous. -->
+                            <RegistryValue Id='ServiceInstallMarker'
+                                           Root='HKLM'
+                                           Key='SOFTWARE\nexrade-cache'
+                                           Name='ServiceInstalled'
+                                           Type='integer'
+                                           Value='1'
+                                           KeyPath='yes'/>
                             <ServiceInstall
                                 Id='NexradeCacheServiceInstall'
                                 Name='nexrade-cache'
