@@ -42,7 +42,7 @@ jobs:
           shared-key: bench-compile
 
       - name: Compile benchmarks (no run)
-        run: cargo bench -p nexrade-core --no-run
+        run: cargo bench -p nexrade-core --bench store_bench --no-run
 
   # ── On pushes to main only: run all benchmarks and upload HTML reports ──────
   # Not run on PRs — avoids noisy 5-min runs on every feature branch push.
@@ -64,7 +64,12 @@ jobs:
       # producing statistically valid results (criterion runs ≥100 samples).
       - name: Run criterion benchmarks
         run: |
-          cargo bench -p nexrade-core -- \
+          # `--bench store_bench` is required: `cargo bench` without it
+          # falls back to running the test binary (which has its own main and
+          # no criterion parser), and the `--warm-up-time` flag then fails
+          # with "Unrecognized option". Verified by reproducing locally:
+          # direct invocation of the bench binary accepts the flags.
+          cargo bench -p nexrade-core --bench store_bench -- \
             --warm-up-time 1 \
             --measurement-time 3 \
             2>&1 | tee bench-output.txt
