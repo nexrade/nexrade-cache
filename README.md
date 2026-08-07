@@ -4,7 +4,7 @@
 
 # nexrade-cache
 
-**v1.2.3**
+**v1.4.2**
 
 nexrade-cache is **a Redis-protocol-compatible cache server built in Rust**. It speaks the
 RESP2 / RESP3 wire format, ships with TLS, Prometheus metrics, Lua scripting, a plugin API,
@@ -205,14 +205,34 @@ nexrade_keyspace_misses_total{db="0"}           1
 nexrade_db_keys{db="0"}                         10000
 ```
 
-### Operations HTTP (1.2.0)
+### Operations HTTP (1.2.0, probe body narrowed in 1.3.0)
 
 `/healthz` (liveness), `/readyz` (readiness), and `/metrics` are the
 operator's surface. Bind separately under `[health]` (default disabled)
-and `[metrics]`. The same JSON `HealthReport` is reachable via
-`INFO health`. Readiness reason codes (`aof_failed`, `snapshot_too_old`,
-`replica_link_down`, `replication_lag_exceeded`, …) appear in the JSON
-body and in `INFO health` when `/readyz` returns 503.
+and `[metrics]`.
+
+**This listener has no authentication of any kind.** Since 1.3.0 the probe
+body is therefore minimal — liveness, readiness, phase, and machine-readable
+reason codes, and nothing else:
+
+```json
+{"live":true,"ready":false,"phase":"recovering","reasons":["aof_failed"]}
+```
+
+Reason codes (`aof_failed`, `snapshot_too_old`, `replica_link_down`,
+`replication_lag_exceeded`, …) come from a closed enum, so an orchestrator
+still learns *why* an instance is unready without the response disclosing
+configured file paths or internal error text.
+
+Set `health.expose_details = true` to serve the full `HealthReport` instead
+(the pre-1.3.0 body) — it includes `rdb_configured_path`,
+`aof_configured_path`, and the AOF failure message, so enable it only when the
+port is reachable by trusted collectors alone. The full detail is always
+available via `INFO persistence` / `INFO health` on the RESP port, which
+honours `requirepass`.
+
+Status codes are unchanged: `/healthz` is 200 while live, `/readyz` is 200
+only when ready and 503 otherwise.
 
 ### Preflight (1.2.0)
 
@@ -558,8 +578,19 @@ jemalloc on Linux/macOS). Methodology: `-c 50 -n 100000 -q` (no pipeline) and
 1.0.0** (no regressions; random pipe MSET improved to **1.06× Redis** at 0.7.1).
 
 **No pipelining** (`-c 50 -n 100000 -q` — the shape most real client traffic
-takes). nexrade-cache **beats Redis on every common single-key command**,
-typically **+4–10%** with lower p50 latency:
+takes). On a **fixed key** nexrade-cache is ahead on every common single-key
+command, typically **+4–10%** with lower p50 latency. Re-verified against
+Redis 7.0.15 on 2026-08-06 (5 rounds each): SET +7.1%, GET +6.0%, HSET +5.4%,
+ZADD +4.0%.
+
+> **Read the caveat before quoting these.** Non-pipelined throughput on
+> loopback is bounded by the per-command round-trip, not by either server —
+> both sit at ~220–235 k rps, and at `-P 1` you are measuring the socket. The
+> percentages below are real but small, and they do **not** all survive a
+> random keyspace: with `-r 50000`, `ZADD` turns into **−8.8%** (Redis speeds
+> up to 256 k while nexrade-cache stays flat at 234 k). See
+> [`docs/perf-methodology.md`](docs/perf-methodology.md#measured-against-redis-7015-160-release-validation)
+> for the full grid, including where Redis wins.
 
 | Command | nexrade-cache | Redis 7.0.15 | Delta |
 |---------|:---:|:---:|:---:|
@@ -667,23 +698,23 @@ The Windows MSI installer (`nexrade-cache-*.msi`) and the manual `nexrade-cache.
 
 The MSI shows a **Port Number and Firewall Exception** dialog during installation, matching the Redis 3 install UX:
 
-- **Port to run nexrade-cache on:** defaults to `6399` — an offset from Redis's `6379` so a coexisting Redis keeps working. Override before clicking Next.
+- **Port to run nexrade-cache on:** defaults to `6379`, the standard Redis port, matching the server's own default. If a Redis instance is already running on this host, change it here — otherwise the service will fail to bind. Override before clicking Next.
 - **Add an exception to the Windows Firewall:** ticked by default. Untick to skip the firewall rule.
 
 When ticked, the MSI adds an inbound TCP rule for the chosen port via the WiX firewall extension; the rule is removed automatically when the MSI is uninstalled. The chosen port is passed to the installed Windows Service via `--service --port <port>`.
 
 ```powershell
-# Verify the dialog flow on a fresh VM (defaults; port 6399, firewall ON)
-Start-Process "nexrade-cache-1.2.3-x86_64.msi"
-Test-NetConnection -Port 6399 -InformationLevel Quiet  # True
+# Verify the dialog flow on a fresh VM (defaults; port 6379, firewall ON)
+Start-Process "nexrade-cache-1.4.2-x86_64.msi"
+Test-NetConnection -Port 6379 -InformationLevel Quiet  # True
 netsh advfirewall firewall show rule name=nexrade-cache
 
 # Confirm cleanup on uninstall
-msiexec /x nexrade-cache-1.2.3-x86_64.msi /q
+msiexec /x nexrade-cache-1.4.2-x86_64.msi /q
 netsh advfirewall firewall show rule name=nexrade-cache  # "No rules match the specified criteria."
 ```
 
-The dialog port value is **not** written into `nexrade.toml` — operators who need it there as well can set `[server].port` in their config; the dialog value and the config file are independent, matching Redis's behaviour.
+The dialog port value is **not** written into `nexrade.toml` — operators who need it there as well can set the top-level `port` key in their config (note: `nexrade.toml` has no `[server]` table — `bind` and `port` are top-level, and a `[server]` section is silently ignored); the dialog value and the config file are independent, matching Redis's behaviour.
 
 ### Manual install (no MSI)
 

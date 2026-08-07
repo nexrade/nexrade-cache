@@ -152,7 +152,7 @@
                              removes it on uninstall automatically. The
                              Port value comes from the [INSTALLPORT]
                              property the operator entered in the dialog,
-                             which already defaults to 6399.
+                             which already defaults to 6379.
                              Guid is explicit (not '*'): this component has no
                              file/registry keypath for light to hash, so an
                              auto-generated guid is rejected with LGHT0230.
@@ -344,14 +344,16 @@
                  would emit a duplicate ControlEvent row (LGHT0091). -->
         </UI>
 
-        <!-- Defaults for the dialog. INSTALLPORT: 6399 — chosen offset so
-             a co-existing Redis on 6379 keeps working. The operator can
-             override. INSTALLFIREWALL defaults to EnableFirewall (defined
-             below) so the checkbox is ticked out of the box; unticking it
-             leaves the firewall component un-installed via its
-             <Condition>. EnableFirewall is the value the checkbox writes
-             when ticked. -->
-        <Property Id='INSTALLPORT' Value='6399'/>
+        <!-- Defaults for the dialog. INSTALLPORT: 6379 — the standard Redis
+             port, matching ServerConfig::default() so the MSI install and a
+             plain `nexrade-cache` run land on the same port. Note this will
+             collide with an already-running Redis on the same host; the
+             operator can override it in the dialog. INSTALLFIREWALL defaults
+             to EnableFirewall (defined below) so the checkbox is ticked out
+             of the box; unticking it leaves the firewall component
+             un-installed via its <Condition>. EnableFirewall is the value the
+             checkbox writes when ticked. -->
+        <Property Id='INSTALLPORT' Value='6379'/>
         <Property Id='INSTALLFIREWALL' Value='EnableFirewall'/>
         <Property Id='EnableFirewall' Value='1'/>
 
