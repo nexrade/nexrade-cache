@@ -111,7 +111,7 @@
                                 Start='auto'
                                 ErrorControl='normal'
                                 Account='LocalSystem'
-                                Arguments='--service --port [INSTALLPORT]'>
+                                Arguments='--service --port [INSTALLPORT][MAXMEMORYARG]'>
                                 <!-- Delayed auto-start keeps the cache off the
                                      critical boot path, so it does not compete
                                      with other auto-start services during
@@ -319,6 +319,61 @@
                 </Control>
                 <Control Id='Next' Type='PushButton' X='236' Y='243' Width='56' Height='17'
                          Default='yes' Text='&amp;Next'>
+                    <Publish Event='NewDialog' Value='MemoryLimitDlg'>1</Publish>
+                </Control>
+                <Control Id='Cancel' Type='PushButton' X='304' Y='243' Width='56' Height='17'
+                         Cancel='yes' Text='Cancel'>
+                    <Publish Event='EndDialog' Value='Exit'>1</Publish>
+                </Control>
+            </Dialog>
+
+            <!--
+                Custom dialog: Redis 3-style "Memory Limit" screen, inserted
+                between PortFirewallDlg and VerifyReadyDlg.
+
+                The checkbox drives SETMAXMEMORY; the edit box collects
+                MAXMEMORYMB in megabytes (the unit operators think in, and
+                what the Redis installer asks for). The server's maxmemory
+                flag takes *bytes*, so the value is converted before it
+                reaches the service command line — MSI's formatted-string
+                syntax has no arithmetic.
+
+                Unticking the checkbox disables the edit box and leaves the
+                maxmemory flag off the command line entirely, which the server
+                reads as unlimited.
+            -->
+            <Dialog Id='MemoryLimitDlg' Width='370' Height='270' Title='nexrade-cache Setup'>
+                <Control Id='BannerBitmap' Type='Bitmap' Width='370' Height='58' X='0' Y='0'
+                         TabSkip='no' Text='WixUI_Bmp_Banner'/>
+                <Control Id='BannerText' Type='Text' X='15' Y='9' Width='340' Height='15'
+                         Transparent='yes' Text='{\WixUI_Font_Title}Memory Limit'/>
+                <Control Id='BodyText' Type='Text' X='25' Y='60' Width='320' Height='28'
+                         Text='Select whether to use a memory limit or not.'/>
+                <Control Id='MaxMemoryCheckBox' Type='CheckBox' Width='320' Height='17' X='25' Y='100'
+                         Property='SETMAXMEMORY' CheckBoxValue='1'
+                         Text='Set the Max Memory limit'/>
+                <Control Id='MaxMemoryLabel' Type='Text' X='25' Y='140' Width='90' Height='17'
+                         Text='Max Memory:'>
+                    <Condition Action='enable'><![CDATA[SETMAXMEMORY]]></Condition>
+                    <Condition Action='disable'><![CDATA[NOT SETMAXMEMORY]]></Condition>
+                </Control>
+                <Control Id='MaxMemoryEdit' Type='Edit' Width='60' Height='17' X='120' Y='138'
+                         Property='MAXMEMORYMB' Indirect='no'>
+                    <Condition Action='enable'><![CDATA[SETMAXMEMORY]]></Condition>
+                    <Condition Action='disable'><![CDATA[NOT SETMAXMEMORY]]></Condition>
+                </Control>
+                <Control Id='MaxMemoryUnit' Type='Text' X='186' Y='140' Width='40' Height='17'
+                         Text='MB'>
+                    <Condition Action='enable'><![CDATA[SETMAXMEMORY]]></Condition>
+                    <Condition Action='disable'><![CDATA[NOT SETMAXMEMORY]]></Condition>
+                </Control>
+                <Control Id='BottomLine' Type='Line' X='0' Y='234' Width='370' Height='0'/>
+                <Control Id='Back' Type='PushButton' X='180' Y='243' Width='56' Height='17'
+                         Text='&amp;Back'>
+                    <Publish Event='NewDialog' Value='PortFirewallDlg'>1</Publish>
+                </Control>
+                <Control Id='Next' Type='PushButton' X='236' Y='243' Width='56' Height='17'
+                         Default='yes' Text='&amp;Next'>
                     <Publish Event='NewDialog' Value='VerifyReadyDlg'>1</Publish>
                 </Control>
                 <Control Id='Cancel' Type='PushButton' X='304' Y='243' Width='56' Height='17'
@@ -339,9 +394,11 @@
                  declaration-order tiebreak is not guaranteed across MSI runtime
                  versions; with Order=99 ours is evaluated last and wins. -->
             <Publish Dialog='CustomizeDlg'     Control='Next' Event='NewDialog' Value='PortFirewallDlg' Order='99'>1</Publish>
-            <!-- PortFirewallDlg's own Back/Next publishes are declared inline
-                 on its <Control> elements above; repeating the Back rule here
-                 would emit a duplicate ControlEvent row (LGHT0091). -->
+            <!-- PortFirewallDlg and MemoryLimitDlg declare their own Back/Next
+                 publishes inline on their <Control> elements above, chaining
+                 CustomizeDlg -> PortFirewallDlg -> MemoryLimitDlg ->
+                 VerifyReadyDlg. Repeating those rules here would emit
+                 duplicate ControlEvent rows (LGHT0091). -->
         </UI>
 
         <!-- Defaults for the dialog. INSTALLPORT: 6379 — the standard Redis
@@ -356,6 +413,61 @@
         <Property Id='INSTALLPORT' Value='6379'/>
         <Property Id='INSTALLFIREWALL' Value='EnableFirewall'/>
         <Property Id='EnableFirewall' Value='1'/>
+
+        <!-- Memory-limit dialog defaults. SETMAXMEMORY ticked with 500 MB
+             matches the Redis installer's defaults. MAXMEMORYBYTES is derived
+             from MAXMEMORYMB at install time (see SetMaxMemoryBytes) and is
+             what actually reaches the service command line. -->
+        <Property Id='SETMAXMEMORY' Value='1'/>
+        <Property Id='MAXMEMORYMB' Value='500'/>
+
+        <!--
+            MB -> bytes. The Windows Installer formatted-string syntax has no
+            arithmetic, so multiplying by 1,048,576 is not expressible here.
+            Appending "000000" multiplies by 1,000,000 using plain string
+            concatenation, giving MB in the SI sense (500 MB -> 500000000
+            bytes). That is a ~4.6% smaller limit than the binary MiB reading
+            of the same number, which is the safer direction to err: the
+            process caps slightly below what the operator typed rather than
+            slightly above.
+
+            Sequenced after CostFinalize so the properties set by the dialog
+            are populated, and conditioned on SETMAXMEMORY so an unticked box
+            leaves MAXMEMORYBYTES empty.
+
+            The explicit <> "0" matters. Unticking the checkbox in the UI
+            clears the property, so a bare `SETMAXMEMORY` test would be enough
+            there — but a silent install passing SETMAXMEMORY=0 on the command
+            line leaves it *defined* with the string "0", which MSI conditions
+            treat as true. Without this the limit would be applied anyway.
+        -->
+        <SetProperty Id='MAXMEMORYBYTES'
+                     Value='[MAXMEMORYMB]000000'
+                     After='CostFinalize'
+                     Sequence='both'>
+            <![CDATA[SETMAXMEMORY AND SETMAXMEMORY <> "0" AND MAXMEMORYMB]]>
+        </SetProperty>
+
+        <!--
+            The whole " maxmemory N" flag fragment, or empty. ServiceInstall's
+            Arguments is a single static string, so the flag has to be
+            conditionally built here rather than conditionally appended there —
+            an unticked checkbox must leave the flag off entirely, not pass an
+            empty value (the flag with no argument fails to parse).
+
+            Anchored explicitly after SetMAXMEMORYBYTES — the action name WiX
+            generates for the SetProperty above ("Set" + property id). Both
+            being anchored to CostFinalize is not enough: WiX assigned this one
+            sequence 1002 and the conversion 1003, so this ran first and
+            expanded MAXMEMORYBYTES while it was still empty, producing a bare
+            flag with no value. Naming the action pins the real dependency.
+        -->
+        <SetProperty Id='MAXMEMORYARG'
+                     Value=' --maxmemory [MAXMEMORYBYTES]'
+                     After='SetMAXMEMORYBYTES'
+                     Sequence='both'>
+            <![CDATA[SETMAXMEMORY AND SETMAXMEMORY <> "0" AND MAXMEMORYMB]]>
+        </SetProperty>
 
         <!-- ── Custom banner image (493×58 px) ──────────────────────── -->
         <WixVariable Id='WixUIBannerBmp' Value='nexrade-cli\wix\Banner.bmp'/>
