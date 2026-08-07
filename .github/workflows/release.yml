@@ -344,9 +344,20 @@ jobs:
           # "ext" comparison, and emit CNDL1098 ("not a valid command line
           # argument") -- the extension then never loads and the
           # <firewall:FirewallException> element fails with CNDL0200.
+          #
+          # -sw1150 suppresses CNDL1150, which fires on the
+          # <ServiceConfig DelayedAutoStart='yes'> in main.wxs and advises
+          # using WixUtilExtension's ServiceConfig instead. That advice does
+          # not apply here: util:ServiceConfig configures failure actions
+          # (FirstFailureActionType et al.) and has no DelayedAutoStart
+          # attribute, so it cannot express what this element does. Delayed
+          # auto-start is deliberate — it keeps the cache off the critical
+          # boot path so it does not compete with other auto-start services
+          # during login.
           cargo wix --package nexrade-cache --no-build --nocapture `
             --target ${{ matrix.target }} `
             --compiler-arg "-ext" --compiler-arg "WixFirewallExtension" `
+            --compiler-arg "-sw1150" `
             --linker-arg "-ext" --linker-arg "WixFirewallExtension" `
             --output "nexrade-cache-${{ github.ref_name }}-${{ matrix.arch }}.msi"
 

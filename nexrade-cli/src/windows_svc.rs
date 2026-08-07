@@ -12,8 +12,10 @@
 //! REM Uninstall (run as Administrator):
 //! nexrade-cache --uninstall-service
 //! ```
-
-#![cfg(windows)]
+//!
+//! The module is gated at its declaration in `main.rs` (`#[cfg(windows)]
+//! mod windows_svc;`), so no inner `#![cfg(windows)]` is needed here — having
+//! both trips clippy::duplicated_attributes.
 
 use std::ffi::OsString;
 use std::sync::OnceLock;

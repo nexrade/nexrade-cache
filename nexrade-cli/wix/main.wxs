@@ -112,6 +112,15 @@
                                 ErrorControl='normal'
                                 Account='LocalSystem'
                                 Arguments='--service --port [INSTALLPORT]'>
+                                <!-- Delayed auto-start keeps the cache off the
+                                     critical boot path, so it does not compete
+                                     with other auto-start services during
+                                     login. candle emits CNDL1150 here
+                                     suggesting WixUtilExtension's ServiceConfig
+                                     instead; that element configures failure
+                                     actions and has no DelayedAutoStart
+                                     attribute, so it cannot express this. The
+                                     build passes -sw1150 to suppress it. -->
                                 <ServiceConfig
                                     DelayedAutoStart='yes'
                                     OnInstall='yes'
