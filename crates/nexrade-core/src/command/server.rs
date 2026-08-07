@@ -90,12 +90,15 @@ fn aof_rewrite_status_str(code: u8) -> &'static str {
 /// `aof_last_write_status` — `ok` when AOF is enabled and the last append
 /// (or ALWAYS fsync) succeeded; `err` when AOF is disabled or the last
 /// write failed.
+///
+/// Derived from the canonical [`PersistenceHealth`] snapshot (1.3.0) so the
+/// value cannot drift from what `/healthz` reports for the same instant.
 #[cfg(not(target_arch = "wasm32"))]
-fn aof_last_write_status(db: &Db) -> &'static str {
-    if !db.stats.aof_enabled.load(Ordering::Relaxed) {
+fn aof_last_write_status_of(p: &crate::health::PersistenceHealth) -> &'static str {
+    if !p.aof_enabled {
         return "err";
     }
-    match db.stats.aof_last_write_status.load(Ordering::Relaxed) {
+    match p.aof_last_write_status {
         0 => "ok",
         _ => "err",
     }
@@ -235,52 +238,72 @@ pub async fn cmd_info(db: &Db, args: &[Resp]) -> Result<Resp> {
         info.push_str("\r\n");
     }
 
+    // C2 (1.3.0): both `# Persistence` and `# Health` are rendered from the
+    // canonical `HealthReport`. Build it **at most once** per `INFO` call and
+    // share it — `INFO all` renders both sections, and computing the report
+    // twice there doubled its cost (it takes the config lock, clones the
+    // configured paths, and allocates a reason vector). Lazily initialised so
+    // `INFO server`, `INFO clients`, … pay nothing for it at all.
+    #[cfg(not(target_arch = "wasm32"))]
+    let health = {
+        let needed = matches!(section.as_str(), "all" | "persistence" | "health");
+        if needed {
+            Some(crate::health::health_report(db))
+        } else {
+            None
+        }
+    };
+
     #[cfg(not(target_arch = "wasm32"))]
     if section == "all" || section == "persistence" {
+        // Field names, order, and formatting are unchanged from 1.2.x; only the
+        // source is. Before this, ten raw atomic loads here could contradict
+        // `# Health` two sections below — most visibly `rdb_last_save_time`
+        // (from `Stats`) against the report's `last_save_time`, which read a
+        // `LifecycleState` field no save path ever wrote and so was
+        // permanently null.
+        let p = &health
+            .as_ref()
+            .expect("health report built for the persistence section")
+            .persistence;
         info.push_str("# Persistence\r\n");
         info.push_str("loading:0\r\n");
-        info.push_str(&format!(
-            "rdb_changes_since_last_save:{}\r\n",
-            db.stats.dirty_keys.load(Ordering::Relaxed)
-        ));
+        info.push_str(&format!("rdb_changes_since_last_save:{}\r\n", p.dirty_keys));
         info.push_str(&format!(
             "rdb_bgsave_in_progress:{}\r\n",
-            db.stats.bgsave_in_progress.load(Ordering::Relaxed) as u8
+            p.bgsave_in_progress as u8
         ));
         info.push_str(&format!(
             "rdb_last_save_time:{}\r\n",
-            db.stats.last_save_time.load(Ordering::Relaxed)
+            p.last_save_time.unwrap_or(0)
         ));
         info.push_str(&format!(
             "rdb_last_bgsave_status:{}\r\n",
-            bgsave_status_str(db.stats.bgsave_last_status.load(Ordering::Relaxed))
+            bgsave_status_str(p.last_save_status)
         ));
         info.push_str("rdb_last_cow_size:0\r\n");
-        info.push_str(&format!(
-            "aof_enabled:{}\r\n",
-            db.stats.aof_enabled.load(Ordering::Relaxed) as u8
-        ));
+        info.push_str(&format!("aof_enabled:{}\r\n", p.aof_enabled as u8));
         info.push_str(&format!(
             "aof_rewrite_in_progress:{}\r\n",
-            db.stats.aof_rewrite_in_progress.load(Ordering::Relaxed) as u8
+            p.aof_rewrite_in_progress as u8
         ));
         info.push_str(&format!(
             "aof_last_bgrewrite_status:{}\r\n",
-            aof_rewrite_status_str(db.stats.aof_rewrite_last_status.load(Ordering::Relaxed))
+            aof_rewrite_status_str(p.last_rewrite_status)
         ));
         info.push_str(&format!(
             "aof_last_write_status:{}\r\n",
-            aof_last_write_status(db)
+            aof_last_write_status_of(p)
         ));
         info.push_str(&format!(
             "aof_write_failed:{}\r\n",
-            db.stats.aof_failed.load(Ordering::Relaxed) as u8
+            p.aof_write_failed as u8
         ));
         info.push_str(&format!(
             "aof_last_write_error_time:{}\r\n",
-            db.stats.aof_failed_time.load(Ordering::Relaxed)
+            p.aof_failure_time.unwrap_or(0)
         ));
-        if let Some(error) = db.stats.aof_failed_msg.lock().as_deref() {
+        if let Some(error) = p.aof_failure_message.as_deref() {
             info.push_str(&format!("aof_last_write_error:{}\r\n", error));
         }
         info.push_str("\r\n");
@@ -292,7 +315,12 @@ pub async fn cmd_info(db: &Db, args: &[Resp]) -> Result<Resp> {
 
     #[cfg(not(target_arch = "wasm32"))]
     if section == "all" || section == "health" {
-        let report = crate::health::health_report(db);
+        // Same snapshot the `# Persistence` section above rendered from, so the
+        // two can never disagree within one response — and so `INFO all` builds
+        // the report once rather than twice.
+        let report = health
+            .as_ref()
+            .expect("health report built for the health section");
         info.push_str("# Health\r\n");
         info.push_str(&format!("live:{}\r\n", report.live as u8));
         info.push_str(&format!("ready:{}\r\n", report.ready as u8));
@@ -910,7 +938,7 @@ pub async fn cmd_config(db: &Db, args: &[Resp]) -> Result<Resp> {
                 render_config_toml(&cfg)
             };
             std::fs::write(&path, snapshot)
-                .map_err(|e| NexradeError::Generic(format!("ERR CONFIG REWRITE failed: {e}")))?;
+                .map_err(|e| NexradeError::Generic(format!("CONFIG REWRITE failed: {e}")))?;
             Ok(Resp::ok())
         }
         "RESETSTAT" => {
@@ -957,10 +985,10 @@ fn parse_save_config(val: &str) -> Result<Vec<(u64, usize)>> {
     let mut rules = Vec::with_capacity(parts.len() / 2);
     for chunk in parts.chunks(2) {
         let secs: u64 = chunk[0].parse().map_err(|_| {
-            NexradeError::Generic("ERR Invalid argument for CONFIG SET 'save'".to_string())
+            NexradeError::Generic("Invalid argument for CONFIG SET 'save'".to_string())
         })?;
         let changes: usize = chunk[1].parse().map_err(|_| {
-            NexradeError::Generic("ERR Invalid argument for CONFIG SET 'save'".to_string())
+            NexradeError::Generic("Invalid argument for CONFIG SET 'save'".to_string())
         })?;
         rules.push((secs, changes));
     }
@@ -1423,7 +1451,7 @@ pub async fn cmd_wait(db: &Db, args: &[Resp]) -> Result<Resp> {
     let num = get_i64(args, 1, "WAIT")?;
     let timeout_ms = get_i64(args, 2, "WAIT")?;
     if num < 0 || timeout_ms < 0 {
-        return Err(NexradeError::Generic("ERR timeout is negative".to_string()));
+        return Err(NexradeError::Generic("timeout is negative".to_string()));
     }
     let num = num as usize;
     // Target = current primary offset. Writes that land after WAIT starts
@@ -1947,7 +1975,7 @@ pub async fn cmd_acl(db: &Db, args: &[Resp], authenticated_user: &str) -> Result
                     }
                     Ok(Resp::array(out))
                 }
-                None => Err(NexradeError::Generic(format!("ERR no such user '{name}'"))),
+                None => Err(NexradeError::Generic(format!("no such user '{name}'"))),
             }
         }
         "SETUSER" => {
@@ -2332,7 +2360,7 @@ fn parse_kill_filter(args: &[Resp], caller_id: u64) -> Result<KillFilter> {
     while i < args.len() {
         let opt = match args[i].as_str() {
             Some(s) => s.to_ascii_uppercase(),
-            None => return Err(NexradeError::Generic("ERR syntax error".to_string())),
+            None => return Err(NexradeError::Generic("syntax error".to_string())),
         };
         match opt.as_str() {
             "ID" => {
@@ -2382,7 +2410,7 @@ fn parse_kill_filter(args: &[Resp], caller_id: u64) -> Result<KillFilter> {
                 f.skipme = !v.eq_ignore_ascii_case("NO");
                 i += 2;
             }
-            _ => return Err(NexradeError::Generic("ERR syntax error".to_string())),
+            _ => return Err(NexradeError::Generic("syntax error".to_string())),
         }
     }
     // Default filter when none specified: kill the calling client only.

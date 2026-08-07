@@ -4,10 +4,7 @@ use std::collections::HashSet;
 
 use bytes::Bytes;
 
-use crate::command::{
-    decode_scan_cursor, get_bytes_vec, get_i64, get_str, scan_cursor_token, scan_sort_by_token,
-    scan_start_offset,
-};
+use crate::command::{decode_scan_cursor, get_bytes_vec, get_i64, get_str, scan_select_page};
 use crate::db::Db;
 use crate::error::{NexradeError, Result};
 use crate::resp::Resp;
@@ -360,32 +357,35 @@ pub async fn cmd_srandmember(db: &Db, args: &[Resp], db_index: usize) -> Result<
         None => Ok(Resp::null()),
         Some(e) => match &e.value {
             DataType::Set(s) => {
-                let members = s.to_vec();
+                // Do NOT materialise the set here. Until 1.4.2 this began with
+                // `s.to_vec()`, cloning every member on every call — 200 000
+                // rps at 1 000 members but 10 526 rps at 40 000. `get_at` is
+                // O(1) on the Hashtable encoding, so the no-count and
+                // negative-count paths now cost one lookup per returned
+                // member instead of one full copy of the set.
+                let len = s.len();
                 match count {
-                    None => {
-                        let idx = pseudo_rand_idx(members.len());
-                        Ok(members
-                            .get(idx)
-                            .map(|m| Resp::bulk(Bytes::from(m.clone())))
-                            .unwrap_or(Resp::null()))
-                    }
+                    None => Ok(s
+                        .get_at(pseudo_rand_idx(len))
+                        .map(|m| Resp::bulk(Bytes::copy_from_slice(m)))
+                        .unwrap_or(Resp::null())),
                     Some(n) => {
                         let result: Vec<Resp> = if n < 0 {
+                            // Negative count: `|n|` members *with* repetition.
                             let count = n.unsigned_abs() as usize;
                             (0..count)
                                 .map(|_| {
-                                    let idx = pseudo_rand_idx(members.len());
-                                    members
-                                        .get(idx)
-                                        .map(|m| Resp::bulk(Bytes::from(m.clone())))
+                                    s.get_at(pseudo_rand_idx(len))
+                                        .map(|m| Resp::bulk(Bytes::copy_from_slice(m)))
                                         .unwrap_or(Resp::null())
                                 })
                                 .collect()
                         } else {
-                            members
-                                .into_iter()
+                            // Positive count: distinct members, capped at the
+                            // set size. Borrowed iteration — no full clone.
+                            s.iter_ref()
                                 .take(n as usize)
-                                .map(|m| Resp::bulk(Bytes::from(m)))
+                                .map(|m| Resp::bulk(Bytes::copy_from_slice(m)))
                                 .collect()
                         };
                         Ok(Resp::array(result))
@@ -405,8 +405,14 @@ pub async fn cmd_spop(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     let count = if args.len() >= 3 {
         let n = get_i64(args, 2, "SPOP")?;
         if n < 0 {
+            // Redis 7.0.15 replies `ERR value is out of range, must be
+            // positive` here — verified against the real server. This used to
+            // say "is not an integer or out of range" (a different Redis
+            // error, for unparseable input) AND double-prefixed it: the
+            // `Generic` variant already renders as `ERR {0}`, so the literal
+            // "ERR " produced `-ERR ERR value is not ...` on the wire.
             return Err(NexradeError::Generic(
-                "ERR value is not an integer or out of range".to_string(),
+                "value is out of range, must be positive".to_string(),
             ));
         }
         Some(n as usize)
@@ -497,30 +503,28 @@ pub async fn cmd_sscan(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
         Some(e) => match &e.value {
             DataType::Set(s) => {
                 let pat = pattern.unwrap_or_else(|| b"*".to_vec());
-                let mut members: Vec<Vec<u8>> = s
-                    .to_vec()
-                    .into_iter()
-                    .filter(|m| glob_match(&pat, m.as_slice()))
-                    .collect();
-                scan_sort_by_token(&mut members);
                 // Member-space cursor, see `scan_cursor_token` for the
                 // hex-encoded boundary scheme. See D1/D2 fix: deletions
                 // cannot shift the resume point because the token is the
                 // boundary itself, not a hash.
-                let start = scan_start_offset(&members, cursor);
-                let start = start.min(members.len());
-                let end = (start + count).min(members.len());
-                let next = if end >= members.len() {
-                    0
-                } else {
-                    scan_cursor_token(&members[end - 1])
-                };
-                let items: Vec<Resp> = members[start..end]
+                //
+                // 1.3.0: bounded-heap page selection replaces a full
+                // `scan_sort_by_token` per call, which made a complete walk
+                // O(n² log n). Order and cursor semantics are unchanged.
+                // Borrowed slices in; only the page is copied.
+                let page = scan_select_page(
+                    s.iter_ref().filter(|m| glob_match(&pat, m)),
+                    cursor,
+                    count,
+                    |m: &&[u8]| m,
+                );
+                let items: Vec<Resp> = page
+                    .items
                     .iter()
                     .map(|m| Resp::bulk(Bytes::copy_from_slice(m)))
                     .collect();
                 Ok(Resp::array(vec![
-                    Resp::bulk_str(next.to_string()),
+                    Resp::bulk_str(page.next_cursor.to_string()),
                     Resp::array(items),
                 ]))
             }

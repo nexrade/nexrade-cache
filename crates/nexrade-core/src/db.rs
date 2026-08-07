@@ -379,22 +379,48 @@ impl Db {
 
     /// Latch an AOF I/O failure exactly once. Subsequent writers are refused
     /// so the in-memory dataset cannot drift further from the durable log.
+    ///
+    /// Publication order is load-bearing. The diagnostic fields are written
+    /// **before** the `aof_failed` latch is set, so any reader that observes
+    /// `aof_failed == true` (via `Acquire`) is guaranteed to also see the
+    /// bounded message and timestamp that explain it. The previous order set
+    /// the latch first, leaving a window in which `/readyz` and `INFO
+    /// persistence` reported the generic `"AOF persistence failed"` fallback
+    /// instead of the real I/O error.
+    ///
+    /// `first_failure` (taken under the `aof_failed_msg` lock) is the
+    /// exactly-once gate, replacing the latch's own `swap` return value —
+    /// the latch can no longer serve that role now that it is set last.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn fail_aof(&self, operation: &str, err: impl std::fmt::Display) {
         self.stats.aof_last_write_status.store(1, Ordering::Relaxed);
-        if !self.stats.aof_failed.swap(true, Ordering::AcqRel) {
-            self.stats
-                .aof_failed_time
-                .store(unix_secs(), Ordering::Relaxed);
-            let mut message = format!("{operation}: {err}");
-            message.truncate(512);
-            let stored = message.clone();
-            *self.stats.aof_failed_msg.lock() = Some(message);
+
+        let mut message = format!("{operation}: {err}");
+        message.truncate(512);
+
+        let first_failure = {
+            let mut slot = self.stats.aof_failed_msg.lock();
+            if slot.is_none() {
+                self.stats
+                    .aof_failed_time
+                    .store(unix_secs(), Ordering::Relaxed);
+                *slot = Some(message.clone());
+                true
+            } else {
+                false
+            }
+        };
+
+        if first_failure {
             // Mirror into the canonical health snapshot so HTTP `/readyz`
             // and `INFO health` report the same bounded message the writer
             // produced, not a separate copy that could drift.
-            self.lifecycle().record_aof_failure(stored);
+            self.lifecycle().record_aof_failure(message);
         }
+
+        // Latch last, with Release, so the diagnostic stores above are visible
+        // to every reader that Acquire-loads this flag.
+        self.stats.aof_failed.store(true, Ordering::Release);
     }
 
     /// Wake list waiters (BLPOP/BRPOP/BLMPOP) — no-op if none parked.

@@ -95,7 +95,7 @@ impl FunctionRegistry {
     /// caller strips that before calling `load`).
     pub fn load(&self, source: &str, allow_replace: bool) -> Result<Resp> {
         let (lib_name, funcs) = parse_library(source)
-            .ok_or_else(|| NexradeError::Generic("ERR Missing library meta data".to_string()))?;
+            .ok_or_else(|| NexradeError::Generic("Missing library meta data".to_string()))?;
         if !is_valid_library_name(&lib_name) {
             return Err(NexradeError::Generic(format!(
                 "ERR Library names can only contain letters, numbers, and underscores(_) and must have at least one alphabetic character. Got '{lib_name}'"
@@ -259,7 +259,7 @@ impl FunctionRegistry {
                 .map(|l| l.source.clone())
         };
         let Some(source) = source else {
-            return Err(NexradeError::Generic("ERR Function not found".to_string()));
+            return Err(NexradeError::Generic("Function not found".to_string()));
         };
         self.inner.write().total_runs += 1;
         run_function(&source, func, keys, argv, db, db_index, user).await

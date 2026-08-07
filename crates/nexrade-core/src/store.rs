@@ -12,6 +12,35 @@ use crate::db::MaxMemoryPolicy;
 use crate::expiry::Expiry;
 use crate::types::{AtomicIntCell, DataType};
 
+/// Hash-map builder for the per-shard key maps (1.5.0).
+///
+/// The std default is SipHash-1-3. It is DoS-resistant but slow, and profiling
+/// the read path found the map probe to be **~91%** of a `GET`'s cost — the
+/// shard `RwLock` everyone assumed was the bottleneck is only 5–30% (see
+/// `docs/experiment-1.5.0-rcu-read-path.md`). Measured on 100 000-key maps with
+/// randomised access:
+///
+/// | Key shape | SipHash | foldhash |
+/// |---|---|---|
+/// | `u64` LE bytes | 67.3 ns | 33.6 ns |
+/// | `user:<n>` | 60.0 ns | 27.2 ns |
+/// | 64-byte | 178.7 ns | 82.1 ns |
+///
+/// `foldhash::fast::RandomState` is seeded per-process, so keys hash
+/// differently in every run and an attacker cannot precompute a colliding key
+/// set — the same protection the std default provides.
+///
+/// **Do not replace this with `BuildHasherDefault<FoldHasher>`**: that is the
+/// fixed-seed variant and would make collision DoS trivial for a
+/// network-exposed cache.
+///
+/// Hashers are *not* a persistence concern: RDB and AOF serialise entries as a
+/// sequence, so nothing on disk depends on bucket order or seed.
+pub type KeyHasher = foldhash::fast::RandomState;
+
+/// A `HashMap` keyed by raw bytes using [`KeyHasher`].
+pub type KeyMap<V> = HashMap<Vec<u8>, V, KeyHasher>;
+
 /// A single entry in the store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
@@ -80,11 +109,11 @@ impl LruClock {
 /// The inner mutable state (one per logical database).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Database {
-    pub entries: HashMap<Vec<u8>, Entry>,
+    pub entries: KeyMap<Entry>,
     /// Monotonically increasing write counter per key — used by WATCH to detect
     /// concurrent modifications. Not persisted (watch state is per-connection).
     #[serde(skip, default)]
-    key_versions: HashMap<Vec<u8>, u64>,
+    key_versions: KeyMap<u64>,
     /// Sorted expiry index: (expires_at_ms, key). Enables O(k log n) active
     /// expiry instead of random HashMap scanning. Not persisted — rebuilt
     /// on insert.
@@ -130,8 +159,8 @@ impl Database {
         // Initialise `live_bytes` to 0; the surrounding `ShardedDatabase` /
         // `Store` keeps a cached view of the same usize.
         Self {
-            entries: HashMap::new(),
-            key_versions: HashMap::new(),
+            entries: KeyMap::default(),
+            key_versions: KeyMap::default(),
             expiry_index: BTreeSet::new(),
             live_bytes: std::sync::atomic::AtomicUsize::new(0),
             lru_clock: LruClock::new(Arc::new(AtomicU32::new(0))),

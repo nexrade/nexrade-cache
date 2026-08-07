@@ -32,16 +32,38 @@ pub struct TlsAcceptor {
     inner: Arc<tokio_rustls::TlsAcceptor>,
 }
 
+/// Build a rustls `ServerConfig` from PEM files.
+///
+/// Shared by [`TlsAcceptor::from_pem_files`] and [`validate_pem_files`] so
+/// that a preflight check and a real startup can never disagree about
+/// whether a certificate is usable — there is exactly one parser.
+fn server_config_from_pem_files(cert_path: &Path, key_path: &Path) -> Result<ServerConfig> {
+    let certs = load_certs(cert_path)?;
+    let key = load_private_key(key_path)?;
+    ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("failed to build TLS server config")
+}
+
+/// Verify that a cert/key pair would produce a working TLS listener,
+/// without binding a socket or retaining any state.
+///
+/// This performs the *entire* configuration build that startup performs —
+/// file open, PEM parse, and the rustls `with_single_cert` step that
+/// rejects a key which doesn't match its certificate. Anything this
+/// accepts, startup accepts; anything this rejects, startup rejects.
+///
+/// Synchronous on purpose: it is pure filesystem + parsing work, so it can
+/// be called from `--preflight` without a Tokio runtime.
+pub fn validate_pem_files<P: AsRef<Path>>(cert_path: P, key_path: P) -> Result<()> {
+    server_config_from_pem_files(cert_path.as_ref(), key_path.as_ref()).map(|_| ())
+}
+
 impl TlsAcceptor {
     /// Build from PEM certificate and key files.
     pub async fn from_pem_files<P: AsRef<Path>>(cert_path: P, key_path: P) -> Result<Self> {
-        let certs = load_certs(cert_path.as_ref())?;
-        let key = load_private_key(key_path.as_ref())?;
-
-        let config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .context("failed to build TLS server config")?;
+        let config = server_config_from_pem_files(cert_path.as_ref(), key_path.as_ref())?;
 
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
         info!("TLS configured from {:?}", cert_path.as_ref());

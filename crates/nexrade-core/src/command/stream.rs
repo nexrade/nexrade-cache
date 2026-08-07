@@ -1234,7 +1234,7 @@ fn nogroup_err(key: &[u8], group: &[u8]) -> NexradeError {
 }
 
 fn no_such_key_err() -> NexradeError {
-    NexradeError::Generic("ERR no such key".to_string())
+    NexradeError::Generic("no such key".to_string())
 }
 
 async fn xinfo_stream(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {

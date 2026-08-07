@@ -326,6 +326,22 @@ impl HashData {
         }
     }
 
+    /// Iterate `(field, value)` as borrowed slices — no allocation per element.
+    ///
+    /// `to_pairs` clones every field *and* value, which is the right shape when
+    /// the caller keeps them all. `HSCAN` does not: it inspects every field to
+    /// pick the handful that belong on one page, so cloning the whole hash per
+    /// page was the dominant cost of a scan (and made a full walk quadratic
+    /// even after the sort was removed).
+    pub fn iter_pairs_ref(&self) -> Box<dyn Iterator<Item = (&[u8], &[u8])> + '_> {
+        match self {
+            HashData::Compact(c) => Box::new(c.iter_pairs_ref()),
+            HashData::Hashtable(h) => {
+                Box::new(h.map.iter().map(|(k, v)| (k.as_slice(), v.as_slice())))
+            }
+        }
+    }
+
     pub fn keys(&self) -> Vec<Vec<u8>> {
         match self {
             HashData::Compact(c) => c.iter_pairs().map(|(k, _)| k).collect(),
@@ -505,6 +521,15 @@ impl CompactHash {
         }
     }
 
+    /// Borrowing variant of [`Self::iter_pairs`] — no allocation per element.
+    fn iter_pairs_ref(&self) -> CompactHashRefIter<'_> {
+        CompactHashRefIter {
+            buf: &self.buf,
+            off: 0,
+            remaining: self.len,
+        }
+    }
+
     fn hgetall_resp_need(&self) -> usize {
         // 2*N bulks: field + value. Framing ~12 each + payload.
         let n = self.len * 2;
@@ -530,6 +555,36 @@ impl Iterator for CompactHashIter<'_> {
         let vo = self.off + 4 + fl;
         let vl = u32::from_le_bytes(self.buf[vo..vo + 4].try_into().ok()?) as usize;
         let v = self.buf[vo + 4..vo + 4 + vl].to_vec();
+        self.off = vo + 4 + vl;
+        self.remaining -= 1;
+        Some((f, v))
+    }
+}
+
+/// Borrowing counterpart to [`CompactHashIter`], yielding `(&field, &value)`
+/// slices into the compact buffer instead of fresh `Vec`s.
+///
+/// Exists for `HSCAN`: page selection only needs to *inspect* every field to
+/// decide which handful belong on the page, so cloning all of them first is
+/// pure waste. See [`HashData::iter_pairs_ref`].
+pub struct CompactHashRefIter<'a> {
+    buf: &'a [u8],
+    off: usize,
+    remaining: usize,
+}
+
+impl<'a> Iterator for CompactHashRefIter<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let fl = u32::from_le_bytes(self.buf[self.off..self.off + 4].try_into().ok()?) as usize;
+        let f = &self.buf[self.off + 4..self.off + 4 + fl];
+        let vo = self.off + 4 + fl;
+        let vl = u32::from_le_bytes(self.buf[vo..vo + 4].try_into().ok()?) as usize;
+        let v = &self.buf[vo + 4..vo + 4 + vl];
         self.off = vo + 4 + vl;
         self.remaining -= 1;
         Some((f, v))

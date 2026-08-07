@@ -564,7 +564,7 @@ pub async fn cmd_dump(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     drop(store_db);
 
     let body = bincode::serde::encode_to_vec(&snapshot, bincode::config::standard())
-        .map_err(|e| NexradeError::Generic(format!("ERR DUMP serialize failed: {e}")))?;
+        .map_err(|e| NexradeError::Generic(format!("DUMP serialize failed: {e}")))?;
     let mut out = Vec::with_capacity(5 + body.len());
     out.extend_from_slice(DUMP_MAGIC);
     out.push(DUMP_VERSION);
@@ -613,7 +613,7 @@ pub async fn cmd_restore(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp
                 i += 2;
             }
             _ => {
-                return Err(NexradeError::Generic("ERR syntax error".to_string()));
+                return Err(NexradeError::Generic("syntax error".to_string()));
             }
         }
     }
@@ -633,7 +633,7 @@ pub async fn cmd_restore(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp
     }
     let (mut entry, _): (crate::store::Entry, usize) =
         bincode::serde::decode_from_slice(&payload[5..], bincode::config::standard())
-            .map_err(|e| NexradeError::Generic(format!("ERR DUMP payload is corrupt: {e}")))?;
+            .map_err(|e| NexradeError::Generic(format!("DUMP payload is corrupt: {e}")))?;
 
     // Apply the TTL argument, overriding whatever expiry was in the payload.
     if ttl_ms < 0 {

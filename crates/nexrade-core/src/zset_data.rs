@@ -315,6 +315,15 @@ impl ZSetData {
         }
     }
 
+    /// Iterate `(member, score)` with the member borrowed — no allocation per
+    /// element. See [`crate::hash_data::HashData::iter_pairs_ref`].
+    pub fn iter_pairs_ref(&self) -> Box<dyn Iterator<Item = (&[u8], f64)> + '_> {
+        match self {
+            ZSetData::Compact(c) => Box::new(c.iter_pairs_ref()),
+            ZSetData::Skiplist(s) => Box::new(s.members.iter().map(|(m, sc)| (m.as_slice(), sc.0))),
+        }
+    }
+
     /// All (member, score) pairs in score-ascending order.
     pub fn to_pairs_sorted(&self) -> Vec<(Vec<u8>, f64)> {
         match self {
@@ -564,6 +573,14 @@ impl CompactZSet {
         }
     }
 
+    /// Borrowing variant of [`Self::iter_pairs`] — no allocation per element.
+    fn iter_pairs_ref(&self) -> CompactZSetRefIter<'_> {
+        CompactZSetRefIter {
+            buf: &self.buf,
+            pos: 0,
+        }
+    }
+
     fn score(&self, member: &[u8]) -> Option<f64> {
         self.iter_pairs()
             .find(|(m, _)| m.as_slice() == member)
@@ -699,6 +716,40 @@ impl CompactZSet {
 struct CompactZSetIter<'a> {
     buf: &'a [u8],
     pos: usize,
+}
+
+/// Borrowing counterpart to `CompactZSetIter`, yielding member slices.
+/// Used by `ZSCAN`, which inspects every member to select one page.
+pub struct CompactZSetRefIter<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Iterator for CompactZSetRefIter<'a> {
+    type Item = (&'a [u8], f64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos + 8 > self.buf.len() {
+            return None;
+        }
+        let mut score_bytes = [0u8; 8];
+        score_bytes.copy_from_slice(&self.buf[self.pos..self.pos + 8]);
+        let score = f64::from_le_bytes(score_bytes);
+        self.pos += 8;
+        if self.pos + 4 > self.buf.len() {
+            return None;
+        }
+        let mut len_bytes = [0u8; 4];
+        len_bytes.copy_from_slice(&self.buf[self.pos..self.pos + 4]);
+        let mlen = u32::from_le_bytes(len_bytes) as usize;
+        self.pos += 4;
+        if self.pos + mlen > self.buf.len() {
+            return None;
+        }
+        let member = &self.buf[self.pos..self.pos + mlen];
+        self.pos += mlen;
+        Some((member, score))
+    }
 }
 
 impl Iterator for CompactZSetIter<'_> {

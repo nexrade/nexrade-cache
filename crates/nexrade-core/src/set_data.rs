@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
 
 /// Promote Compact → Hashtable when any of these is exceeded (defaults).
@@ -60,14 +61,36 @@ pub fn set_set_thresholds(t: SetThresholds) {
     DEMOTE_ENTRIES.store(t.demote_entries, Ordering::Relaxed);
 }
 
-/// Large-set encoding: `HashSet` plus a cached member-byte total so
+/// Large-set encoding: an `IndexSet` plus a cached member-byte total so
 /// `payload_bytes()` stays O(1) after Compact → Hashtable promote.
 ///
+/// **Why `IndexSet` and not `HashSet`** (1.4.2): `SPOP` and `SRANDMEMBER` need
+/// a *random member by index*, and `HashSet` offers no indexed access — the
+/// previous implementation used `set.iter().nth(idx)`, an O(n) walk of ~n/2
+/// entries per call. Measured on the release binary before this change:
+///
+/// | Cardinality | `SPOP` | `SRANDMEMBER` |
+/// |---|---|---|
+/// | 1 000 | 157 895 rps | 200 000 rps |
+/// | 40 000 | **42 254 rps** | **10 526 rps** |
+///
+/// A `SADD`-producer / `SPOP`-consumer work queue — a common Redis pattern
+/// that Redis itself serves in O(1) — therefore degraded as the queue grew.
+/// `IndexSet` keeps hash-set semantics (uniqueness, O(1) contains/insert)
+/// while adding O(1) `get_index` and O(1) `swap_remove_index`.
+///
+/// **Iteration order is insertion order**, where `HashSet` was arbitrary.
+/// Redis makes no ordering promise for `SMEMBERS`/`SSCAN`, so this is not an
+/// observable contract change — but it does mean set iteration is now
+/// deterministic, which is strictly easier to reason about.
+///
 /// **Wire format**: `set` only (`bytes` skipped). SetData uses the default
-/// (externally tagged) enum representation for bincode compatibility.
+/// (externally tagged) enum representation for bincode compatibility. An
+/// `IndexSet` serialises as a sequence exactly as `HashSet` did, so RDB and
+/// AOF files interoperate in both directions across this change.
 #[derive(Debug, Clone, Serialize)]
 pub struct HashtableSet {
-    set: HashSet<Vec<u8>>,
+    set: IndexSet<Vec<u8>>,
     #[serde(skip)]
     bytes: usize,
 }
@@ -76,22 +99,26 @@ impl<'de> Deserialize<'de> for HashtableSet {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct Wire {
-            set: HashSet<Vec<u8>>,
+            set: IndexSet<Vec<u8>>,
         }
         let w = Wire::deserialize(deserializer)?;
-        Ok(Self::from_set(w.set))
+        Ok(Self::from_index_set(w.set))
     }
 }
 
 impl HashtableSet {
     fn with_capacity(n: usize) -> Self {
         Self {
-            set: HashSet::with_capacity(n),
+            set: IndexSet::with_capacity(n),
             bytes: 0,
         }
     }
 
     fn from_set(set: HashSet<Vec<u8>>) -> Self {
+        Self::from_index_set(set.into_iter().collect())
+    }
+
+    fn from_index_set(set: IndexSet<Vec<u8>>) -> Self {
         let bytes = set.iter().map(|m| m.len()).sum();
         Self { set, bytes }
     }
@@ -122,14 +149,33 @@ impl HashtableSet {
     }
 
     /// Returns `(removed, payload_delta)`.
+    ///
+    /// Uses `swap_remove` (O(1)) rather than `shift_remove` (O(n)). That
+    /// permutes the index of at most one other member, which is fine because
+    /// nothing depends on a stable index across mutations — indices are only
+    /// used transiently to pick a random member.
     fn remove(&mut self, member: &[u8]) -> (bool, isize) {
-        if self.set.remove(member) {
+        if self.set.swap_remove(member) {
             let n = member.len();
             self.bytes = self.bytes.saturating_sub(n);
             (true, -(n as isize))
         } else {
             (false, 0)
         }
+    }
+
+    /// Member at `idx` in O(1). `None` if out of range.
+    #[inline]
+    fn get_index(&self, idx: usize) -> Option<&Vec<u8>> {
+        self.set.get_index(idx)
+    }
+
+    /// Remove and return the member at `idx` in O(1).
+    fn swap_remove_index(&mut self, idx: usize) -> Option<(Vec<u8>, isize)> {
+        let m = self.set.swap_remove_index(idx)?;
+        let n = m.len();
+        self.bytes = self.bytes.saturating_sub(n);
+        Some((m, -(n as isize)))
     }
 
     fn drain(self) -> impl Iterator<Item = Vec<u8>> {
@@ -306,14 +352,33 @@ impl SetData {
         }
     }
 
+    /// Iterate members as borrowed slices — no allocation per element.
+    /// See [`crate::hash_data::HashData::iter_pairs_ref`] for the rationale.
+    pub fn iter_ref(&self) -> Box<dyn Iterator<Item = &[u8]> + '_> {
+        match self {
+            SetData::Compact(c) => Box::new(c.iter_members_ref()),
+            SetData::Hashtable(s) => Box::new(s.set.iter().map(|m| m.as_slice())),
+        }
+    }
+
     pub fn to_hashset(&self) -> HashSet<Vec<u8>> {
         match self {
             SetData::Compact(c) => c.iter_members().collect(),
-            SetData::Hashtable(s) => s.set.clone(),
+            // Was `s.set.clone()` when the backing store was a `HashSet`.
+            // `IndexSet` needs an explicit rebuild; callers want set algebra
+            // (SINTER/SUNION/SDIFF), not order, so a plain `HashSet` is still
+            // the right return type.
+            SetData::Hashtable(s) => s.set.iter().cloned().collect(),
         }
     }
 
     /// Pop one member at `idx` (0..len). Returns None if empty.
+    ///
+    /// O(1) for the Hashtable encoding as of 1.4.2 (was an O(n)
+    /// `iter().nth(idx)` walk — see [`HashtableSet`]). Compact stays a linear
+    /// scan, which is correct: it is a contiguous length-prefixed buffer with
+    /// no index, and it is bounded to a few hundred small members by the
+    /// promote thresholds.
     pub fn remove_at(&mut self, idx: usize) -> Option<Vec<u8>> {
         if self.is_empty() || idx >= self.len() {
             return None;
@@ -326,11 +391,25 @@ impl SetData {
                 Some(m)
             }
             SetData::Hashtable(s) => {
-                let m = s.set.iter().nth(idx).cloned()?;
-                let _ = s.remove(&m);
+                let (m, _delta) = s.swap_remove_index(idx)?;
                 self.maybe_demote();
                 Some(m)
             }
+        }
+    }
+
+    /// Member at `idx` (0..len) without removing it. `None` if out of range.
+    ///
+    /// Exists so `SRANDMEMBER` can pick one member without materialising the
+    /// whole set. Before 1.4.2 it called `to_vec()`, cloning **every** member
+    /// on every call — measured at 200 000 rps on a 1 000-member set but
+    /// **10 526 rps** at 40 000 members, a 19× degradation that was worse than
+    /// the `SPOP` bug it was found alongside.
+    pub fn get_at(&self, idx: usize) -> Option<&[u8]> {
+        match self {
+            // Linear, but bounded by the Compact promote thresholds.
+            SetData::Compact(c) => c.nth_ref(idx),
+            SetData::Hashtable(s) => s.get_index(idx).map(|m| m.as_slice()),
         }
     }
 }
@@ -423,6 +502,12 @@ impl CompactSet {
     }
 
     fn nth(&self, idx: usize) -> Option<Vec<u8>> {
+        self.nth_ref(idx).map(|m| m.to_vec())
+    }
+
+    /// Borrowing variant of [`Self::nth`] — no allocation. Used by
+    /// `SRANDMEMBER`, which only needs to read one member.
+    fn nth_ref(&self, idx: usize) -> Option<&[u8]> {
         if idx >= self.len {
             return None;
         }
@@ -430,7 +515,7 @@ impl CompactSet {
         for i in 0..self.len {
             let n = u32::from_le_bytes(self.buf[off..off + 4].try_into().ok()?) as usize;
             if i == idx {
-                return Some(self.buf[off + 4..off + 4 + n].to_vec());
+                return Some(&self.buf[off + 4..off + 4 + n]);
             }
             off += 4 + n;
         }
@@ -444,12 +529,45 @@ impl CompactSet {
             remaining: self.len,
         }
     }
+
+    /// Borrowing variant of [`Self::iter_members`] — no allocation per element.
+    fn iter_members_ref(&self) -> CompactSetRefIter<'_> {
+        CompactSetRefIter {
+            buf: &self.buf,
+            off: 0,
+            remaining: self.len,
+        }
+    }
 }
 
 pub struct CompactSetIter<'a> {
     buf: &'a [u8],
     off: usize,
     remaining: usize,
+}
+
+/// Borrowing counterpart to [`CompactSetIter`], yielding slices into the
+/// compact buffer. Used by `SSCAN`, which inspects every member to select one
+/// page and therefore should not clone them all first.
+pub struct CompactSetRefIter<'a> {
+    buf: &'a [u8],
+    off: usize,
+    remaining: usize,
+}
+
+impl<'a> Iterator for CompactSetRefIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let n = u32::from_le_bytes(self.buf[self.off..self.off + 4].try_into().ok()?) as usize;
+        let m = &self.buf[self.off + 4..self.off + 4 + n];
+        self.off += 4 + n;
+        self.remaining -= 1;
+        Some(m)
+    }
 }
 
 impl Iterator for CompactSetIter<'_> {

@@ -27,6 +27,7 @@ dashmap = { workspace = true }
 parking_lot = { workspace = true }
 ordered-float = { workspace = true }
 indexmap = { workspace = true }
+foldhash = { workspace = true }
 atoi = { workspace = true }
 bincode = { workspace = true }
 futures = { workspace = true }

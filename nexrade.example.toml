@@ -77,6 +77,12 @@ port = 9091
 # port = 9090                      # readiness probe port
 # max_snapshot_age_secs = 3600     # 0 disables
 # max_replication_lag_secs = 10    # 0 disables
+# expose_details = false           # true = serve the full HealthReport on
+#                                  # /healthz and /readyz, including
+#                                  # persistence paths and AOF error text.
+#                                  # This listener has NO authentication, so
+#                                  # the default body is minimal (live, ready,
+#                                  # phase, reason codes).
 
 # Set NEXRADE_LOG_JSON=1 for structured JSON logging (for Loki/Datadog/etc.)
 

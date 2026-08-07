@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.2.3"
+version = "1.4.2"
 edition = "2021"
 authors = ["Nexrade Contributors"]
 license = "MIT OR Apache-2.0"
@@ -72,8 +72,28 @@ parking_lot = { version = "0.12", features = ["send_guard"] }
 # ordered-float for sorted sets
 ordered-float = { version = "5", features = ["serde"] }
 
-# skiplist / sorted structures
-indexmap = "2"
+# skiplist / sorted structures. `serde` is needed because `HashtableSet`
+# persists an `IndexSet` (1.4.2 — see set_data.rs); indexmap serialises a set
+# as a plain sequence, identical to what `HashSet` produced, so RDB/AOF files
+# interoperate across that change.
+indexmap = { version = "2", features = ["serde"] }
+
+# foldhash — hasher for the per-shard key map (1.5.0). The std default is
+# SipHash-1-3, which is DoS-resistant but slow; measured on 100k-key maps with
+# randomised access it costs 60–179 ns per lookup vs 27–82 ns for foldhash, a
+# ~54% saving on what profiling showed to be ~91% of a read's cost.
+#
+# Chosen over ahash (which measured marginally faster, −57% vs −55%) because
+# foldhash has zero dependencies of its own and reaches this workspace only as
+# a direct dependency. ahash arrives transitively via `config` → `rust-ini` →
+# `ordered-multimap` → `hashbrown`, so its enabled feature set is not ours to
+# control, and its randomness depends on which features are on.
+#
+# `foldhash::fast::RandomState` is seeded per-process (verified: the same key
+# hashes differently across runs), so key-collision DoS is not a regression
+# from the std default. Do NOT switch to `BuildHasherDefault<FoldHasher>` —
+# that is the fixed-seed variant.
+foldhash = "0.1"
 
 # RESP protocol
 atoi = "2"

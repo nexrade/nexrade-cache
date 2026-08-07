@@ -106,16 +106,34 @@ pub struct Listener {
     pub db: Db,
     pub config: ServerConfig,
     metrics: Option<Metrics>,
+    /// Broadcast side of the unified shutdown signal. Owned here (rather than
+    /// created inside `run`) so callers can hand receivers to the operations
+    /// HTTP servers *before* `run` consumes `self` — those servers are started
+    /// first, and previously had no way to observe the drain.
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl Listener {
     pub fn new(db: Db, metrics: Option<Metrics>) -> Self {
         let config = db.config.lock().clone();
+        let (shutdown_tx, _) = watch::channel(false);
         Self {
             db,
             config,
             metrics,
+            shutdown_tx,
         }
+    }
+
+    /// Subscribe to the unified shutdown signal.
+    ///
+    /// Flips to `true` once on SIGINT, SIGTERM, or the `SHUTDOWN` command.
+    /// Intended for long-lived side listeners (metrics, health) that must stop
+    /// answering before the process exits — a `/readyz` endpoint that outlives
+    /// the drain reports `ready=true` to a load balancer that should already
+    /// have been told to stop sending traffic.
+    pub fn shutdown_subscriber(&self) -> watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
     }
 
     /// Start the server and block until shutdown.
@@ -124,6 +142,9 @@ impl Listener {
         // the operations HTTP surface and `INFO health` can report this
         // state. Recovery will transition to Ready after this function
         // finishes successfully; a startup failure transitions to Failed.
+        //
+        // This is also the `Starting -> Recovering` edge: a `Db` is born in
+        // `Starting`, and this is the only place that advances it.
         self.db.lifecycle().set_phase(HealthPhase::Recovering);
 
         // A legacy full AOF has no checkpoint boundary. Replaying it after a
@@ -250,6 +271,68 @@ impl Listener {
             info!("AOF enabled: {}", aof);
         }
 
+        // ── TLS material is validated and its port bound BEFORE readiness ───
+        //
+        // Ordering is deliberate. This used to sit ~80 lines below, *after*
+        // `set_phase(Ready)`, so even once the failures became fatal the
+        // instance had already advertised `ready=true` to every probe before
+        // discovering it could not serve TLS. Validating here means a TLS
+        // misconfiguration is caught while the phase is still `Recovering`.
+        //
+        // Every failure is fatal (1.3.0). Previously each arm only logged
+        // `error!`/`warn!` and startup continued, which meant an operator who
+        // set `tls_enabled = true` with an unreadable cert, a bad key, or an
+        // occupied TLS port got a server that:
+        //
+        //   - printed `TLS  ON` in the startup banner,
+        //   - never bound the TLS port at all, and
+        //   - exited 0 and served plaintext as if nothing were wrong.
+        //
+        // A client configured for TLS then fails to connect while the instance
+        // looks healthy, and a client with a fallback path could silently
+        // downgrade to plaintext. Asking for TLS and quietly not getting it is
+        // the one outcome that must never be silent, so this now matches how
+        // `nexrade-cache` already treats a metrics or health bind failure:
+        // refuse to start.
+        //
+        // (The comment previously here claimed cert/key presence was "checked
+        // in `start_server` before this point". No such validation existed
+        // anywhere — hence the explicit check below.)
+        #[cfg(feature = "tls")]
+        let tls_setup = if self.config.tls_enabled {
+            // Run the same validation `--preflight` runs, first, so the two
+            // agree by construction and the error text is identical whether
+            // an operator hits it in a deploy check or at startup.
+            let problems = validate_tls_config(&self.config);
+            if !problems.is_empty() {
+                anyhow::bail!(
+                    "refusing to start: TLS is enabled but misconfigured, and \
+                     starting anyway would serve only plaintext:\n  - {}",
+                    problems.join("\n  - ")
+                );
+            }
+            // validate_tls_config guarantees both are Some in this branch.
+            let (Some(cert), Some(key)) = (&self.config.tls_cert, &self.config.tls_key) else {
+                unreachable!("validate_tls_config rejects a missing cert or key")
+            };
+            let tls_port = self.config.tls_port.unwrap_or(6380);
+            let tls_addr = format!("{}:{}", self.config.bind, tls_port);
+            let acceptor = nexrade_tls::TlsAcceptor::from_pem_files(cert, key)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to initialize TLS for {tls_addr} \
+                         (cert {cert:?}, key {key:?}): {e}"
+                    )
+                })?;
+            let tls_listener = TcpListener::bind(&tls_addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to bind TLS listener on {tls_addr}: {e}"))?;
+            Some((tls_listener, acceptor, tls_addr))
+        } else {
+            None
+        };
+
         let addr = format!("{}:{}", self.config.bind, self.config.port);
         let listener = TcpListener::bind(&addr).await?;
         info!("nexrade-cache listening on {}", addr);
@@ -276,9 +359,11 @@ impl Listener {
         // owns the one `notified()` wait and fans the signal out to every
         // accept loop via a `watch` channel instead.
         //
-        // Created *before* tick/replication so those loops can select on the
-        // same watch and exit promptly on drain (0.5.0).
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // The channel is owned by `Listener` (created in `new`) rather than
+        // here, so the operations HTTP servers — started before `run` is
+        // called — can already hold receivers via `shutdown_subscriber()`.
+        let shutdown_tx = self.shutdown_tx;
+        let shutdown_rx = shutdown_tx.subscribe();
 
         // Spawn background tasks
         let db_clone = self.db.clone();
@@ -327,48 +412,34 @@ impl Listener {
         );
 
         // ── Optional TLS listener, running alongside the plain-TCP one ──────
-        // `config.tls_enabled` requires both `tls_cert` and `tls_key` to be
-        // set (checked in `nexrade-cache`'s `start_server` before this
-        // point); if either is missing here we just skip starting it rather
-        // than failing the whole server.
+        //
+        // The socket is already bound and the cert/key already validated (see
+        // the pre-readiness block above); all that remains is to start serving
+        // on it.
         #[cfg(feature = "tls")]
-        if self.config.tls_enabled {
-            if let (Some(cert), Some(key)) = (&self.config.tls_cert, &self.config.tls_key) {
-                let tls_port = self.config.tls_port.unwrap_or(6380);
-                let tls_addr = format!("{}:{}", self.config.bind, tls_port);
-                match nexrade_tls::TlsAcceptor::from_pem_files(cert, key).await {
-                    Ok(acceptor) => match TcpListener::bind(&tls_addr).await {
-                        Ok(tls_listener) => {
-                            info!("nexrade-cache TLS listening on {}", tls_addr);
-                            let db = db.clone();
-                            let metrics = metrics.clone();
-                            let lua_engine = lua_engine.clone();
-                            let function_registry = function_registry.clone();
-                            let mut shutdown_rx = shutdown_rx.clone();
-                            bg.push(
-                                "tls-accept",
-                                tokio::spawn(async move {
-                                    run_tls_accept_loop(
-                                        tls_listener,
-                                        acceptor,
-                                        db,
-                                        metrics,
-                                        lua_engine,
-                                        function_registry,
-                                        max_clients,
-                                        &mut shutdown_rx,
-                                    )
-                                    .await;
-                                }),
-                            );
-                        }
-                        Err(e) => error!("failed to bind TLS listener on {}: {}", tls_addr, e),
-                    },
-                    Err(e) => error!("failed to initialize TLS ({}): {}", tls_addr, e),
-                }
-            } else {
-                warn!("TLS enabled but tls-cert or tls-key not set, TLS listener skipped");
-            }
+        if let Some((tls_listener, acceptor, tls_addr)) = tls_setup {
+            info!("nexrade-cache TLS listening on {}", tls_addr);
+            let db = db.clone();
+            let metrics = metrics.clone();
+            let lua_engine = lua_engine.clone();
+            let function_registry = function_registry.clone();
+            let mut shutdown_rx = shutdown_rx.clone();
+            bg.push(
+                "tls-accept",
+                tokio::spawn(async move {
+                    run_tls_accept_loop(
+                        tls_listener,
+                        acceptor,
+                        db,
+                        metrics,
+                        lua_engine,
+                        function_registry,
+                        max_clients,
+                        &mut shutdown_rx,
+                    )
+                    .await;
+                }),
+            );
         }
 
         let mut shutdown_rx = shutdown_rx;
@@ -467,6 +538,81 @@ impl Listener {
         info!("server shut down gracefully");
         Ok(())
     }
+}
+
+/// Validate the TLS portion of a config without binding anything.
+///
+/// Returns one human-readable error string per problem found, in the order
+/// startup would hit them. An empty vec means the TLS settings would let
+/// `Listener::run` reach its bind step.
+///
+/// This exists so `--preflight` and startup cannot drift: both call this,
+/// and the actual PEM parsing is delegated to `nexrade_tls`, which is the
+/// same code path that builds the live acceptor. Before 1.3.1 preflight
+/// performed *no* TLS validation at all, so a config with a missing or
+/// unparseable certificate reported `preflight: OK` and then exited 1 on
+/// the next deploy step — precisely the failure preflight exists to catch.
+///
+/// Port collisions are checked but not bound: preflight is non-mutating, so
+/// it cannot prove a port is free. It only catches the statically-decidable
+/// case where TLS and plaintext are pointed at the same port, which
+/// otherwise surfaces as a bare `Address already in use` that never
+/// mentions TLS.
+pub fn validate_tls_config(config: &ServerConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    if !config.tls_enabled {
+        // A cert configured while TLS is off is a live footgun: the operator
+        // believes TLS is on (the paths are right there in the file) but the
+        // server serves plaintext only. Not fatal — disabling TLS while
+        // leaving the paths in place is a legitimate way to stage a rollout —
+        // so this is surfaced by the caller as a warning, not an error.
+        return errors;
+    }
+
+    #[cfg(not(feature = "tls"))]
+    {
+        errors.push(
+            "tls.enabled = true but this binary was built without the `tls` \
+             feature; it cannot serve TLS and would only serve plaintext"
+                .to_string(),
+        );
+    }
+
+    #[cfg(feature = "tls")]
+    {
+        // Mirror `Listener::run`'s ordering: presence first, then parse.
+        match (&config.tls_cert, &config.tls_key) {
+            (None, None) => errors.push(
+                "tls.enabled = true but neither tls.cert nor tls.key is set; \
+                 startup will refuse rather than serve plaintext"
+                    .to_string(),
+            ),
+            (None, Some(_)) => errors
+                .push("tls.enabled = true and tls.key is set but tls.cert is missing".to_string()),
+            (Some(_), None) => errors
+                .push("tls.enabled = true and tls.cert is set but tls.key is missing".to_string()),
+            (Some(cert), Some(key)) => {
+                // Delegates to the same parser the live acceptor uses, so a
+                // key that doesn't match its certificate is caught here too.
+                if let Err(e) = nexrade_tls::validate_pem_files(cert, key) {
+                    errors.push(format!(
+                        "TLS cert/key unusable (cert {cert:?}, key {key:?}): {e}"
+                    ));
+                }
+            }
+        }
+
+        let tls_port = config.tls_port.unwrap_or(6380);
+        if tls_port == config.port {
+            errors.push(format!(
+                "tls.port ({tls_port}) is the same as the plaintext port; \
+                 the second bind fails with 'Address already in use'"
+            ));
+        }
+    }
+
+    errors
 }
 
 /// Accept loop for the TLS listener — mirrors the plain-TCP loop in

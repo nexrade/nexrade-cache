@@ -1,8 +1,9 @@
 //! Verifies the canonical health snapshot used by `/healthz`, `/readyz`,
 //! `INFO health`, and Prometheus operational gauges:
 //!
-//! - `live` stays true through `Recovering` and `Draining`; only `false`
-//!   once the listener records `Failed`.
+//! - `live` stays true through `Starting`, `Recovering`, and `Draining`; only
+//!   `false` once the listener records `Failed`.
+//! - Phase transitions are one-way and `Failed` is terminal (1.3.0).
 //! - `ready` requires the `Ready` phase plus no blocking reason.
 //! - Quiescing persistence, AOF failure latch, configured-but-unavailable
 //!   AOF writer, snapshot age, and replica link state all keep readiness
@@ -35,16 +36,17 @@ fn info_field(info: &str, key: &str) -> Option<String> {
 }
 
 #[tokio::test]
-async fn health_report_default_is_recovering_and_not_ready() {
+async fn health_report_default_is_starting_and_not_ready() {
     let db = Db::new(nexrade_core::db::ServerConfig::default());
     let report = nexrade_core::health::health_report(&db);
 
-    // Default Db lifecycle starts in Recovering (the listener flips it to
-    // Ready after recovery succeeds). A fresh Db is therefore live but not
-    // ready.
-    assert!(report.live, "Recovering is still live");
-    assert!(!report.ready, "Recovering is not ready");
-    assert_eq!(report.phase, HealthPhase::Recovering);
+    // A fresh Db lifecycle starts in Starting (1.3.0+; previously Recovering).
+    // The listener advances it to Recovering when it begins persistence
+    // recovery, then Ready once that succeeds. Starting is live but not ready,
+    // so the HTTP status codes are unchanged from 1.2.x.
+    assert!(report.live, "Starting is still live");
+    assert!(!report.ready, "Starting is not ready");
+    assert_eq!(report.phase, HealthPhase::Starting);
 }
 
 #[tokio::test]
@@ -54,6 +56,9 @@ async fn lifecycle_phase_transitions_are_visible_in_health() {
     // Drive the listener-style transitions directly through the lifecycle
     // helper. This is the same surface the listener uses.
     let lifecycle: &LifecycleState = db.lifecycle();
+    assert_eq!(lifecycle.phase(), HealthPhase::Starting, "born Starting");
+    lifecycle.set_phase(HealthPhase::Recovering);
+    assert_eq!(lifecycle.phase(), HealthPhase::Recovering);
     lifecycle.set_phase(HealthPhase::Ready);
     let report = nexrade_core::health::health_report(&db);
     assert_eq!(report.phase, HealthPhase::Ready);

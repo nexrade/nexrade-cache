@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 
-use crate::command::{decode_scan_cursor, get_f64, scan_cursor_token, scan_start_offset_by};
+use crate::command::{decode_scan_cursor, get_f64, scan_select_page};
 
 use crate::command::string::format_float;
 use crate::command::{get_bytes_vec, get_i64, get_str};
@@ -1252,32 +1252,27 @@ pub async fn cmd_zscan(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
         Some(e) => match &e.value {
             DataType::ZSet(z) => {
                 let pat = pattern.unwrap_or_else(|| b"*".to_vec());
-                let mut pairs: Vec<(Vec<u8>, f64)> = z
-                    .to_pairs()
-                    .into_iter()
-                    .filter(|(m, _)| glob_match(&pat, m.as_slice()))
-                    .collect();
                 // Member-space cursor, see `scan_cursor_token`. Ordering by
                 // the token makes the cursor a position in the walked order,
                 // so a removed boundary member cannot shift the resume point.
-                // Byte sort then a stable cached-key sort on the token:
-                // one hash per element instead of one per comparison.
-                pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                pairs.sort_by_cached_key(|p| scan_cursor_token(&p.0));
-                let start = scan_start_offset_by(&pairs, cursor, |p| &p.0);
-                let end = (start + count).min(pairs.len());
-                let next = if end >= pairs.len() {
-                    0
-                } else {
-                    scan_cursor_token(&pairs[end - 1].0)
-                };
-                let mut items = Vec::with_capacity((end - start) * 2);
-                for (m, score) in &pairs[start..end] {
-                    items.push(Resp::bulk(Bytes::from(m.clone())));
+                //
+                // 1.3.0: bounded-heap page selection replaces sorting the whole
+                // zset on every page, which made a complete walk O(n² log n).
+                // Order and cursor semantics are unchanged.
+                // Borrowed member slices in; only the page is copied.
+                let page = scan_select_page(
+                    z.iter_pairs_ref().filter(|(m, _)| glob_match(&pat, m)),
+                    cursor,
+                    count,
+                    |p: &(&[u8], f64)| p.0,
+                );
+                let mut items = Vec::with_capacity(page.items.len() * 2);
+                for (m, score) in &page.items {
+                    items.push(Resp::bulk(Bytes::copy_from_slice(m)));
                     items.push(Resp::bulk_str(format_float(*score)));
                 }
                 Ok(Resp::array(vec![
-                    Resp::bulk_str(next.to_string()),
+                    Resp::bulk_str(page.next_cursor.to_string()),
                     Resp::array(items),
                 ]))
             }
@@ -1679,7 +1674,7 @@ pub async fn cmd_zrangestore(db: &Db, args: &[Resp], db_index: usize) -> Result<
         }
     }
     if byscore && bylex {
-        return Err(NexradeError::Generic("ERR syntax error".to_string()));
+        return Err(NexradeError::Generic("syntax error".to_string()));
     }
 
     // Read entries from src.

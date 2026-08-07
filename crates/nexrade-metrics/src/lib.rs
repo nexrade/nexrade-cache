@@ -15,7 +15,9 @@
 //! async fn main() {
 //!     init_tracing();
 //!     let addr: SocketAddr = "0.0.0.0:9091".parse().unwrap();
-//!     let _handle = MetricsServer::start(addr, Metrics::new()).await;
+//!     // `None` runs the accept loop until the process exits. Pass a
+//!     // `watch::Receiver<bool>` to stop it when the server drains.
+//!     let _handle = MetricsServer::start(addr, Metrics::new(), None).await;
 //! }
 //! ```
 

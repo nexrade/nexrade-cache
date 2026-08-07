@@ -340,12 +340,35 @@ where
     let db = Db::new(config.clone());
     on_db(db.clone());
 
+    // Build the listener up front — before the operations servers — so they can
+    // subscribe to its shutdown watch. `Listener::new` only clones config and
+    // creates the channel; it binds no sockets, so nothing observable happens
+    // earlier than it used to. `run()` (which consumes it) is still called
+    // last, after both operations listeners are bound.
+    //
+    // Cloning `db` here keeps the lifecycle state addressable after `run`
+    // consumes the listener: a startup failure (corrupt RDB, invalid TLS,
+    // occupied port, …) must flip the lifecycle to `Failed` so `/healthz`
+    // returns 503 — otherwise a process that bound health but failed to bind
+    // the data plane would falsely advertise `live=true` to probes.
+    let db_for_failure = db.clone();
+
     // Start metrics server (Prometheus /metrics). Both metrics and
     // health servers are spawned as background tasks: their `start`
     // returns once the listener is bound so the main thread can move
     // on to bind the redis port and start recovery.
-    let (metrics, metrics_handle) = if config.metrics_enabled {
-        let m = Metrics::new();
+    //
+    // `metrics_addr` is resolved here but the server is started *after* the
+    // `Listener` exists, so it can be handed a shutdown receiver too.
+    let metrics = if config.metrics_enabled {
+        Some(Metrics::new())
+    } else {
+        None
+    };
+
+    let listener = Listener::new(db, metrics.clone());
+
+    let metrics_handle = if let Some(ref m) = metrics {
         // Use the dedicated `metrics_bind` field rather than `bind` so
         // the data-plane and observability listeners can be scoped to
         // different interfaces (e.g. Redis on 0.0.0.0 with requirepass,
@@ -354,7 +377,12 @@ where
         let metrics_addr = format!("{}:{}", config.metrics_bind, config.metrics_port)
             .parse()
             .unwrap_or_else(|_| "127.0.0.1:9091".parse().unwrap());
-        let handle = MetricsServer::start(metrics_addr, m.clone()).await;
+        let handle = MetricsServer::start(
+            metrics_addr,
+            m.clone(),
+            Some(listener.shutdown_subscriber()),
+        )
+        .await;
         info!(
             "metrics available at http://{}:{}/metrics",
             config.metrics_bind, config.metrics_port
@@ -371,19 +399,29 @@ where
                 config.metrics_port
             );
         }
-        (Some(m), handle)
+        handle
     } else {
-        (None, None)
+        None
     };
 
     // Start health server (operations /healthz, /readyz) — bound to the
     // configured `health.bind` so loopback production profiles are not
     // reachable on the public interface.
+    //
+    // The shutdown receiver is what makes `/readyz` stop answering when the
+    // data plane drains. Passing `None` here (as every release through 1.2.3
+    // did) left the accept loop running past the drain, so a load balancer
+    // could still be told `ready=true` by a server that had stopped serving.
     let health_handle = if config.health.enabled {
         let health_addr = format!("{}:{}", config.health.bind, config.health.port)
             .parse()
             .unwrap_or_else(|_| "127.0.0.1:9090".parse().unwrap());
-        let handle = HealthServer::start(health_addr, db.clone(), None).await;
+        let handle = HealthServer::start(
+            health_addr,
+            db_for_failure.clone(),
+            Some(listener.shutdown_subscriber()),
+        )
+        .await;
         info!(
             "health endpoints available at http://{}:{}/healthz and /readyz",
             config.health.bind, config.health.port
@@ -407,15 +445,6 @@ where
     // TLS-upgraded accept loop on `tls_port` when `config.tls_enabled` is
     // set (see `nexrade_server::listener`) — both listeners run
     // concurrently and share the same shutdown signal.
-    //
-    // Clone the db handle so the lifecycle state stays addressable
-    // after `Listener::run` consumes `self`. A startup failure
-    // (corrupt RDB, invalid TLS, occupied port, …) must flip the
-    // lifecycle to `Failed` so `/healthz` returns 503 — otherwise a
-    // process that bound health but failed to bind the data plane
-    // would falsely advertise `live=true` to probes.
-    let db_for_failure = db.clone();
-    let listener = Listener::new(db, metrics);
     if let Err(e) = listener.run().await {
         db_for_failure
             .lifecycle()
@@ -423,13 +452,40 @@ where
         return Err(e.context("startup failed"));
     }
 
-    // Background servers have no shutdown signal wired in yet (the
-    // production profile defaults to disabled, so the operator opts in);
-    // they will exit when their accept loop is dropped on process exit.
-    let _ = metrics_handle;
-    let _ = health_handle;
+    // `run()` has returned, so the shutdown watch has fired and the operations
+    // servers are exiting. Join them (bounded) rather than dropping the handles:
+    // an abrupt process exit mid-response looks to a probe like a connection
+    // reset instead of a clean close.
+    join_ops_server("health", health_handle).await;
+    join_ops_server("metrics", metrics_handle).await;
 
     Ok(())
+}
+
+/// Grace period for an operations HTTP server to finish in-flight work after
+/// the shutdown signal fires. Short by design: these serve small, local,
+/// bounded bodies.
+const OPS_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Await an operations server's exit, bounded by [`OPS_SHUTDOWN_GRACE`].
+///
+/// A server that overruns is left for the OS to reclaim at process exit rather
+/// than blocking shutdown — the same trade-off `BgTasks` makes for data-plane
+/// background tasks.
+async fn join_ops_server(name: &str, handle: Option<tokio::task::JoinHandle<()>>) {
+    let Some(handle) = handle else { return };
+    match tokio::time::timeout(OPS_SHUTDOWN_GRACE, handle).await {
+        Ok(Ok(())) => info!("{} server stopped", name),
+        Ok(Err(e)) if e.is_panic() => {
+            tracing::error!("{} server panicked during shutdown: {:?}", name, e)
+        }
+        Ok(Err(_)) => {}
+        Err(_) => tracing::warn!(
+            "{} server did not stop within {:?} — continuing shutdown",
+            name,
+            OPS_SHUTDOWN_GRACE
+        ),
+    }
 }
 
 // Cap workers: redis-benchmark single-key write pipelines (LPUSH/SET) regress
@@ -587,6 +643,24 @@ fn run_preflight(config: &ServerConfig) -> Result<()> {
                 Err(e) => errors.push(format!("AOF '{aof_path}' open failure: {e}")),
             }
         }
+    }
+
+    // TLS sanity: startup refuses to run with TLS enabled but unusable
+    // (1.3.0), so preflight must catch the same cases — otherwise a deploy
+    // check passes and the very next step exits 1. Delegated to
+    // nexrade_server so there is one validator, not two.
+    for e in nexrade_server::validate_tls_config(config) {
+        errors.push(e);
+    }
+
+    // A cert/key configured while TLS is off is not a startup failure, but
+    // it is almost always a mistake: the operator sees the paths in the
+    // config and believes the port is encrypted. Warn without failing.
+    if !config.tls_enabled && (config.tls_cert.is_some() || config.tls_key.is_some()) {
+        eprintln!(
+            "preflight: warning: tls.cert/tls.key are set but tls.enabled = false; \
+             this instance serves plaintext only"
+        );
     }
 
     if errors.is_empty() {
@@ -775,6 +849,11 @@ fn load_config_file(path: &str) -> Result<ServerConfig> {
             .and_then(|v| v.as_integer())
         {
             config.health.max_replication_lag_secs = if lag < 0 { None } else { Some(lag as u64) };
+        }
+        // S3: opt back into the pre-1.3.0 full-report probe body, which
+        // includes persistence paths and the AOF failure message.
+        if let Some(expose) = health.get("expose_details").and_then(|v| v.as_bool()) {
+            config.health.expose_details = expose;
         }
     }
 
@@ -993,6 +1072,11 @@ fn print_config(config: &ServerConfig) {
     println!();
     println!("[tls]");
     println!("enabled = {}", config.tls_enabled);
+    // Print the *resolved* TLS port, including the 6380 default when the
+    // config omits it. Previously this line was missing entirely, so
+    // `--print-config` output was not a round-trippable config and hid the
+    // field involved in a `tls.port == port` collision.
+    println!("port = {}", config.tls_port.unwrap_or(6380));
     if let Some(ref cert) = config.tls_cert {
         println!("cert = \"{}\"", cert);
     }
@@ -1025,6 +1109,7 @@ fn print_config(config: &ServerConfig) {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "disabled".to_string())
     );
+    println!("expose_details = {}", config.health.expose_details);
 }
 
 fn print_banner(config: &ServerConfig) {

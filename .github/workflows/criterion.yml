@@ -60,18 +60,23 @@ jobs:
         with:
           shared-key: bench-run
 
-      # Shorter measurement time keeps CI under 5 minutes while still
-      # producing statistically valid results (criterion runs ≥100 samples).
+      # The harness sets its own warm-up/measurement defaults (3s/10s) and a
+      # 5% noise_threshold — see the module docs in store_bench.rs. We
+      # deliberately do NOT override them here.
+      #
+      # This job previously passed `--warm-up-time 1 --measurement-time 3`
+      # with a comment claiming that still produced "statistically valid
+      # results". It does not: measured on an idle 24-core host, those
+      # settings gave a ~15% spread across runs of an *unchanged* binary,
+      # with criterion reporting "Performance has regressed (p = 0.00)" and
+      # "Performance has improved (p = 0.01)" for the same code. The longer
+      # defaults cut that to ~5%.
       - name: Run criterion benchmarks
         run: |
           # `--bench store_bench` is required: `cargo bench` without it
           # falls back to running the test binary (which has its own main and
-          # no criterion parser), and the `--warm-up-time` flag then fails
-          # with "Unrecognized option". Verified by reproducing locally:
-          # direct invocation of the bench binary accepts the flags.
-          cargo bench -p nexrade-core --bench store_bench -- \
-            --warm-up-time 1 \
-            --measurement-time 3 \
+          # no criterion parser). Verified by reproducing locally.
+          cargo bench -p nexrade-core --bench store_bench \
             2>&1 | tee bench-output.txt
 
       # criterion writes HTML to target/criterion — upload the whole tree.
@@ -100,3 +105,23 @@ jobs:
           grep -E "^[a-zA-Z]|time:|thrpt:" bench-output.txt \
             | sed 's/^[ \t]*//' >> $GITHUB_STEP_SUMMARY || true
           echo '```' >> $GITHUB_STEP_SUMMARY
+          cat >> $GITHUB_STEP_SUMMARY <<'NOTE'
+
+          > **These numbers are indicative, not authoritative.**
+          >
+          > GitHub runners are shared and unpinned. Criterion's
+          > `Performance has regressed (p < 0.05)` answers "did the samples
+          > differ?", not "is the code slower?" — on a noisy host that comes
+          > back positive for unchanged code. Runs of an identical binary
+          > have reported both `+7.6% regressed` and `−5.3% improved`.
+          >
+          > **Do not open a performance issue from this page alone.**
+          > Reproduce locally with a measured noise floor:
+          >
+          > ```
+          > python3 scripts/bench_ab.py --noise-floor --pairs 8
+          > python3 scripts/bench_ab.py --baseline main --pairs 8
+          > ```
+          >
+          > See `docs/perf-methodology.md` § Criterion microbenchmarks.
+          NOTE
