@@ -294,30 +294,44 @@
                 downstream components.
             -->
             <Dialog Id='PortFirewallDlg' Width='370' Height='270' Title='nexrade-cache Setup'>
-                <!-- Text is the Binary row Id, not the WixVariable name:
+                <!-- Geometry mirrors WixUI's own CustomizeDlg so this screen
+                     does not visibly jump when the user clicks Next: banner
+                     44dlu tall with a separator line beneath it, Title at
+                     (15,6) and Description at (25,23) *inside* the banner,
+                     body text starting at Y=55, buttons on the 243 baseline
+                     with Back at X=192. An earlier 58dlu banner stretched the
+                     493x58 bitmap into the wrong box and left the heading
+                     misaligned against the built-in dialogs.
+
+                     Text is the Binary row Id, not the WixVariable name:
                      WixUIBannerBmp is the variable that overrides the
                      bitmap's *source file*, while the row WixUIExtension
                      actually emits is WixUI_Bmp_Banner. Naming the variable
                      here links with LGHT0094 (unresolved Binary symbol). -->
-                <Control Id='BannerBitmap' Type='Bitmap' Width='370' Height='58' X='0' Y='0'
+                <Control Id='BannerBitmap' Type='Bitmap' Width='370' Height='44' X='0' Y='0'
                          TabSkip='no' Text='WixUI_Bmp_Banner'/>
-                <Control Id='BannerText' Type='Text' X='15' Y='9' Width='340' Height='15'
-                         Transparent='yes' Text='{\WixUI_Font_Title}Port Number and Firewall Exception'/>
-                <Control Id='BodyText' Type='Text' X='25' Y='60' Width='320' Height='28'
+                <Control Id='Title' Type='Text' X='15' Y='6' Width='210' Height='15'
+                         Transparent='yes' NoPrefix='yes'
+                         Text='{\WixUI_Font_Title}Port Number and Firewall Exception'/>
+                <Control Id='Description' Type='Text' X='25' Y='23' Width='280' Height='15'
+                         Transparent='yes' NoPrefix='yes'
+                         Text='Select the listener port and firewall exception.'/>
+                <Control Id='BannerLine' Type='Line' X='0' Y='44' Width='370' Height='0'/>
+                <Control Id='BodyText' Type='Text' X='25' Y='55' Width='320' Height='20'
                          Text='Select whether to add an exception to the Windows Firewall for nexrade-cache.'/>
-                <Control Id='PortLabel' Type='Text' X='25' Y='110' Width='220' Height='17'
+                <Control Id='PortLabel' Type='Text' X='25' Y='105' Width='220' Height='17'
                          Text='Port to run nexrade-cache on:'/>
-                <Control Id='PortEdit' Type='Edit' Width='80' Height='17' X='250' Y='108'
+                <Control Id='PortEdit' Type='Edit' Width='80' Height='17' X='250' Y='103'
                          Property='INSTALLPORT' Indirect='no'/>
-                <Control Id='FirewallCheckBox' Type='CheckBox' Width='320' Height='17' X='25' Y='140'
+                <Control Id='FirewallCheckBox' Type='CheckBox' Width='320' Height='17' X='25' Y='135'
                          Property='INSTALLFIREWALL' CheckBoxValue='EnableFirewall'
                          Text='Add an exception to the Windows Firewall.'/>
                 <Control Id='BottomLine' Type='Line' X='0' Y='234' Width='370' Height='0'/>
-                <Control Id='Back' Type='PushButton' X='180' Y='243' Width='56' Height='17'
+                <Control Id='Back' Type='PushButton' X='192' Y='243' Width='56' Height='17'
                          Text='&amp;Back'>
                     <Publish Event='NewDialog' Value='CustomizeDlg'>1</Publish>
                 </Control>
-                <Control Id='Next' Type='PushButton' X='236' Y='243' Width='56' Height='17'
+                <Control Id='Next' Type='PushButton' X='248' Y='243' Width='56' Height='17'
                          Default='yes' Text='&amp;Next'>
                     <Publish Event='NewDialog' Value='MemoryLimitDlg'>1</Publish>
                 </Control>
@@ -343,36 +357,42 @@
                 reads as unlimited.
             -->
             <Dialog Id='MemoryLimitDlg' Width='370' Height='270' Title='nexrade-cache Setup'>
-                <Control Id='BannerBitmap' Type='Bitmap' Width='370' Height='58' X='0' Y='0'
+                <!-- Same geometry as PortFirewallDlg above and WixUI's
+                     CustomizeDlg: 44dlu banner, separator at Y=44, heading
+                     inside the banner, buttons on the 243 baseline. -->
+                <Control Id='BannerBitmap' Type='Bitmap' Width='370' Height='44' X='0' Y='0'
                          TabSkip='no' Text='WixUI_Bmp_Banner'/>
-                <Control Id='BannerText' Type='Text' X='15' Y='9' Width='340' Height='15'
-                         Transparent='yes' Text='{\WixUI_Font_Title}Memory Limit'/>
-                <Control Id='BodyText' Type='Text' X='25' Y='60' Width='320' Height='28'
+                <Control Id='Title' Type='Text' X='15' Y='6' Width='210' Height='15'
+                         Transparent='yes' NoPrefix='yes'
+                         Text='{\WixUI_Font_Title}Memory Limit'/>
+                <Control Id='Description' Type='Text' X='25' Y='23' Width='280' Height='15'
+                         Transparent='yes' NoPrefix='yes'
                          Text='Select whether to use a memory limit or not.'/>
-                <Control Id='MaxMemoryCheckBox' Type='CheckBox' Width='320' Height='17' X='25' Y='100'
+                <Control Id='BannerLine' Type='Line' X='0' Y='44' Width='370' Height='0'/>
+                <Control Id='MaxMemoryCheckBox' Type='CheckBox' Width='320' Height='17' X='25' Y='70'
                          Property='SETMAXMEMORY' CheckBoxValue='1'
                          Text='Set the Max Memory limit'/>
-                <Control Id='MaxMemoryLabel' Type='Text' X='25' Y='140' Width='90' Height='17'
+                <Control Id='MaxMemoryLabel' Type='Text' X='25' Y='110' Width='90' Height='17'
                          Text='Max Memory:'>
                     <Condition Action='enable'><![CDATA[SETMAXMEMORY]]></Condition>
                     <Condition Action='disable'><![CDATA[NOT SETMAXMEMORY]]></Condition>
                 </Control>
-                <Control Id='MaxMemoryEdit' Type='Edit' Width='60' Height='17' X='120' Y='138'
+                <Control Id='MaxMemoryEdit' Type='Edit' Width='60' Height='17' X='120' Y='108'
                          Property='MAXMEMORYMB' Indirect='no'>
                     <Condition Action='enable'><![CDATA[SETMAXMEMORY]]></Condition>
                     <Condition Action='disable'><![CDATA[NOT SETMAXMEMORY]]></Condition>
                 </Control>
-                <Control Id='MaxMemoryUnit' Type='Text' X='186' Y='140' Width='40' Height='17'
+                <Control Id='MaxMemoryUnit' Type='Text' X='186' Y='110' Width='40' Height='17'
                          Text='MB'>
                     <Condition Action='enable'><![CDATA[SETMAXMEMORY]]></Condition>
                     <Condition Action='disable'><![CDATA[NOT SETMAXMEMORY]]></Condition>
                 </Control>
                 <Control Id='BottomLine' Type='Line' X='0' Y='234' Width='370' Height='0'/>
-                <Control Id='Back' Type='PushButton' X='180' Y='243' Width='56' Height='17'
+                <Control Id='Back' Type='PushButton' X='192' Y='243' Width='56' Height='17'
                          Text='&amp;Back'>
                     <Publish Event='NewDialog' Value='PortFirewallDlg'>1</Publish>
                 </Control>
-                <Control Id='Next' Type='PushButton' X='236' Y='243' Width='56' Height='17'
+                <Control Id='Next' Type='PushButton' X='248' Y='243' Width='56' Height='17'
                          Default='yes' Text='&amp;Next'>
                     <Publish Event='NewDialog' Value='VerifyReadyDlg'>1</Publish>
                 </Control>
