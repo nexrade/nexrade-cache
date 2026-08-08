@@ -81,14 +81,93 @@ impl Default for NexradeStore {
 #[cfg(feature = "wasm")]
 pub mod wasm_bindings {
     use super::*;
-    use js_sys::Promise;
+    use js_sys::{Array, Promise, Uint8Array};
     use wasm_bindgen::prelude::*;
+    use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::future_to_promise;
 
     /// Initialize panic hook for better error messages in browser console.
     #[wasm_bindgen(start)]
     pub fn init_panic_hook() {
         console_error_panic_hook::set_once();
+    }
+
+    fn js_args_to_resp(value: &JsValue) -> Result<Vec<Resp>, JsValue> {
+        if !Array::is_array(value) {
+            return Err(JsValue::from_str("command arguments must be an array"));
+        }
+        let array = Array::from(value);
+        let mut args = Vec::with_capacity(array.length() as usize);
+
+        for value in array.iter() {
+            if let Some(text) = value.as_string() {
+                args.push(Resp::bulk_str(text));
+            } else if value.is_null() || value.is_undefined() {
+                return Err(JsValue::from_str("command arguments cannot contain null"));
+            } else if let Some(number) = value.as_f64() {
+                if !number.is_finite() {
+                    return Err(JsValue::from_str("command arguments must be finite"));
+                }
+                let text = if number.fract() == 0.0 {
+                    format!("{number:.0}")
+                } else {
+                    number.to_string()
+                };
+                args.push(Resp::bulk_str(text));
+            } else if let Some(bytes) = value.dyn_ref::<Uint8Array>() {
+                args.push(Resp::bulk(bytes.to_vec()));
+            } else {
+                return Err(JsValue::from_str(
+                    "command arguments must be strings, numbers, or Uint8Array values",
+                ));
+            }
+        }
+
+        if args.is_empty() {
+            return Err(JsValue::from_str(
+                "a command requires at least one argument",
+            ));
+        }
+        Ok(args)
+    }
+
+    fn resp_to_js(value: Resp) -> Result<JsValue, JsValue> {
+        match value {
+            Resp::SimpleString(text) => Ok(JsValue::from_str(&text)),
+            Resp::Error(message) => Err(JsValue::from_str(&message)),
+            Resp::Integer(number) => Ok(JsValue::from_f64(number as f64)),
+            Resp::Double(number) => Ok(JsValue::from_f64(number)),
+            Resp::Bool(value) => Ok(JsValue::from_bool(value)),
+            Resp::BulkString(None) | Resp::Null => Ok(JsValue::NULL),
+            Resp::BulkString(Some(bytes)) => Ok(Uint8Array::from(bytes.as_ref()).into()),
+            Resp::Array(None) => Ok(JsValue::NULL),
+            Resp::Array(Some(values)) | Resp::Set(values) | Resp::Push(values) => {
+                let output = Array::new();
+                for value in values {
+                    output.push(&resp_to_js(value)?);
+                }
+                Ok(output.into())
+            }
+            Resp::Map(pairs) => {
+                let output = Array::new();
+                for (key, value) in pairs {
+                    let pair = Array::new();
+                    pair.push(&resp_to_js(key)?);
+                    pair.push(&resp_to_js(value)?);
+                    output.push(&pair);
+                }
+                Ok(output.into())
+            }
+            Resp::Raw(bytes) => {
+                let mut parser = RespParser::new();
+                parser.feed(&bytes);
+                match parser.parse_one() {
+                    Ok(Some(value)) => resp_to_js(value),
+                    Ok(None) => Err(JsValue::from_str("incomplete command response")),
+                    Err(error) => Err(JsValue::from_str(&error.to_string())),
+                }
+            }
+        }
     }
 
     /// WASM-accessible nexrade store.
@@ -115,6 +194,20 @@ pub mod wasm_bindings {
             Self {
                 store: NexradeStore::new(),
             }
+        }
+
+        /// Execute a command from structured JavaScript arguments.
+        /// Strings and numbers are encoded as Redis bulk strings; Uint8Array
+        /// values are sent as binary-safe bulk strings. The Promise resolves
+        /// to native JavaScript values and rejects Redis errors.
+        pub fn command(&self, args: JsValue) -> Promise {
+            let db = self.store.db.clone();
+
+            future_to_promise(async move {
+                let args = js_args_to_resp(&args)?;
+                let result = dispatch(&db, args, 0).await;
+                resp_to_js(result)
+            })
         }
 
         /// Execute a command (inline format like "SET key value").

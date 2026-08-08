@@ -137,6 +137,9 @@ bash examples/10-wasm/build.sh
 
 **Requires:** `wasm-pack` (`cargo install wasm-pack`)
 
+For the higher-level browser SDK with typed methods, JSON helpers, namespaces,
+TTLs, and optional IndexedDB persistence, see [`@nexrade/local-cache`](../packages/local-cache/README.md).
+
 ---
 
 ## 11-python-patterns — Common redis-py Patterns

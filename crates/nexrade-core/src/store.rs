@@ -658,7 +658,7 @@ impl Database {
             }
             #[cfg(target_arch = "wasm32")]
             {
-                0u128
+                js_sys::Date::now() as u128
             }
         };
 

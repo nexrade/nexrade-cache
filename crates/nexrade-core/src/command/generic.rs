@@ -21,7 +21,7 @@ fn now_unix_ms() -> u128 {
 
 #[cfg(target_arch = "wasm32")]
 fn now_unix_ms() -> u128 {
-    0
+    js_sys::Date::now() as u128
 }
 
 pub async fn cmd_del(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
