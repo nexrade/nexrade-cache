@@ -16,7 +16,7 @@ fn system_now_ms() -> u128 {
 
 #[cfg(target_arch = "wasm32")]
 fn system_now_ms() -> u128 {
-    0
+    js_sys::Date::now() as u128
 }
 
 /// Expiry information for a key.

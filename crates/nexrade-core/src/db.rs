@@ -631,10 +631,17 @@ impl Drop for WaiterGuard<'_> {
 
 /// Read the current Unix timestamp in whole seconds.
 fn current_lru_secs() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as u32
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        (js_sys::Date::now() / 1000.0) as u32
+    }
 }
 
 impl Default for Db {
@@ -711,7 +718,7 @@ pub fn unix_secs() -> u64 {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        0
+        (js_sys::Date::now() / 1000.0) as u64
     }
 }
 

@@ -374,7 +374,7 @@ pub fn now_ms() -> u64 {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        0
+        js_sys::Date::now() as u64
     }
 }
 

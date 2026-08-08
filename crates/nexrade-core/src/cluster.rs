@@ -135,15 +135,18 @@ pub fn generate_node_id() -> String {
     let bytes = Uuid::new_v4();
     let mut out = String::with_capacity(40);
     out.push_str(&hex::encode(bytes.as_bytes()));
-    // 32 chars from UUID. Pad to 40 with a deterministic process-local
-    // counter — process PID + startup nanos.
-    use std::time::SystemTime;
-    let extra = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id() as u128;
-    let combined = extra ^ pid;
+    #[cfg(not(target_arch = "wasm32"))]
+    let combined = {
+        use std::time::SystemTime;
+        let extra = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id() as u128;
+        extra ^ pid
+    };
+    #[cfg(target_arch = "wasm32")]
+    let combined = js_sys::Date::now() as u128;
     out.push_str(&format!("{:08x}", (combined & 0xFFFFFFFF) as u32));
     out
 }

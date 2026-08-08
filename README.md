@@ -42,6 +42,7 @@ Redis is great. But it ships without built-in observability, requires OpenSSL fo
 | **TLS without OpenSSL (rustls)** | ✅ | ⚠️ requires OpenSSL + compile flag |
 | **Plugin API (Rust, no C required)** | ✅ | ⚠️ C module API only |
 | **WebAssembly / edge target** | ✅ | ❌ |
+| **`@nexrade/local-cache` browser SDK** | ✅ | ❌ |
 | **Embeddable Rust library** | ✅ | ❌ |
 | **Multi-core parallel writes (sharded store)** | ✅ | ❌ |
 | Memory-safe (written in Rust) | ✅ | ❌ |
@@ -458,11 +459,35 @@ async fn main() {
 
 ## WebAssembly / Edge Functions
 
-Build for the browser or edge runtimes (Cloudflare Workers, Deno Deploy):
+Build the low-level WASM bindings for browser or edge runtimes (Cloudflare Workers, Deno Deploy):
 
 ```sh
 wasm-pack build crates/nexrade-wasm --target web --features wasm
 ```
+
+For an ergonomic browser cache with typed methods, JSON helpers, binary-safe values, namespaces, TTLs, and optional IndexedDB persistence, use `@nexrade/local-cache`:
+
+```sh
+cd packages/local-cache
+npm install
+npm run build
+```
+
+```javascript
+import { createCache } from '@nexrade/local-cache';
+
+const cache = await createCache({
+  namespace: 'app:',
+  persistence: 'indexeddb',
+});
+
+await cache.setJson('session:123', { active: true }, { ttl: 3600 });
+console.log(await cache.getJson('session:123')); // { active: true }
+```
+
+The package runs the Nexrade storage engine in-process, so normal cache operations do not require a network connection. IndexedDB persistence is a local cache checkpoint, not a replacement for a durable server database.
+
+The lower-level bindings remain available for Redis-compatible command execution:
 
 ```javascript
 import init, { NexradeWasm } from './pkg/nexrade_wasm.js';

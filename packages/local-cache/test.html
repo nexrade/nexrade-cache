@@ -1,0 +1,721 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>@nexrade/local-cache test dashboard</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: #0f172a;
+      color: #e5e7eb;
+    }
+
+    * { box-sizing: border-box; }
+    body { max-width: 1120px; margin: 0 auto; padding: 28px 18px 48px; }
+    h1 { margin: 0 0 8px; color: #93c5fd; }
+    h2 { margin: 26px 0 12px; color: #bfdbfe; font-size: 1rem; }
+    p { color: #9ca3af; line-height: 1.6; }
+
+    .toolbar, .command-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin: 18px 0;
+    }
+
+    button, input, select {
+      border: 1px solid #475569;
+      border-radius: 6px;
+      padding: 9px 12px;
+      background: #1e293b;
+      color: #e5e7eb;
+      font: inherit;
+    }
+
+    button { border: 0; background: #2563eb; cursor: pointer; }
+    button:hover { background: #1d4ed8; }
+    button.secondary { background: #475569; }
+    button.danger { background: #b91c1c; }
+    button:disabled { cursor: wait; opacity: .55; }
+    input { flex: 1 1 360px; min-width: 240px; }
+    select { min-width: 240px; }
+
+    .tests {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 10px;
+    }
+
+    .test-card {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 13px 14px;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      background: #111827;
+    }
+
+    .test-card button { padding: 7px 10px; font-size: .85rem; }
+    .test-name { font-size: .9rem; }
+    .test-meta { display: block; margin-top: 4px; color: #64748b; font-size: .72rem; }
+    .status { min-width: 76px; text-align: right; font-size: .8rem; }
+    .pending { color: #94a3b8; }
+    .running { color: #facc15; }
+    .pass { color: #86efac; }
+    .fail { color: #fca5a5; }
+    .skip { color: #fbbf24; }
+
+    pre {
+      min-height: 300px;
+      max-height: 560px;
+      overflow: auto;
+      margin: 0;
+      padding: 16px;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      background: #020617;
+      color: #dbeafe;
+      white-space: pre-wrap;
+      line-height: 1.5;
+    }
+
+    code { color: #bfdbfe; }
+    .hint { margin: 8px 0; font-size: .8rem; }
+  </style>
+</head>
+<body>
+  <h1>@nexrade/local-cache test dashboard</h1>
+  <p>
+    Build the package first, serve this directory over HTTP, and run the suites below.
+    The tests cover strings, JSON, binary values, TTLs, counters, lists, hashes,
+    sets, sorted sets, streams, bitmaps, namespaces, raw commands, and IndexedDB.
+  </p>
+
+  <div class="toolbar">
+    <button id="run-all">Run all tests</button>
+    <button id="reset-tests" class="secondary">Reset statuses</button>
+    <button id="clear-output" class="secondary">Clear output</button>
+  </div>
+
+  <h2>Test suites</h2>
+  <div id="tests" class="tests"></div>
+
+  <h2>Save / load playground</h2>
+  <p class="hint">
+    This demo uses a persistent IndexedDB cache. Enter <code>SET A '5'</code>, run it,
+    save the snapshot, then load a fresh cache instance and run <code>GET A</code>.
+  </p>
+  <div class="command-row">
+    <input id="persistence-command" value="SET A '5'" placeholder="SET A '5'" />
+    <button id="persistence-run">Run command</button>
+  </div>
+  <div class="command-row">
+    <input id="persistence-key" value="A" placeholder="Key to inspect" />
+    <button id="persistence-save">Save snapshot</button>
+    <button id="persistence-load">Load fresh cache</button>
+    <button id="persistence-export" class="secondary">Export save file</button>
+    <button id="persistence-import" class="secondary">Import save file</button>
+    <input id="persistence-file" type="file" accept=".json,application/json" hidden />
+    <button id="persistence-clear" class="danger">Clear saved data</button>
+  </div>
+  <p id="persistence-state" class="hint">No persistent cache loaded.</p>
+
+  <h2>Interactive raw command</h2>
+  <p class="hint">
+    Raw commands are sent as separate arguments. Use complete keys here; raw commands
+    do not automatically add the high-level API namespace.
+  </p>
+  <div class="command-row">
+    <input id="command-input" value="PING" placeholder="SET demo:key hello" />
+    <button id="run-command">Run command</button>
+  </div>
+
+  <h2>Output</h2>
+  <pre id="output">Build the package first, then run a test.</pre>
+
+  <script type="module">
+    import { createCache } from "./dist/index.js";
+
+    const output = document.querySelector("#output");
+    const testsElement = document.querySelector("#tests");
+    const runAllButton = document.querySelector("#run-all");
+    const resetButton = document.querySelector("#reset-tests");
+    const clearOutputButton = document.querySelector("#clear-output");
+    const commandInput = document.querySelector("#command-input");
+    const runCommandButton = document.querySelector("#run-command");
+    const persistenceCommandInput = document.querySelector("#persistence-command");
+    const persistenceKeyInput = document.querySelector("#persistence-key");
+    const persistenceRunButton = document.querySelector("#persistence-run");
+    const persistenceSaveButton = document.querySelector("#persistence-save");
+    const persistenceLoadButton = document.querySelector("#persistence-load");
+    const persistenceExportButton = document.querySelector("#persistence-export");
+    const persistenceImportButton = document.querySelector("#persistence-import");
+    const persistenceFileInput = document.querySelector("#persistence-file");
+    const persistenceClearButton = document.querySelector("#persistence-clear");
+    const persistenceState = document.querySelector("#persistence-state");
+
+    const runId = `${Date.now()}`;
+    const persistenceOptions = {
+      namespace: "save-load-demo:",
+      persistence: "indexeddb",
+      databaseName: "nexrade-save-load-demo",
+      autoPersist: false,
+    };
+    let persistenceCache;
+    const testDefinitions = [
+      ["strings", "Strings and JSON", "SET, GET, MGET, APPEND, STRLEN, JSON", testStrings],
+      ["expiry", "Expiry and counters", "EXPIRE, TTL, PTTL, INCR, DECR", testExpiryAndCounters],
+      ["lists", "Lists", "LPUSH, RPUSH, LRANGE, LLEN, LPOP", testLists],
+      ["hashes", "Hashes", "HSET, HGET, HGETALL, HEXISTS, HDEL", testHashes],
+      ["sets", "Sets", "SADD, SISMEMBER, SMEMBERS, SCARD", testSets],
+      ["sorted-sets", "Sorted sets", "ZADD, ZRANGE, ZSCORE, ZCARD", testSortedSets],
+      ["streams", "Streams", "XADD, XLEN, XRANGE", testStreams],
+      ["bitmaps", "Bitmaps", "SETBIT, GETBIT, BITCOUNT", testBitmaps],
+      ["namespace", "Namespaces and raw commands", "key isolation, KEYS, SIZE, DEL, CLEAR", testNamespaceAndRaw],
+      ["persistence", "IndexedDB persistence", "persist, restore, TTL preservation", testPersistence],
+    ];
+
+    const statusElements = new Map();
+    let activeCache;
+
+    function print(value) {
+      output.textContent = typeof value === "string"
+        ? value
+        : JSON.stringify(value, replacer, 2);
+    }
+
+    function appendLog(value) {
+      const previous = output.textContent === "Build the package first, then run a test."
+        ? ""
+        : `${output.textContent}\n`;
+      output.textContent = `${previous}${typeof value === "string" ? value : JSON.stringify(value, replacer, 2)}`;
+    }
+
+    function replacer(_key, value) {
+      if (value instanceof Uint8Array) return { bytes: Array.from(value) };
+      return value;
+    }
+
+    function displayValue(value) {
+      if (value instanceof Uint8Array) return new TextDecoder().decode(value);
+      if (Array.isArray(value)) return value.map(displayValue);
+      return value;
+    }
+
+    function text(value) {
+      if (value instanceof Uint8Array) return new TextDecoder().decode(value);
+      return String(value);
+    }
+
+    function bytes(value) {
+      if (!(value instanceof Uint8Array)) throw new Error("expected Uint8Array response");
+      return value;
+    }
+
+    function arrayOfText(value) {
+      if (!Array.isArray(value)) throw new Error("expected array response");
+      return value.map(text);
+    }
+
+    function assert(condition, message) {
+      if (!condition) throw new Error(`Assertion failed: ${message}`);
+    }
+
+    function equal(actual, expected, message) {
+      if (actual !== expected) {
+        throw new Error(`${message}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+      }
+    }
+
+    function updatePersistenceState(message) {
+      persistenceState.textContent = message;
+    }
+
+    async function ensurePersistenceCache() {
+      if (!persistenceCache) {
+        persistenceCache = await createCache(persistenceOptions);
+        updatePersistenceState("Persistent cache ready. Database: nexrade-save-load-demo");
+      }
+      return persistenceCache;
+    }
+
+    function persistenceCommandArgs(line) {
+      const args = parseCommand(line);
+      if (args.length === 0) throw new Error("Enter a command");
+      const command = args[0].toUpperCase();
+      const keyCommands = new Set(["GET", "SET", "DEL", "EXISTS", "TTL", "PTTL", "EXPIRE", "PERSIST"]);
+      if (args.length > 1 && keyCommands.has(command) && !args[1].startsWith(persistenceOptions.namespace)) {
+        args[1] = `${persistenceOptions.namespace}${args[1]}`;
+      }
+      return args;
+    }
+
+    async function runPersistenceCommand() {
+      const line = persistenceCommandInput.value.trim();
+      if (!line) return;
+      persistenceRunButton.disabled = true;
+      try {
+        const cache = await ensurePersistenceCache();
+        const args = persistenceCommandArgs(line);
+        const result = await cache.command(...args);
+        const shown = displayValue(result);
+        appendLog(`[save/load] > ${line}\n${JSON.stringify(shown, replacer, 2)}\n`);
+        updatePersistenceState(`Command complete: ${line}`);
+      } catch (error) {
+        appendLog(`[save/load] > ${line}\nERROR: ${error?.stack || error}\n`);
+        updatePersistenceState("Command failed");
+      } finally {
+        persistenceRunButton.disabled = false;
+      }
+    }
+
+    async function savePersistenceSnapshot() {
+      persistenceSaveButton.disabled = true;
+      try {
+        const cache = await ensurePersistenceCache();
+        await cache.persist();
+        const size = await cache.size();
+        const key = persistenceKeyInput.value.trim() || "A";
+        const value = await cache.get(key);
+        appendLog(`[save/load] SAVED\nkey: ${key}\nvalue: ${JSON.stringify(value)}\nkeys: ${size}\n`);
+        updatePersistenceState(`Saved ${size} key(s) to IndexedDB. ${key}=${JSON.stringify(value)}`);
+      } catch (error) {
+        appendLog(`[save/load] SAVE ERROR\n${error?.stack || error}\n`);
+        updatePersistenceState("Save failed");
+      } finally {
+        persistenceSaveButton.disabled = false;
+      }
+    }
+
+    async function loadPersistenceSnapshot() {
+      persistenceLoadButton.disabled = true;
+      try {
+        persistenceCache = await createCache(persistenceOptions);
+        const key = persistenceKeyInput.value.trim() || "A";
+        const value = await persistenceCache.get(key);
+        const ttl = await persistenceCache.ttl(key);
+        appendLog(`[save/load] LOADED FRESH CACHE\nGET ${key}: ${JSON.stringify(value)}\nTTL: ${ttl}\n`);
+        updatePersistenceState(`Loaded fresh cache. GET ${key} = ${JSON.stringify(value)}`);
+      } catch (error) {
+        appendLog(`[save/load] LOAD ERROR\n${error?.stack || error}\n`);
+        updatePersistenceState("Load failed");
+      } finally {
+        persistenceLoadButton.disabled = false;
+      }
+    }
+
+    async function clearPersistenceSnapshot() {
+      persistenceClearButton.disabled = true;
+      try {
+        const cache = await ensurePersistenceCache();
+        await cache.clearPersisted();
+        await cache.clear();
+        persistenceCache = await createCache(persistenceOptions);
+        const key = persistenceKeyInput.value.trim() || "A";
+        const value = await persistenceCache.get(key);
+        appendLog(`[save/load] CLEARED\nGET ${key}: ${JSON.stringify(value)}\n`);
+        updatePersistenceState("Saved snapshot and in-memory keys cleared.");
+      } catch (error) {
+        appendLog(`[save/load] CLEAR ERROR\n${error?.stack || error}\n`);
+        updatePersistenceState("Clear failed");
+      } finally {
+        persistenceClearButton.disabled = false;
+      }
+    }
+
+    function encodeBase64(bytes) {
+      let binary = "";
+      for (const byte of bytes) binary += String.fromCharCode(byte);
+      return btoa(binary);
+    }
+
+    function decodeBase64(value) {
+      if (typeof value !== "string" || !value) throw new Error("Invalid base64 value");
+      const binary = atob(value);
+      return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    }
+
+    async function exportPersistenceFile() {
+      persistenceExportButton.disabled = true;
+      try {
+        const cache = await ensurePersistenceCache();
+        const entries = [];
+        for (const key of await cache.keys()) {
+          const fullKey = `${persistenceOptions.namespace}${key}`;
+          const dump = await cache.command("DUMP", fullKey);
+          if (!(dump instanceof Uint8Array)) continue;
+          entries.push({
+            key,
+            dump: encodeBase64(dump),
+            ttlMs: await cache.command("PTTL", fullKey),
+          });
+        }
+
+        const snapshot = {
+          format: "nexrade-local-cache",
+          version: 1,
+          namespace: persistenceOptions.namespace,
+          databaseName: persistenceOptions.databaseName,
+          createdAt: new Date().toISOString(),
+          entries,
+        };
+        const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "nexrade-cache-save.json";
+        link.click();
+        URL.revokeObjectURL(url);
+        appendLog(`[save/load] EXPORTED\nfile: nexrade-cache-save.json\nkeys: ${entries.length}\n`);
+        updatePersistenceState(`Exported ${entries.length} key(s) to nexrade-cache-save.json.`);
+      } catch (error) {
+        appendLog(`[save/load] EXPORT ERROR\n${error?.stack || error}\n`);
+        updatePersistenceState("Export failed");
+      } finally {
+        persistenceExportButton.disabled = false;
+      }
+    }
+
+    async function importPersistenceFile(file) {
+      persistenceImportButton.disabled = true;
+      try {
+        const snapshot = JSON.parse(await file.text());
+        if (snapshot?.format !== "nexrade-local-cache" || snapshot?.version !== 1) {
+          throw new Error("Unsupported Nexrade save file format");
+        }
+        if (snapshot.namespace !== persistenceOptions.namespace) {
+          throw new Error("Save file namespace does not match this playground");
+        }
+        if (!Array.isArray(snapshot.entries)) throw new Error("Save file entries are invalid");
+
+        const cache = await ensurePersistenceCache();
+        await cache.clear();
+        for (const entry of snapshot.entries) {
+          if (typeof entry.key !== "string") throw new Error("Save file contains an invalid key");
+          const ttlMs = Number(entry.ttlMs);
+          if (!Number.isInteger(ttlMs) || ttlMs < 0) throw new Error(`Invalid TTL for key ${entry.key}`);
+          const payload = decodeBase64(entry.dump);
+          const fullKey = `${persistenceOptions.namespace}${entry.key}`;
+          await cache.command("RESTORE", fullKey, ttlMs, payload, "REPLACE");
+        }
+        await cache.persist();
+        persistenceCache = await createCache(persistenceOptions);
+        const key = persistenceKeyInput.value.trim() || "A";
+        const value = await persistenceCache.get(key);
+        appendLog(`[save/load] IMPORTED\nfile: ${file.name}\nkeys: ${snapshot.entries.length}\nGET ${key}: ${JSON.stringify(value)}\n`);
+        updatePersistenceState(`Imported ${snapshot.entries.length} key(s) from ${file.name}. ${key}=${JSON.stringify(value)}`);
+      } catch (error) {
+        appendLog(`[save/load] IMPORT ERROR\n${error?.stack || error}\n`);
+        updatePersistenceState("Import failed");
+      } finally {
+        persistenceFileInput.value = "";
+        persistenceImportButton.disabled = false;
+      }
+    }
+
+    function renderTestCards() {
+      testsElement.innerHTML = "";
+      for (const [id, name, description] of testDefinitions) {
+        const card = document.createElement("div");
+        card.className = "test-card";
+        card.innerHTML = `
+          <div>
+            <span class="test-name">${name}</span>
+            <span class="test-meta">${description}</span>
+          </div>
+          <button data-test="${id}">Run</button>
+          <span class="status pending" data-status="${id}">pending</span>
+        `;
+        card.querySelector("button").addEventListener("click", () => runTest(id));
+        testsElement.append(card);
+        statusElements.set(id, card.querySelector(`[data-status="${id}"]`));
+      }
+    }
+
+    function setStatus(id, status, detail = "") {
+      const element = statusElements.get(id);
+      if (!element) return;
+      element.className = `status ${status}`;
+      element.textContent = detail || status;
+    }
+
+    function setButtonsDisabled(disabled) {
+      document.querySelectorAll("button").forEach((button) => {
+        button.disabled = disabled;
+      });
+    }
+
+    async function withMemoryCache(label, callback) {
+      const prefix = `local-test:${label}:${runId}:${Date.now()}:`;
+      const cache = await createCache({ namespace: prefix });
+      try {
+        return await callback(cache, prefix);
+      } finally {
+        await cache.clear();
+      }
+    }
+
+    async function withPersistenceCache(callback) {
+      if (!("indexedDB" in window)) {
+        return { skipped: true, reason: "IndexedDB is not available in this browser" };
+      }
+      const options = {
+        namespace: `local-persistence:${runId}:`,
+        persistence: "indexeddb",
+        databaseName: `nexrade-local-cache-test-${runId}`,
+        autoPersist: false,
+      };
+      const cache = await createCache(options);
+      try {
+        return await callback(cache, options);
+      } finally {
+        await cache.clearPersisted();
+        await cache.clear();
+      }
+    }
+
+    async function runTest(id) {
+      const definition = testDefinitions.find(([testId]) => testId === id);
+      if (!definition) return;
+      const [, name, , test] = definition;
+      setButtonsDisabled(true);
+      setStatus(id, "running", "running");
+      print(`${name}\n\nRunning...`);
+      const started = performance.now();
+
+      try {
+        const result = await test();
+        const elapsed = Math.round(performance.now() - started);
+        if (result?.skipped) {
+          setStatus(id, "skip", "skipped");
+          print(`${name}\n\nSKIPPED\n\n${result.reason}`);
+        } else {
+          setStatus(id, "pass", `PASS ${elapsed}ms`);
+          print(`${name}\n\nPASS (${elapsed}ms)\n\n${JSON.stringify(result, replacer, 2)}`);
+        }
+      } catch (error) {
+        const elapsed = Math.round(performance.now() - started);
+        setStatus(id, "fail", `FAIL ${elapsed}ms`);
+        print(`${name}\n\nFAIL (${elapsed}ms)\n\n${error?.stack || error}`);
+      } finally {
+        setButtonsDisabled(false);
+      }
+    }
+
+    async function runAll() {
+      setButtonsDisabled(true);
+      for (const [id] of testDefinitions) {
+        setButtonsDisabled(true);
+        await runTest(id);
+      }
+      setButtonsDisabled(false);
+    }
+
+    async function testStrings() {
+      return withMemoryCache("strings", async (cache, prefix) => {
+        equal(await cache.set("greeting", "hello"), true, "SET");
+        equal(await cache.get("greeting"), "hello", "GET");
+        equal(await cache.setJson("user", { name: "Ada", active: true }), true, "SET JSON");
+        const user = await cache.getJson("user");
+        assert(user?.name === "Ada" && user?.active === true, "JSON round-trip");
+
+        const multi = await cache.command("MGET", `${prefix}greeting`, `${prefix}user`);
+        equal(text(multi[0]), "hello", "MGET first value");
+        assert(multi[1] instanceof Uint8Array, "MGET second value should be bytes");
+        equal(await cache.command("APPEND", `${prefix}greeting`, " world"), 11, "APPEND length");
+        equal(await cache.get("greeting"), "hello world", "APPEND value");
+        equal(await cache.command("STRLEN", `${prefix}greeting`), 11, "STRLEN");
+
+        return { user, mget: displayValue(multi), greeting: await cache.get("greeting") };
+      });
+    }
+
+    async function testExpiryAndCounters() {
+      return withMemoryCache("expiry", async (cache) => {
+        equal(await cache.incr("counter"), 1, "INCR");
+        equal(await cache.incr("counter", 4), 5, "INCRBY");
+        equal(await cache.decr("counter"), 4, "DECR");
+        equal(await cache.decr("counter", 2), 2, "DECRBY");
+        equal(await cache.set("temporary", "value", { ttl: 30 }), true, "SET EX");
+        const ttl = await cache.ttl("temporary");
+        const pttl = await cache.command("PTTL", "local-test:expiry:missing");
+        assert(ttl > 0 && ttl <= 30, "TTL range");
+        assert(pttl === -2, "missing PTTL");
+        equal(await cache.expire("temporary", 60), true, "EXPIRE");
+        assert((await cache.ttl("temporary")) > 0, "updated TTL");
+        return { counter: await cache.get("counter"), ttl: await cache.ttl("temporary") };
+      });
+    }
+
+    async function testLists() {
+      return withMemoryCache("lists", async (cache, prefix) => {
+        equal(await cache.command("RPUSH", `${prefix}queue`, "job:1", "job:2"), 2, "RPUSH");
+        equal(await cache.command("LPUSH", `${prefix}queue`, "job:0"), 3, "LPUSH");
+        equal(await cache.command("LLEN", `${prefix}queue`), 3, "LLEN");
+        const range = await cache.command("LRANGE", `${prefix}queue`, 0, -1);
+        equal(JSON.stringify(arrayOfText(range)), JSON.stringify(["job:0", "job:1", "job:2"]), "LRANGE");
+        equal(text(await cache.command("LPOP", `${prefix}queue`)), "job:0", "LPOP");
+        return { range: arrayOfText(range), remaining: await cache.command("LRANGE", `${prefix}queue`, 0, -1) };
+      });
+    }
+
+    async function testHashes() {
+      return withMemoryCache("hashes", async (cache, prefix) => {
+        equal(await cache.command("HSET", `${prefix}profile`, "name", "Ada", "role", "admin"), 2, "HSET");
+        equal(text(await cache.command("HGET", `${prefix}profile`, "name")), "Ada", "HGET");
+        equal(await cache.command("HEXISTS", `${prefix}profile`, "role"), 1, "HEXISTS");
+        const values = await cache.command("HGETALL", `${prefix}profile`);
+        equal(await cache.command("HDEL", `${prefix}profile`, "role"), 1, "HDEL");
+        equal(await cache.command("HEXISTS", `${prefix}profile`, "role"), 0, "HEXISTS after HDEL");
+        return { values: arrayOfText(values), remaining: displayValue(await cache.command("HGETALL", `${prefix}profile`)) };
+      });
+    }
+
+    async function testSets() {
+      return withMemoryCache("sets", async (cache, prefix) => {
+        equal(await cache.command("SADD", `${prefix}tags`, "rust", "wasm", "rust"), 2, "SADD");
+        equal(await cache.command("SISMEMBER", `${prefix}tags`, "wasm"), 1, "SISMEMBER true");
+        equal(await cache.command("SISMEMBER", `${prefix}tags`, "python"), 0, "SISMEMBER false");
+        const members = arrayOfText(await cache.command("SMEMBERS", `${prefix}tags`)).sort();
+        equal(JSON.stringify(members), JSON.stringify(["rust", "wasm"]), "SMEMBERS");
+        equal(await cache.command("SCARD", `${prefix}tags`), 2, "SCARD");
+        return { members, cardinality: await cache.command("SCARD", `${prefix}tags`) };
+      });
+    }
+
+    async function testSortedSets() {
+      return withMemoryCache("sorted-sets", async (cache, prefix) => {
+        equal(await cache.command("ZADD", `${prefix}scores`, 100, "alice", 200, "bob"), 2, "ZADD");
+        equal(await cache.command("ZCARD", `${prefix}scores`), 2, "ZCARD");
+        equal(text(await cache.command("ZSCORE", `${prefix}scores`, "bob")), "200", "ZSCORE");
+        const range = arrayOfText(await cache.command("ZRANGE", `${prefix}scores`, 0, -1, "WITHSCORES"));
+        equal(JSON.stringify(range), JSON.stringify(["alice", "100", "bob", "200"]), "ZRANGE WITHSCORES");
+        return { range };
+      });
+    }
+
+    async function testStreams() {
+      return withMemoryCache("streams", async (cache, prefix) => {
+        const id = text(await cache.command("XADD", `${prefix}events`, "*", "event", "login"));
+        assert(id.length > 0, "XADD should return an id");
+        equal(await cache.command("XLEN", `${prefix}events`), 1, "XLEN");
+        const range = await cache.command("XRANGE", `${prefix}events`, "-", "+");
+        assert(Array.isArray(range) && range.length === 1, "XRANGE should return one entry");
+        return { id, range: displayValue(range) };
+      });
+    }
+
+    async function testBitmaps() {
+      return withMemoryCache("bitmaps", async (cache, prefix) => {
+        equal(await cache.command("SETBIT", `${prefix}flags`, 1, 1), 0, "SETBIT old value");
+        equal(await cache.command("GETBIT", `${prefix}flags`, 1), 1, "GETBIT set bit");
+        equal(await cache.command("GETBIT", `${prefix}flags`, 2), 0, "GETBIT unset bit");
+        equal(await cache.command("BITCOUNT", `${prefix}flags`), 1, "BITCOUNT");
+        return { bit1: await cache.command("GETBIT", `${prefix}flags`, 1), bitCount: await cache.command("BITCOUNT", `${prefix}flags`) };
+      });
+    }
+
+    async function testNamespaceAndRaw() {
+      return withMemoryCache("namespace", async (cache, prefix) => {
+        await cache.set("visible", "yes");
+        await cache.command("SET", `${prefix}raw`, "binary-safe");
+        equal(await cache.get("raw"), "binary-safe", "raw key visible through high-level API");
+        const raw = bytes(await cache.command("GET", `${prefix}raw`));
+        equal(text(raw), "binary-safe", "raw GET");
+        const keys = await cache.keys();
+        assert(keys.includes("visible") && keys.includes("raw"), "namespace keys");
+        assert(keys.every((key) => !key.includes(prefix)), "namespace prefix leaked");
+        equal(await cache.size(), 2, "namespace size");
+        equal(await cache.delete("visible"), 1, "namespace DEL");
+        await cache.clear();
+        equal(await cache.size(), 0, "namespace CLEAR");
+        return { prefix, raw: text(raw), keysBeforeClear: keys, finalSize: await cache.size() };
+      });
+    }
+
+    async function testPersistence() {
+      return withPersistenceCache(async (first, options) => {
+        await first.set("plain", "persisted value");
+        await first.setJson("json", { persisted: true });
+        await first.set("binary", new Uint8Array([10, 20, 255]));
+        await first.set("temporary", "still alive", { ttl: 60 });
+        await first.persist();
+
+        const second = await createCache(options);
+        const plain = await second.get("plain");
+        const json = await second.getJson("json");
+        const binary = await second.getBytes("binary");
+        const temporary = await second.get("temporary");
+        const ttl = await second.ttl("temporary");
+        equal(plain, "persisted value", "plain restore");
+        assert(json?.persisted === true, "JSON restore");
+        equal(JSON.stringify(Array.from(binary || [])), JSON.stringify([10, 20, 255]), "binary restore");
+        equal(temporary, "still alive", "TTL value restore");
+        assert(ttl > 0 && ttl <= 60, "restored TTL range");
+        await second.clearPersisted();
+        return { plain, json, binary: Array.from(binary || []), temporary, ttl, size: await second.size() };
+      });
+    }
+
+    function parseCommand(line) {
+      const parts = [];
+      const pattern = /"((?:\\.|[^"\\])*)"|'([^']*)'|([^\s]+)/g;
+      let match;
+      while ((match = pattern.exec(line)) !== null) {
+        parts.push(match[1] ?? match[2] ?? match[3]);
+      }
+      return parts;
+    }
+
+    async function runInteractiveCommand() {
+      const line = commandInput.value.trim();
+      if (!line) return;
+      runCommandButton.disabled = true;
+      try {
+        if (!activeCache) {
+          activeCache = await createCache({ namespace: "interactive:" });
+        }
+        const args = parseCommand(line);
+        if (args.length === 0) throw new Error("Enter a command");
+        const result = await activeCache.command(...args);
+        appendLog(`> ${line}\n${JSON.stringify(displayValue(result), replacer, 2)}\n`);
+      } catch (error) {
+        appendLog(`> ${line}\nERROR: ${error?.stack || error}\n`);
+      } finally {
+        runCommandButton.disabled = false;
+      }
+    }
+
+    commandInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") runInteractiveCommand();
+    });
+
+    renderTestCards();
+    runAllButton.addEventListener("click", runAll);
+    resetButton.addEventListener("click", () => {
+      for (const [id] of testDefinitions) setStatus(id, "pending", "pending");
+      print("Statuses reset.");
+    });
+    clearOutputButton.addEventListener("click", () => print("Output cleared."));
+    runCommandButton.addEventListener("click", runInteractiveCommand);
+    persistenceRunButton.addEventListener("click", runPersistenceCommand);
+    persistenceSaveButton.addEventListener("click", savePersistenceSnapshot);
+    persistenceLoadButton.addEventListener("click", loadPersistenceSnapshot);
+    persistenceExportButton.addEventListener("click", exportPersistenceFile);
+    persistenceImportButton.addEventListener("click", () => persistenceFileInput.click());
+    persistenceFileInput.addEventListener("change", () => {
+      const file = persistenceFileInput.files?.[0];
+      if (file) importPersistenceFile(file);
+    });
+    persistenceClearButton.addEventListener("click", clearPersistenceSnapshot);
+    persistenceCommandInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") runPersistenceCommand();
+    });
+  </script>
+</body>
+</html>

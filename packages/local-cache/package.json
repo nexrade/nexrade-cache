@@ -1,0 +1,50 @@
+{
+  "name": "@nexrade/local-cache",
+  "version": "1.4.2",
+  "description": "A fast, Redis-compatible local cache for browsers, PWAs, and edge applications",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nexrade/nexrade-cache.git",
+    "directory": "packages/local-cache"
+  },
+  "keywords": [
+    "cache",
+    "redis",
+    "wasm",
+    "webassembly",
+    "offline-first",
+    "indexeddb"
+  ],
+  "type": "module",
+  "files": [
+    "dist",
+    "wasm",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "build:ts": "tsc -p tsconfig.json",
+    "build": "npm run build:wasm && npm run build:ts",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true}); require('node:fs').rmSync('wasm',{recursive:true,force:true})\""
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}

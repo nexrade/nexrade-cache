@@ -1058,6 +1058,7 @@ dependencies = [
  "hex",
  "indexmap",
  "itoa",
+ "js-sys",
  "libc",
  "ordered-float",
  "parking_lot",
