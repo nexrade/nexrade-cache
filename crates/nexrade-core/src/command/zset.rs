@@ -28,18 +28,22 @@ fn get_or_create_zset<'a>(
 /// Parse a Redis score bound string.
 /// Returns `(value, is_exclusive)` where `is_exclusive` corresponds to `(` prefix.
 fn parse_score_bound(s: &str) -> Result<(f64, bool)> {
-    match s {
-        "+inf" | "+INF" => Ok((f64::INFINITY, false)),
-        "-inf" | "-INF" => Ok((f64::NEG_INFINITY, false)),
-        s if s.starts_with('(') => {
-            let v = s[1..].parse::<f64>().map_err(|_| NexradeError::NotFloat)?;
-            Ok((v, true))
-        }
-        s => {
-            let v = s.parse::<f64>().map_err(|_| NexradeError::NotFloat)?;
-            Ok((v, false))
-        }
+    let (body, excl) = match s.strip_prefix('(') {
+        Some(rest) => (rest, true),
+        None => (s.strip_prefix('[').unwrap_or(s), false),
+    };
+    let v = match body {
+        "+inf" | "+INF" => f64::INFINITY,
+        "-inf" | "-INF" => f64::NEG_INFINITY,
+        other => other.parse::<f64>().map_err(|_| NexradeError::NotFloat)?,
+    };
+    // `parse::<f64>` accepts "NaN"/"nan", but every comparison against NaN is
+    // false, so a NaN bound silently returned an empty array instead of the
+    // error Redis raises. Worse, a NaN bound would defeat `min > max` checks.
+    if v.is_nan() {
+        return Err(NexradeError::NotFloat);
     }
+    Ok((v, excl))
 }
 
 pub async fn cmd_zadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
@@ -100,7 +104,7 @@ pub async fn cmd_zadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     if incr {
         if args.len() - i != 2 {
             return Err(NexradeError::Generic(
-                "ERR INCR option supports a single increment-element pair".to_string(),
+                "INCR option supports a single increment-element pair".to_string(),
             ));
         }
     } else if (i + 1) >= args.len() || (args.len() - i) % 2 != 0 {
@@ -108,6 +112,13 @@ pub async fn cmd_zadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     }
 
     let mut store_db = db.store.db(db_index).write_for(&key);
+    // `XX` means "only if the key already exists". Creating the (empty) sorted
+    // set first left a phantom key behind: `ZADD nosuchkey XX 1 m` replied 0
+    // and still conjured the key into existence, so a `DBSIZE` sweep and the
+    // eventual-eviction policy both saw a key the client never wrote.
+    if xx && store_db.get(&key).is_none() {
+        return Ok(if incr { Resp::null() } else { Resp::int(0) });
+    }
     let zset = get_or_create_zset(&mut store_db, &key)?;
     // Payload is member bytes only (score is not counted). New members
     // contribute +member.len(); score-only updates contribute 0.
@@ -308,18 +319,125 @@ async fn rank(db: &Db, args: &[Resp], db_index: usize, rev: bool, cmd: &str) -> 
     }
 }
 
+/// How `ZRANGE`'s two bound arguments should be read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ZRangeKind {
+    Rank,
+    Score,
+    Lex,
+}
+
+/// Strip a leading `(` / `[` range-exclusion marker from a bound token.
+fn strip_exclusive(s: &str) -> &str {
+    s.strip_prefix('(')
+        .or_else(|| s.strip_prefix('['))
+        .unwrap_or(s)
+}
+
+/// `(lower bound, lower exclusive, upper bound, upper exclusive)`. `None`
+/// bounds are unbounded, matching Redis's `-` / `+` sentinels.
+type LexBounds = (Option<Vec<u8>>, bool, Option<Vec<u8>>, bool);
+
+/// Parse `ZRANGEBYLEX`-style `min max` bounds. `-` / `+` mean unbounded; a
+/// leading `(` makes that side exclusive. Shared with the unified `ZRANGE`
+/// path so both spell `BYLEX` identically.
+fn parse_lex_bounds(min_s: &str, max_s: &str) -> Result<LexBounds> {
+    let min_excl = min_s.starts_with('(');
+    let max_excl = max_s.starts_with('(');
+    // "-" = no lower bound; "+" = no upper bound (None means unbounded).
+    // Using an Option avoids the [0xFF;256] sentinel which would silently
+    // exclude members whose bytes exceed that fixed-length value.
+    let min_b: Option<Vec<u8>> = if min_s == "-" {
+        None
+    } else {
+        Some(strip_exclusive(min_s).as_bytes().to_vec())
+    };
+    let max_b: Option<Vec<u8>> = if max_s == "+" {
+        None
+    } else {
+        Some(strip_exclusive(max_s).as_bytes().to_vec())
+    };
+    Ok((min_b, min_excl, max_b, max_excl))
+}
+
+/// `ZRANGE key start stop [BYSCORE | BYLEX] [REV] [LIMIT offset count]
+///  [WITHSCORES]`
+///
+/// The options decide how `start`/`stop` are interpreted. This handler used to
+/// look only at `args[4]` for `WITHSCORES` and unconditionally treat the bounds
+/// as ranks, so `ZRANGE k - + BYLEX` and `ZRANGE k 0 -1 BYSCORE LIMIT 0 10`
+/// silently returned the *whole* sorted set — a client asking for ten items
+/// got every member, in the wrong order.
 pub async fn cmd_zrange(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     if args.len() < 4 {
         return Err(NexradeError::WrongArity("zrange".to_string()));
     }
     let key = get_bytes_vec(args, 1, "ZRANGE")?;
-    let start = get_i64(args, 2, "ZRANGE")?;
-    let stop = get_i64(args, 3, "ZRANGE")?;
-    let withscores = args
-        .get(4)
-        .and_then(|a| a.as_str())
-        .map(|s| s.eq_ignore_ascii_case("WITHSCORES"))
-        .unwrap_or(false);
+    let first = get_str(args, 2, "ZRANGE")?;
+    let second = get_str(args, 3, "ZRANGE")?;
+
+    let mut i = 4;
+    let mut withscores = false;
+    let mut rev = false;
+    let mut kind: Option<ZRangeKind> = None;
+    let mut offset = 0usize;
+    let mut count: Option<usize> = None;
+
+    while i < args.len() {
+        match get_str(args, i, "ZRANGE")?.to_uppercase().as_str() {
+            "WITHSCORES" => {
+                withscores = true;
+                i += 1;
+            }
+            "REV" => {
+                rev = true;
+                i += 1;
+            }
+            "BYSCORE" => {
+                kind = Some(ZRangeKind::Score);
+                i += 1;
+            }
+            "BYLEX" => {
+                kind = Some(ZRangeKind::Lex);
+                i += 1;
+            }
+            "LIMIT" => {
+                let off = get_i64(args, i + 1, "ZRANGE")?;
+                let cnt = get_i64(args, i + 2, "ZRANGE")?;
+                if off < 0 || cnt < 0 {
+                    return Err(NexradeError::Generic("LIMIT can't be negative".to_string()));
+                }
+                offset = off as usize;
+                count = Some(cnt as usize);
+                i += 3;
+            }
+            _ => return Err(NexradeError::SyntaxError),
+        }
+    }
+
+    // A `+`/`-` bound is the caller saying "not a rank". Redis resolves that
+    // ambiguity as a score range when both sides parse as numbers, and as a
+    // lex range otherwise.
+    let kind = match kind {
+        Some(k) => k,
+        None if first == "+" || first == "-" || second == "+" || second == "-" => {
+            let numeric = strip_exclusive(first).parse::<f64>().is_ok()
+                && strip_exclusive(second).parse::<f64>().is_ok();
+            if numeric {
+                ZRangeKind::Score
+            } else {
+                ZRangeKind::Lex
+            }
+        }
+        None => ZRangeKind::Rank,
+    };
+
+    if kind == ZRangeKind::Rank && count.is_some() {
+        return Err(NexradeError::Generic(
+            "syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX"
+                .to_string(),
+        ));
+    }
 
     let store_db = db.store.db(db_index).read_for(&key);
 
@@ -327,9 +445,50 @@ pub async fn cmd_zrange(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
         None => Ok(Resp::array(vec![])),
         Some(e) => match &e.value {
             DataType::ZSet(z) => {
-                let entries = z.range_by_rank(start as isize, stop as isize, false);
-                let result = format_zrange_result(entries, withscores);
-                Ok(Resp::array(result))
+                let out = match kind {
+                    ZRangeKind::Rank => {
+                        let start: i64 = first.parse().map_err(|_| NexradeError::NotInteger)?;
+                        let stop: i64 = second.parse().map_err(|_| NexradeError::NotInteger)?;
+                        format_zrange_result(
+                            z.range_by_rank(start as isize, stop as isize, rev),
+                            withscores,
+                        )
+                    }
+                    ZRangeKind::Score => {
+                        let (min, min_excl) = parse_score_bound(first)?;
+                        let (max, max_excl) = parse_score_bound(second)?;
+                        format_zrange_result(
+                            z.range_by_score(min, min_excl, max, max_excl, rev, offset, count),
+                            withscores,
+                        )
+                    }
+                    ZRangeKind::Lex => {
+                        let (min_b, min_excl, max_b, max_excl) = parse_lex_bounds(first, second)?;
+                        let mut members = z.range_by_lex_members(
+                            min_b.as_deref(),
+                            min_excl,
+                            max_b.as_deref(),
+                            max_excl,
+                        );
+                        if rev {
+                            members.reverse();
+                        }
+                        let mut out =
+                            Vec::with_capacity(members.len().min(count.unwrap_or(usize::MAX)));
+                        for m in members
+                            .into_iter()
+                            .skip(offset)
+                            .take(count.unwrap_or(usize::MAX))
+                        {
+                            if withscores {
+                                out.push(Resp::bulk_str(format_float(z.score(&m).unwrap_or(0.0))));
+                            }
+                            out.push(Resp::bulk(Bytes::from(m)));
+                        }
+                        out
+                    }
+                };
+                Ok(Resp::array(out))
             }
             _ => Err(NexradeError::WrongType),
         },
@@ -404,13 +563,21 @@ async fn range_by_score(
                 i += 1;
             }
             "LIMIT" => {
-                offset = get_i64(args, i + 1, cmd)? as usize;
-                count = Some(get_i64(args, i + 2, cmd)? as usize);
+                let off = get_i64(args, i + 1, cmd)?;
+                let cnt = get_i64(args, i + 2, cmd)?;
+                // Both were cast straight to `usize`, so `LIMIT -1 ...`
+                // became a multi-exabyte offset and silently returned nothing.
+                if off < 0 || cnt < 0 {
+                    return Err(NexradeError::Generic("LIMIT can't be negative".to_string()));
+                }
+                offset = off as usize;
+                count = Some(cnt as usize);
                 i += 3;
             }
-            _ => {
-                i += 1;
-            }
+            // An unrecognised option used to be skipped one token at a time,
+            // so a typo like `LIMTI 0 5` silently dropped the LIMIT and
+            // returned the whole range.
+            _ => return Err(NexradeError::SyntaxError),
         }
     }
 
@@ -436,22 +603,7 @@ pub async fn cmd_zrangebylex(db: &Db, args: &[Resp], db_index: usize) -> Result<
     let key = get_bytes_vec(args, 1, "ZRANGEBYLEX")?;
     let min_s = get_str(args, 2, "ZRANGEBYLEX")?;
     let max_s = get_str(args, 3, "ZRANGEBYLEX")?;
-
-    let min_excl = min_s.starts_with('(');
-    let max_excl = max_s.starts_with('(');
-    // "-" = no lower bound; "+" = no upper bound (None means unbounded).
-    // Using an Option avoids the [0xFF;256] sentinel which would silently
-    // exclude members whose bytes exceed that fixed-length value.
-    let min_b: Option<Vec<u8>> = if min_s == "-" {
-        None
-    } else {
-        Some(min_s.trim_start_matches(['[', '(']).as_bytes().to_vec())
-    };
-    let max_b: Option<Vec<u8>> = if max_s == "+" {
-        None
-    } else {
-        Some(max_s.trim_start_matches(['[', '(']).as_bytes().to_vec())
-    };
+    let (min_b, min_excl, max_b, max_excl) = parse_lex_bounds(min_s, max_s)?;
 
     let store_db = db.store.db(db_index).read_for(&key);
 
@@ -665,7 +817,7 @@ async fn zpop(db: &Db, args: &[Resp], db_index: usize, max: bool, cmd: &str) -> 
         let n = get_i64(args, 2, cmd)?;
         if n < 0 {
             return Err(NexradeError::Generic(
-                "ERR value is not an integer or out of range".to_string(),
+                "value is not an integer or out of range".to_string(),
             ));
         }
         n as usize
@@ -792,8 +944,10 @@ pub async fn cmd_zrandmember(db: &Db, args: &[Resp], db_index: usize) -> Result<
                     Some(n) => {
                         let mut result = Vec::new();
                         if n < 0 {
-                            // Negative count: allow duplicates, return exactly |n|.
-                            let take = n.unsigned_abs() as usize;
+                            // Negative count: allow duplicates, return |n|
+                            // (capped — see `MAX_RANDOM_SAMPLE`).
+                            let take =
+                                (n.unsigned_abs() as usize).min(crate::command::MAX_RANDOM_SAMPLE);
                             for _ in 0..take {
                                 let idx = pseudo_rand_idx(pairs.len());
                                 let (m, s) = &pairs[idx];
@@ -842,11 +996,7 @@ async fn bzpop(db: &Db, args: &[Resp], db_index: usize, max: bool, cmd: &str) ->
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let dur = if timeout_secs == 0.0 {
-            std::time::Duration::from_secs(u64::MAX)
-        } else {
-            std::time::Duration::from_secs_f64(timeout_secs)
-        };
+        let dur = crate::command::blocking_duration(timeout_secs, cmd)?;
         match tokio::time::timeout(dur, async {
             let _parked = db.park_zset_waiter();
             loop {
@@ -856,18 +1006,26 @@ async fn bzpop(db: &Db, args: &[Resp], db_index: usize, max: bool, cmd: &str) ->
                 let notified = db.zset_chan.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                #[cfg(not(target_arch = "wasm32"))]
-                let _permit = match db.persistence.enter_mutation() {
-                    Some(p) => p,
-                    None => {
-                        return Err(NexradeError::Generic(
-                            "MISCONF persistence is quiescing; writes are temporarily disabled"
-                                .to_string(),
-                        ))
+                // The mutation permit is scoped to this block so it is
+                // released *before* `notified.await`. Holding it across the
+                // park keeps `active_mutations` permanently above zero,
+                // which wedges every `quiesce()` caller — the server goes
+                // permanently read-only ("MISCONF persistence is
+                // quiescing") as soon as any BGSAVE or shutdown waits on
+                // it, and never recovers until restart.
+                {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _permit =
+                        match db.persistence.enter_mutation() {
+                            Some(p) => p,
+                            None => return Err(NexradeError::Generic(
+                                "MISCONF persistence is quiescing; writes are temporarily disabled"
+                                    .to_string(),
+                            )),
+                        };
+                    if let Some(resp) = bzpop_attempt(db, db_index, &keys, max)? {
+                        return Ok::<Resp, NexradeError>(resp);
                     }
-                };
-                if let Some(resp) = bzpop_attempt(db, db_index, &keys, max)? {
-                    return Ok::<Resp, NexradeError>(resp);
                 }
                 notified.await;
             }
@@ -1338,11 +1496,7 @@ pub async fn cmd_bzmpop(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let dur = if timeout_secs == 0.0 {
-            std::time::Duration::from_secs(u64::MAX)
-        } else {
-            std::time::Duration::from_secs_f64(timeout_secs)
-        };
+        let dur = crate::command::blocking_duration(timeout_secs, "BZMPOP")?;
         // Wait on the dedicated zset notify so ZADD / ZINCRBY / Z*STORE actually
         // wake us. list_chan only fires on list/stream pushes.
         match tokio::time::timeout(dur, async {
@@ -1352,18 +1506,20 @@ pub async fn cmd_bzmpop(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
                 let notified = db.zset_chan.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                #[cfg(not(target_arch = "wasm32"))]
-                let _permit = match db.persistence.enter_mutation() {
-                    Some(p) => p,
-                    None => {
-                        return Err(NexradeError::Generic(
-                            "MISCONF persistence is quiescing; writes are temporarily disabled"
-                                .to_string(),
-                        ))
+                // Permit scoped to the mutation attempt only — see bzpop.
+                {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _permit =
+                        match db.persistence.enter_mutation() {
+                            Some(p) => p,
+                            None => return Err(NexradeError::Generic(
+                                "MISCONF persistence is quiescing; writes are temporarily disabled"
+                                    .to_string(),
+                            )),
+                        };
+                    if let Some(resp) = zmpop_attempt(db, db_index, &keys, min, count)? {
+                        return Ok::<Resp, NexradeError>(resp);
                     }
-                };
-                if let Some(resp) = zmpop_attempt(db, db_index, &keys, min, count)? {
-                    return Ok::<Resp, NexradeError>(resp);
                 }
                 notified.await;
             }
@@ -1406,7 +1562,10 @@ fn zmpop_attempt(
                     continue;
                 }
                 let mut delta: isize = 0;
-                let mut popped: Vec<Resp> = Vec::with_capacity(count);
+                // Clamp to the set's real size — `count` is client-supplied
+                // and unbounded, and the loop below breaks out as soon as the
+                // set is exhausted anyway.
+                let mut popped: Vec<Resp> = Vec::with_capacity(count.min(z.len()));
                 for _ in 0..count {
                     // min=true → pop lowest; min=false → pop highest
                     let Some((score, member)) = z.pop_extreme(!min) else {
@@ -1693,12 +1852,12 @@ pub async fn cmd_zrangestore(db: &Db, args: &[Resp], db_index: usize) -> Result<
                     } else {
                         let start = start_str.parse::<isize>().map_err(|_| {
                             NexradeError::Generic(
-                                "ERR value is not an integer or out of range".to_string(),
+                                "value is not an integer or out of range".to_string(),
                             )
                         })?;
                         let stop = stop_str.parse::<isize>().map_err(|_| {
                             NexradeError::Generic(
-                                "ERR value is not an integer or out of range".to_string(),
+                                "value is not an integer or out of range".to_string(),
                             )
                         })?;
                         z.range_by_rank(start, stop, rev)

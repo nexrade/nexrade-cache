@@ -170,6 +170,12 @@ pub async fn cmd_geoadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
     let mut payload_delta: isize = 0;
 
     let mut store_db = db.store.db(db_index).write_for(&key);
+    // Same phantom-key trap as `ZADD ... XX`: `get_geo_mut!` inserted an empty
+    // GeoData before the per-member `xx && !exists` skip, so
+    // `GEOADD nosuchkey XX 15 37 m` replied 0 and still created the key.
+    if xx && store_db.get(&key).is_none() {
+        return Ok(Resp::Integer(0));
+    }
     let geo = get_geo_mut!(store_db, key);
 
     let mut i = idx;
@@ -184,7 +190,7 @@ pub async fn cmd_geoadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
             .ok_or(NexradeError::NotFloat)?;
         if !(-180.0..=180.0).contains(&lon) || !(-85.051_129..=85.051_129).contains(&lat) {
             return Err(NexradeError::Generic(
-                "ERR invalid longitude,latitude pair".to_string(),
+                "invalid longitude,latitude pair".to_string(),
             ));
         }
         let member = args[i + 2]
@@ -445,8 +451,15 @@ pub async fn cmd_georadius(db: &Db, args: &[Resp], db_index: usize) -> Result<Re
                 desc = true;
             }
             "COUNT" => {
+                // `args[i]` used to be indexed directly after the increment,
+                // so a trailing `COUNT` with no value panicked with an
+                // out-of-bounds index. `cmd_geosearch` in this same file
+                // already used `args.get(i)`; match that.
                 i += 1;
-                count = args[i].as_str().and_then(|s| s.parse().ok());
+                count = args
+                    .get(i)
+                    .and_then(|a| a.as_str())
+                    .and_then(|s| s.parse().ok());
             }
             _ => {}
         }
@@ -513,8 +526,15 @@ pub async fn cmd_georadiusbymember(db: &Db, args: &[Resp], db_index: usize) -> R
                 desc = true;
             }
             "COUNT" => {
+                // `args[i]` used to be indexed directly after the increment,
+                // so a trailing `COUNT` with no value panicked with an
+                // out-of-bounds index. `cmd_geosearch` in this same file
+                // already used `args.get(i)`; match that.
                 i += 1;
-                count = args[i].as_str().and_then(|s| s.parse().ok());
+                count = args
+                    .get(i)
+                    .and_then(|a| a.as_str())
+                    .and_then(|s| s.parse().ok());
             }
             _ => {}
         }
@@ -805,7 +825,7 @@ pub async fn cmd_geosearchstore(db: &Db, args: &[Resp], db_index: usize) -> Resu
             }
             "WITHCOORD" | "WITHDIST" | "WITHHASH" => {
                 return Err(NexradeError::Generic(
-                    "ERR GEOSEARCHSTORE does not support WITHDIST/WITHCOORD/WITHHASH".to_string(),
+                    "GEOSEARCHSTORE does not support WITHDIST/WITHCOORD/WITHHASH".to_string(),
                 ));
             }
             _ => {}

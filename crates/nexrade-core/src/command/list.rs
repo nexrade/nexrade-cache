@@ -1,8 +1,6 @@
 //! List command handlers.
 
 #[cfg(not(target_arch = "wasm32"))]
-use std::time::Duration;
-
 use bytes::Bytes;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::time::timeout;
@@ -115,7 +113,7 @@ async fn pop(db: &Db, args: &[Resp], db_index: usize, left: bool, cmd: &str) -> 
         let n = get_i64(args, 2, cmd)?;
         if n < 0 {
             return Err(NexradeError::Generic(
-                "ERR value is not an integer or out of range".to_string(),
+                "value is not an integer or out of range".to_string(),
             ));
         }
         Some(n as usize)
@@ -580,11 +578,7 @@ pub async fn cmd_blmove(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
         return Ok(Resp::bulk(val));
     }
 
-    let dur = if timeout_secs == 0.0 {
-        Duration::from_secs(u64::MAX)
-    } else {
-        Duration::from_secs_f64(timeout_secs)
-    };
+    let dur = crate::command::blocking_duration(timeout_secs, "BLMOVE")?;
 
     let result = timeout(dur, async {
         let _parked = db.park_list_waiter();
@@ -634,7 +628,7 @@ pub async fn cmd_blmove(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
 #[cfg(target_arch = "wasm32")]
 pub async fn cmd_blmove(_db: &Db, _args: &[Resp], _db_index: usize) -> Result<Resp> {
     Err(NexradeError::Generic(
-        "ERR blocking commands not supported in WASM mode".to_string(),
+        "blocking commands not supported in WASM mode".to_string(),
     ))
 }
 
@@ -646,7 +640,7 @@ pub async fn cmd_blpop(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
 #[cfg(target_arch = "wasm32")]
 pub async fn cmd_blpop(_db: &Db, _args: &[Resp], _db_index: usize) -> Result<Resp> {
     Err(NexradeError::Generic(
-        "ERR blocking commands not supported in WASM mode".to_string(),
+        "blocking commands not supported in WASM mode".to_string(),
     ))
 }
 
@@ -658,7 +652,7 @@ pub async fn cmd_brpop(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
 #[cfg(target_arch = "wasm32")]
 pub async fn cmd_brpop(_db: &Db, _args: &[Resp], _db_index: usize) -> Result<Resp> {
     Err(NexradeError::Generic(
-        "ERR blocking commands not supported in WASM mode".to_string(),
+        "blocking commands not supported in WASM mode".to_string(),
     ))
 }
 
@@ -679,11 +673,7 @@ async fn blocking_pop(
         .map(|i| get_bytes_vec(args, i, cmd))
         .collect::<Result<_>>()?;
 
-    let dur = if timeout_secs == 0.0 {
-        Duration::from_secs(u64::MAX)
-    } else {
-        Duration::from_secs_f64(timeout_secs)
-    };
+    let dur = crate::command::blocking_duration(timeout_secs, cmd)?;
 
     let result = timeout(dur, async {
         let _parked = db.park_list_waiter();
@@ -773,7 +763,7 @@ pub async fn cmd_lpos(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
                 let n = get_i64(args, i + 1, "LPOS")?;
                 if n < 0 {
                     return Err(NexradeError::Generic(
-                        "ERR value is not an integer or out of range".to_string(),
+                        "value is not an integer or out of range".to_string(),
                     ));
                 }
                 count = Some(n as usize);
@@ -783,7 +773,7 @@ pub async fn cmd_lpos(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
                 let n = get_i64(args, i + 1, "LPOS")?;
                 if n < 0 {
                     return Err(NexradeError::Generic(
-                        "ERR value is not an integer or out of range".to_string(),
+                        "value is not an integer or out of range".to_string(),
                     ));
                 }
                 maxlen = n as usize;
@@ -824,21 +814,29 @@ pub async fn cmd_lpos(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
                 matches_seen += 1;
                 if matches_seen >= rank {
                     results.push(Resp::int(idx as i64));
-                    if results.len() >= want && count.is_some() {
+                    // Break unconditionally, not only under COUNT. Without it
+                    // the negative-RANK path collected *every* match, and
+                    // `results.reverse()` then left the earliest one first —
+                    // so `LPOS l x RANK -1` returned the first occurrence
+                    // instead of the last.
+                    if results.len() >= want {
                         break;
                     }
                 }
             }
         }
     } else {
-        // Negative rank — search from the tail
-        let abs_rank = rank.unsigned_abs() as i64;
+        // Negative rank — search from the tail. `rank.unsigned_abs()` is u64:
+        // going through `as i64` turned `RANK -9223372036854775808` back into
+        // i64::MIN, so the first match satisfied `matches_seen >= abs_rank` and
+        // LPOS returned the *last* match where Redis returns nothing.
+        let abs_rank = rank.unsigned_abs();
         for (idx, v) in elems.iter().enumerate().rev().take(limit) {
             if v.as_ref() == element.as_ref() {
                 matches_seen += 1;
-                if matches_seen >= abs_rank {
+                if matches_seen as u64 >= abs_rank {
                     results.push(Resp::int(idx as i64));
-                    if results.len() >= want && count.is_some() {
+                    if results.len() >= want {
                         break;
                     }
                 }
@@ -884,11 +882,7 @@ pub async fn cmd_blmpop(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let dur = if timeout_secs == 0.0 {
-            std::time::Duration::from_secs(u64::MAX)
-        } else {
-            std::time::Duration::from_secs_f64(timeout_secs)
-        };
+        let dur = crate::command::blocking_duration(timeout_secs, "BLMPOP")?;
         match tokio::time::timeout(dur, async {
             let _parked = db.park_list_waiter();
             loop {
@@ -896,18 +890,23 @@ pub async fn cmd_blmpop(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
                 let notified = db.list_chan.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                #[cfg(not(target_arch = "wasm32"))]
-                let _permit = match db.persistence.enter_mutation() {
-                    Some(p) => p,
-                    None => {
-                        return Err(NexradeError::Generic(
-                            "MISCONF persistence is quiescing; writes are temporarily disabled"
-                                .to_string(),
-                        ))
+                // Permit scoped to the mutation attempt only — see blocking_pop
+                // above: releasing it before `notified.await` is what keeps a
+                // parked client from wedging `quiesce()` (and with it every
+                // write on the server) for the process lifetime.
+                {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _permit =
+                        match db.persistence.enter_mutation() {
+                            Some(p) => p,
+                            None => return Err(NexradeError::Generic(
+                                "MISCONF persistence is quiescing; writes are temporarily disabled"
+                                    .to_string(),
+                            )),
+                        };
+                    if let Some(resp) = lmpop_attempt(db, db_index, &keys, left, count)? {
+                        return Ok::<Resp, NexradeError>(resp);
                     }
-                };
-                if let Some(resp) = lmpop_attempt(db, db_index, &keys, left, count)? {
-                    return Ok::<Resp, NexradeError>(resp);
                 }
                 notified.await;
             }
@@ -955,7 +954,11 @@ fn lmpop_attempt(
                     continue;
                 }
                 let mut delta: isize = 0;
-                let mut popped: Vec<Resp> = Vec::with_capacity(count);
+                // `count` is client-supplied and unbounded (`LMPOP 1 L LEFT
+                // COUNT 10000000000` asked for a 320 GB pre-allocation and
+                // aborted the process). Clamp to what the list can actually
+                // yield — same idiom as `cmd_lpop` above.
+                let mut popped: Vec<Resp> = Vec::with_capacity(count.min(list.len()));
                 for _ in 0..count {
                     let v = if left {
                         list.pop_front()
