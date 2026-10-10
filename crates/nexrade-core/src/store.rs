@@ -41,6 +41,20 @@ pub type KeyHasher = foldhash::fast::RandomState;
 /// A `HashMap` keyed by raw bytes using [`KeyHasher`].
 pub type KeyMap<V> = HashMap<Vec<u8>, V, KeyHasher>;
 
+/// Removals between `key_versions` prune passes. See
+/// [`Database::maybe_prune_versions`]. Small enough that the map never grows
+/// far past its cap, large enough that the linear prune is amortised away.
+const VERSION_PRUNE_INTERVAL: u32 = 1024;
+
+/// `key_versions` is pruned once it exceeds this multiple of the live key
+/// count. Above 1× because live keys legitimately hold slots too; the margin
+/// keeps a healthy store from pruning on every interval.
+const VERSION_PRUNE_RATIO: usize = 2;
+
+/// Floor on the prune threshold, so a small store still holds enough slots
+/// that ordinary short-lived `WATCH` transactions never straddle a prune.
+const VERSION_PRUNE_MIN: usize = 4096;
+
 /// A single entry in the store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
@@ -114,6 +128,9 @@ pub struct Database {
     /// concurrent modifications. Not persisted (watch state is per-connection).
     #[serde(skip, default)]
     key_versions: KeyMap<u64>,
+    /// Removals since the last `key_versions` prune. See `maybe_prune_versions`.
+    #[serde(skip, default)]
+    removals_since_prune: u32,
     /// Sorted expiry index: (expires_at_ms, key). Enables O(k log n) active
     /// expiry instead of random HashMap scanning. Not persisted — rebuilt
     /// on insert.
@@ -139,6 +156,7 @@ impl Clone for Database {
         Self {
             entries: self.entries.clone(),
             key_versions: self.key_versions.clone(),
+            removals_since_prune: self.removals_since_prune,
             expiry_index: self.expiry_index.clone(),
             live_bytes: std::sync::atomic::AtomicUsize::new(
                 self.live_bytes.load(std::sync::atomic::Ordering::Relaxed),
@@ -161,6 +179,7 @@ impl Database {
         Self {
             entries: KeyMap::default(),
             key_versions: KeyMap::default(),
+            removals_since_prune: 0,
             expiry_index: BTreeSet::new(),
             live_bytes: std::sync::atomic::AtomicUsize::new(0),
             lru_clock: LruClock::new(Arc::new(AtomicU32::new(0))),
@@ -255,8 +274,78 @@ impl Database {
                 self.remove(key);
                 return None;
             }
+            // Handing back `&mut Entry` is a promise the caller may change the
+            // value in place, so the write has to be visible to `WATCH`.
+            // Without this bump, every in-place mutator — APPEND,
+            // INCRBYFLOAT, SETRANGE, GETSET — left the key's version
+            // untouched, so `WATCH k` + another client's `APPEND k x` + `EXEC`
+            // still committed. That is silent lost-update, and WATCH is the
+            // standard guard against exactly that.
+            self.bump_version(key);
+            return self.entries.get_mut(key);
         }
-        self.entries.get_mut(key)
+        None
+    }
+
+    /// Advance `key`'s write version, creating the slot if it doesn't exist.
+    fn bump_version(&mut self, key: &[u8]) {
+        if let Some(v) = self.key_versions.get_mut(key) {
+            *v = v.wrapping_add(1);
+        } else {
+            self.key_versions.insert(key.to_vec(), 1);
+        }
+    }
+
+    /// Advance `key`'s write version only if a slot already exists.
+    ///
+    /// Used by the delete paths: bumping a key that was never versioned would
+    /// *allocate* a slot purely to record a deletion, which is exactly the
+    /// growth `maybe_prune_versions` exists to undo.
+    fn bump_version_if_present(&mut self, key: &[u8]) {
+        if let Some(v) = self.key_versions.get_mut(key) {
+            *v = v.wrapping_add(1);
+        }
+    }
+
+    /// Drop `key_versions` slots belonging to keys that no longer exist.
+    ///
+    /// A deletion has to bump the version so `WATCH` observes it, but that
+    /// leaves a slot behind pointing at nothing. Nothing else ever frees it:
+    /// `DEL`, TTL expiry and every `maxmemory` eviction policy all funnel
+    /// through `remove()`/`expire_batch`, and only `FLUSH` cleared the map.
+    /// So a workload that churns distinct key names — or any cache that
+    /// cycles through eviction — grew this map without bound, one
+    /// `(Vec<u8>, u64)` per key ever written.
+    ///
+    /// The prune is batched: it only runs once per `VERSION_PRUNE_INTERVAL`
+    /// removals and only when the map exceeds `VERSION_PRUNE_RATIO`× the live
+    /// key count, so the amortised cost is one linear pass per interval. The
+    /// price is that a `WATCH` on a key that another client creates *and*
+    /// deletes entirely across a prune boundary can no longer see the
+    /// create. Watching an existing key — the ordinary optimistic-locking
+    /// pattern — is unaffected: its slot always survives, and the deletion
+    /// bump is visible.
+    fn maybe_prune_versions(&mut self, removals: u32) {
+        self.removals_since_prune = self.removals_since_prune.saturating_add(removals);
+        if self.removals_since_prune < VERSION_PRUNE_INTERVAL {
+            return;
+        }
+        self.removals_since_prune = 0;
+        let cap = self
+            .entries
+            .len()
+            .saturating_mul(VERSION_PRUNE_RATIO)
+            .max(VERSION_PRUNE_MIN);
+        if self.key_versions.len() <= cap {
+            return;
+        }
+        // `retain` would need `&mut self.key_versions` and `&self.entries`
+        // at once; take the map out and rebuild it instead.
+        let stale = std::mem::take(&mut self.key_versions);
+        self.key_versions = stale
+            .into_iter()
+            .filter(|(k, _)| self.entries.contains_key(k))
+            .collect();
     }
 
     /// Returns the current write version for a key (0 if never written).
@@ -444,6 +533,11 @@ impl Database {
             }
         });
         if let Some(p) = live_ptr {
+            // This is the dominant write path for a cache — HSET on an
+            // existing field, SADD of a new member, ZADD, LPUSH — and it
+            // mutates in place, so it has to advance the version for `WATCH`
+            // just like `get_mut` does.
+            self.bump_version(key);
             // SAFETY: exclusive &mut self; no other refs into entries exist.
             // The pointer is only used to reborrow immediately.
             return unsafe { &mut *p };
@@ -601,9 +695,10 @@ impl Database {
             if let Some(ref exp) = e.expiry {
                 self.expiry_index.remove(&(exp.expires_at_ms, key.to_vec()));
             }
-            *self.key_versions.entry(key.to_vec()).or_insert(0) += 1;
+            self.bump_version_if_present(key);
             Self::sub_live_bytes_atomic(&self.live_bytes, Self::estimate_entry_size(key, e));
         }
+        self.maybe_prune_versions(1);
         removed
     }
 
@@ -675,11 +770,16 @@ impl Database {
         for (exp_ms, key) in to_delete {
             if let Some(e) = self.entries.remove(&key) {
                 Self::sub_live_bytes_atomic(&self.live_bytes, Self::estimate_entry_size(&key, &e));
-                *self.key_versions.entry(key.clone()).or_insert(0) += 1;
+                self.bump_version_if_present(&key);
                 deleted.push(key.clone());
             }
             self.expiry_index.remove(&(exp_ms, key));
         }
+        // One prune per batch rather than per key: the batch already walked
+        // every expired entry, so this is the cheapest place to run it. The
+        // counter is advanced by the batch size — charging it one removal per
+        // batch meant a single huge expire would never trip the threshold.
+        self.maybe_prune_versions(deleted.len() as u32);
         deleted
     }
 
@@ -744,6 +844,10 @@ impl Database {
                 self.expiry_index.insert((e.expires_at_ms, key.to_vec()));
             }
             entry.expiry = expiry;
+            // Changing a key's TTL is a write as far as `WATCH` is concerned:
+            // `EXPIRE`/`PEXPIRE`/`PERSIST` on a watched key must abort the
+            // transaction, as it does in Redis.
+            self.bump_version(key);
         }
     }
 
@@ -1079,6 +1183,12 @@ impl ShardedDatabase {
             s.entries.clear();
             s.expiry_index.clear();
             s.key_versions.clear();
+            // Every entry is gone, so the live-memory counter must go with
+            // them. Leaving it set means `flush` is invisible to the
+            // maxmemory accounting: `evict_if_needed` still compares
+            // against the pre-flush value and evicts the very next write,
+            // so a FLUSHALL'd server silently stores nothing until restart.
+            s.live_bytes.store(0, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -1498,11 +1608,36 @@ impl ShardedDatabase {
     }
 
     /// SMOVE src dst member — atomically move a set member between sets.
-    pub fn smove_atomic(&self, src: &[u8], dst: Vec<u8>, member: Vec<u8>) -> i64 {
+    ///
+    /// Returns `Err(WrongType)` rather than a bare 0 when either endpoint
+    /// holds a non-set, so the caller can report it: the previous version
+    /// removed the member from the source *before* looking at the
+    /// destination, and then swallowed the destination's type mismatch in an
+    /// `if let ... else { 0 }`. `SMOVE src dst a` with a string `dst`
+    /// therefore replied `1` and lost `a` from **both** sets.
+    pub fn smove_atomic(
+        &self,
+        src: &[u8],
+        dst: Vec<u8>,
+        member: Vec<u8>,
+    ) -> crate::error::Result<i64> {
+        use crate::error::NexradeError;
         use crate::types::DataType;
         let si = self.shard_idx(src);
         let di = self.shard_idx(&dst);
         let (mut lo_g, hi_opt, swapped) = self.lock_two(si, di);
+
+        // Validate the destination up front, while both locks are held and
+        // before anything has been mutated.
+        // Reads the map directly rather than via `get_mut`, both because a
+        // read-only check must not bump the write version (which `get_mut`
+        // now does for `WATCH`) and because a lazily-expired destination is
+        // logically absent — and therefore usable, since the insert below
+        // replaces it.
+        let dst_is_usable = |g: &Database| match g.entries.get(&dst) {
+            None => true,
+            Some(e) => matches!(e.value, DataType::Set(_)),
+        };
 
         if let Some(mut hi_g) = hi_opt {
             let (src_s, dst_s) = if swapped {
@@ -1510,18 +1645,21 @@ impl ShardedDatabase {
             } else {
                 (&mut *lo_g, &mut *hi_g)
             };
+            if !dst_is_usable(dst_s) {
+                return Err(NexradeError::WrongType);
+            }
             let (removed, src_delta, emptied) = match src_s.get_mut(src) {
                 Some(e) => match &mut e.value {
                     DataType::Set(s) => {
                         let (removed, d) = s.remove(&member);
                         (removed, d, s.is_empty())
                     }
-                    _ => return 0,
+                    _ => return Err(NexradeError::WrongType),
                 },
-                None => return 0,
+                None => return Ok(0),
             };
             if !removed {
-                return 0;
+                return Ok(0);
             }
             src_s.adjust_live_bytes(src_delta);
             if emptied {
@@ -1543,20 +1681,23 @@ impl ShardedDatabase {
             } else {
                 dst_s.key_versions.insert(dst, 1);
             }
-            1
+            Ok(1)
         } else {
+            if !dst_is_usable(&lo_g) {
+                return Err(NexradeError::WrongType);
+            }
             let (removed, src_delta, emptied) = match lo_g.get_mut(src) {
                 Some(e) => match &mut e.value {
                     DataType::Set(s) => {
                         let (removed, d) = s.remove(&member);
                         (removed, d, s.is_empty())
                     }
-                    _ => return 0,
+                    _ => return Err(NexradeError::WrongType),
                 },
-                None => return 0,
+                None => return Ok(0),
             };
             if !removed {
-                return 0;
+                return Ok(0);
             }
             lo_g.adjust_live_bytes(src_delta);
             if emptied {
@@ -1577,7 +1718,7 @@ impl ShardedDatabase {
             } else {
                 lo_g.key_versions.insert(dst, 1);
             }
-            1
+            Ok(1)
         }
     }
 
@@ -2085,6 +2226,96 @@ mod tests {
         db.insert(b"key".to_vec(), entry);
         std::thread::sleep(Duration::from_millis(5));
         assert!(db.get(b"key").is_none());
+    }
+
+    // ── key_versions growth ───────────────────────────────────────────────────
+
+    /// `key_versions` gained a permanent slot per key ever written: the delete
+    /// paths did `entry().or_insert(0) += 1`, so deleting a key *allocated* a
+    /// marker, and nothing but `FLUSH` ever freed one. A cache that cycles
+    /// through eviction, or any workload churning distinct key names, grew the
+    /// map for the life of the process.
+    #[test]
+    fn deleting_many_keys_does_not_grow_key_versions_without_bound() {
+        let mut db = Database::new();
+        for i in 0..20_000u32 {
+            let key = format!("churn:{i}");
+            db.insert(
+                key.clone().into_bytes(),
+                Entry::new(DataType::String(Bytes::from_static(b"v"))),
+            );
+            db.remove(key.as_bytes());
+        }
+        assert_eq!(db.entries.len(), 0, "all keys should be gone");
+        assert!(
+            db.key_versions.len() < 20_000,
+            "key_versions retained {} slots for 20 000 write+delete cycles",
+            db.key_versions.len()
+        );
+    }
+
+    /// TTL expiry is the other bulk-removal path, and it went through the same
+    /// allocating `or_insert`.
+    #[test]
+    fn expiring_many_keys_does_not_grow_key_versions_without_bound() {
+        let mut db = Database::new();
+        for i in 0..20_000u32 {
+            let key = format!("ttl:{i}");
+            db.insert(
+                key.clone().into_bytes(),
+                Entry::with_expiry(
+                    DataType::String(Bytes::from_static(b"v")),
+                    Expiry::from_duration(Duration::from_millis(1)),
+                ),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        db.expire_batch(usize::MAX);
+        assert_eq!(db.entries.len(), 0);
+        assert!(
+            db.key_versions.len() < 20_000,
+            "expiry retained {} slots for 20 000 keys",
+            db.key_versions.len()
+        );
+    }
+
+    /// The prune must not blind `WATCH` to the case that matters most:
+    /// deleting a key that *was* live has to change its version.
+    #[test]
+    fn pruning_never_hides_a_deletion_from_watch() {
+        let mut db = Database::new();
+        db.insert(
+            b"watched".to_vec(),
+            Entry::new(DataType::String(Bytes::from_static(b"v"))),
+        );
+        let before = db.key_version(b"watched");
+
+        // Churn hard enough to force several prunes.
+        for i in 0..20_000u32 {
+            let key = format!("noise:{i}");
+            db.insert(
+                key.clone().into_bytes(),
+                Entry::new(DataType::String(Bytes::from_static(b"v"))),
+            );
+            db.remove(key.as_bytes());
+        }
+
+        assert!(
+            db.entries.contains_key(&b"watched"[..]),
+            "the live key was pruned away"
+        );
+        assert_eq!(
+            db.key_version(b"watched"),
+            before,
+            "a surviving key's version must be untouched by the prune"
+        );
+
+        db.remove(b"watched");
+        assert_ne!(
+            db.key_version(b"watched"),
+            before,
+            "deleting a live key must still advance its version"
+        );
     }
 
     // ── DataType::Int — promotion, key_version, RDB/COPY independence ─────────
@@ -2684,7 +2915,7 @@ mod tests {
         let (sa2, sb2, m2) = (sa.clone(), sb.clone(), m.clone());
         let t1 = thread::spawn(move || {
             for _ in 0..ITERS {
-                sdb2.smove_atomic(&sa2, sb2.clone(), m2.clone());
+                let _ = sdb2.smove_atomic(&sa2, sb2.clone(), m2.clone());
             }
         });
 
@@ -2692,7 +2923,7 @@ mod tests {
         let (sa3, sb3, m3) = (sa.clone(), sb.clone(), m.clone());
         let t2 = thread::spawn(move || {
             for _ in 0..ITERS {
-                sdb3.smove_atomic(&sb3, sa3.clone(), m3.clone());
+                let _ = sdb3.smove_atomic(&sb3, sa3.clone(), m3.clone());
             }
         });
 
