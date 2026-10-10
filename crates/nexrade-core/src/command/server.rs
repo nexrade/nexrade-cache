@@ -676,7 +676,7 @@ pub async fn cmd_config(db: &Db, args: &[Resp]) -> Result<Resp> {
                             "no" => AofSync::No,
                             _ => {
                                 return Err(NexradeError::Generic(
-                                    "ERR invalid appendfsync value — use always, everysec, or no"
+                                    "invalid appendfsync value — use always, everysec, or no"
                                         .to_string(),
                                 ));
                             }
@@ -928,7 +928,7 @@ pub async fn cmd_config(db: &Db, args: &[Resp]) -> Result<Resp> {
             let path = cfg_clone_config_path(db);
             let Some(path) = path else {
                 return Err(NexradeError::Generic(
-                    "ERR CONFIG REWRITE failed: no config file path was set at startup \
+                    "CONFIG REWRITE failed: no config file path was set at startup \
                      (pass --config /path/to/nexrade.toml)"
                         .to_string(),
                 ));
@@ -979,7 +979,7 @@ fn parse_save_config(val: &str) -> Result<Vec<(u64, usize)>> {
     let parts: Vec<&str> = trimmed.split_whitespace().collect();
     if parts.len() % 2 != 0 {
         return Err(NexradeError::Generic(
-            "ERR wrong number of arguments for CONFIG SET 'save'".to_string(),
+            "wrong number of arguments for CONFIG SET 'save'".to_string(),
         ));
     }
     let mut rules = Vec::with_capacity(parts.len() / 2);
@@ -1185,7 +1185,7 @@ pub async fn cmd_save(db: &Db) -> Result<Resp> {
         Ok(guard) => guard,
         Err(_) => {
             return Err(NexradeError::Generic(
-                "ERR RDB save already in progress".to_string(),
+                "RDB save already in progress".to_string(),
             ));
         }
     };
@@ -1600,7 +1600,7 @@ pub async fn cmd_memory(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
                     let n = get_i64(args, i + 1, "MEMORY")?;
                     if !(1..=1000).contains(&n) {
                         return Err(NexradeError::Generic(
-                            "ERR samples must be between 1 and 1000".to_string(),
+                            "samples must be between 1 and 1000".to_string(),
                         ));
                     }
                     _samples = Some(n);
@@ -2261,7 +2261,7 @@ pub async fn cmd_client(db: &Db, args: &[Resp], caller_id: u64) -> Result<Resp> 
         // silently swallowing them as `unknown`.
         "REPLY" => Ok(Resp::ok()),
         "TRACKING" | "CACHING" | "TRACKINGINFO" => Err(NexradeError::Generic(
-            "ERR CLIENT subcommand not supported via dispatch".to_string(),
+            "CLIENT subcommand not supported via dispatch".to_string(),
         )),
         "HELP" => Ok(client_help()),
         other => Err(NexradeError::Generic(format!(
@@ -2600,7 +2600,7 @@ pub async fn cmd_cluster(db: &Db, args: &[Resp]) -> Result<Resp> {
             Ok(Resp::int(0))
         }
         "FAILOVER-CHECK-RAYS" => Err(NexradeError::Generic(
-            "ERR FAILOVER-CHECK-RAYS is not available in standalone              (no quorum to check against)"
+            "FAILOVER-CHECK-RAYS is not available in standalone              (no quorum to check against)"
                 .to_string(),
         )),
         "HELP" => Ok(cluster_help()),

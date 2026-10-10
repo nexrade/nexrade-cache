@@ -480,7 +480,7 @@ pub async fn cmd_move(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     let target_db_i = get_i64(args, 2, "MOVE")?;
     if target_db_i < 0 || target_db_i as usize >= db.db_count() {
         return Err(NexradeError::Generic(
-            "ERR DB index is out of range".to_string(),
+            "DB index is out of range".to_string(),
         ));
     }
     let target_db = target_db_i as usize;
@@ -588,7 +588,7 @@ pub async fn cmd_restore(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp
         Resp::BulkString(Some(b)) => b.as_ref(),
         _ => {
             return Err(NexradeError::Generic(
-                "ERR RESTORE payload must be a bulk string".to_string(),
+                "RESTORE payload must be a bulk string".to_string(),
             ))
         }
     };
@@ -620,7 +620,7 @@ pub async fn cmd_restore(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp
 
     if payload.len() < 5 || &payload[..4] != DUMP_MAGIC {
         return Err(NexradeError::Generic(
-            "ERR DUMP payload version or checksum are wrong — \
+            "DUMP payload version or checksum are wrong — \
              nexrade DUMP uses a custom NEXD format, not Redis RDB"
                 .to_string(),
         ));
@@ -638,7 +638,7 @@ pub async fn cmd_restore(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp
     // Apply the TTL argument, overriding whatever expiry was in the payload.
     if ttl_ms < 0 {
         return Err(NexradeError::Generic(
-            "ERR Invalid TTL value, must be >= 0".to_string(),
+            "Invalid TTL value, must be >= 0".to_string(),
         ));
     }
     if ttl_ms == 0 && !absttl {
@@ -653,7 +653,7 @@ pub async fn cmd_restore(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp
         // than insert a ghost that lazy-expire would drop on first access.
         if deadline_ms <= now_unix_ms() {
             return Err(NexradeError::Generic(
-                "ERR Invalid TTL value, must be >= 0".to_string(),
+                "Invalid TTL value, must be >= 0".to_string(),
             ));
         }
         entry.expiry = Some(Expiry::from_ms(deadline_ms as u64));
@@ -684,7 +684,7 @@ pub async fn cmd_sort_ro(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp
         .any(|a| a.as_str().is_some_and(|s| s.eq_ignore_ascii_case("STORE")))
     {
         return Err(NexradeError::Generic(
-            "ERR SORT_RO does not support STORE".to_string(),
+            "SORT_RO does not support STORE".to_string(),
         ));
     }
     sort_inner(db, args, db_index, false).await
@@ -793,7 +793,7 @@ async fn sort_inner(
                 if !take_write_lock {
                     // SORT_RO already rejected STORE above, but be defensive.
                     return Err(NexradeError::Generic(
-                        "ERR SORT_RO does not support STORE".to_string(),
+                        "SORT_RO does not support STORE".to_string(),
                     ));
                 }
                 if i + 1 >= args.len() {

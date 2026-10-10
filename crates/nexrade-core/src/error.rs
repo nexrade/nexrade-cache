@@ -7,19 +7,19 @@ pub enum NexradeError {
     #[error("WRONGTYPE Operation against a key holding the wrong kind of value")]
     WrongType,
 
-    #[error("no such key")]
+    #[error("ERR no such key")]
     NoKey,
 
-    #[error("value is not an integer or out of range")]
+    #[error("ERR value is not an integer or out of range")]
     NotInteger,
 
-    #[error("value is not a valid float")]
+    #[error("ERR value is not a valid float")]
     NotFloat,
 
-    #[error("out of range value for incr")]
+    #[error("ERR out of range value for incr")]
     Overflow,
 
-    #[error("syntax error")]
+    #[error("ERR syntax error")]
     SyntaxError,
 
     #[error("ERR unknown command '{0}'{1}")]
@@ -28,10 +28,10 @@ pub enum NexradeError {
     #[error("ERR wrong number of arguments for '{0}' command")]
     WrongArity(String),
 
-    #[error("index out of range")]
+    #[error("ERR index out of range")]
     IndexOutOfRange,
 
-    #[error("bit offset is not an integer or out of range")]
+    #[error("ERR bit offset is not an integer or out of range")]
     BitError,
 
     #[error("ERR {0}")]
