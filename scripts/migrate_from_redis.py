@@ -13,6 +13,19 @@ Copies:
   - per-key TTL (PTTL → PEXPIRE)
   - optional stream consumer group name + last-delivered-id
     (--copy-stream-groups; PELs are NOT restored)
+  - HyperLogLogs, converted from Redis's native HLL blob into nexrade's
+    dense register layout (see HLL_NOTE below)
+
+HLL_NOTE:
+  Redis stores a HyperLogLog as an opaque string, and for anything below
+  ~3 KB it uses a *sparse* run-length encoding that is 27 bytes for a typical
+  small key. Copying those bytes verbatim produces a key that looks correct
+  (same TYPE, same bytes) but that PFCOUNT / PFADD / PFMERGE then reject.
+  So this script asks the source server for the register array itself
+  (PFDEBUG GETREG, or HLL.DEBUG GETREG before Redis 7) and writes that.
+  NOTE: PFDEBUG rewrites the source key's internal representation from
+  sparse to dense. That is a no-op for HLL semantics — the elements and the
+  PFCOUNT answer are unchanged — but it is a write to the source server.
 
 Does not copy:
   - ACL / CONFIG / SCRIPT LOAD cache
@@ -39,6 +52,56 @@ from collections import Counter
 from typing import Any
 
 import redis
+
+# Redis HyperLogLog blob: 4-byte magic, 1-byte encoding (0 = dense,
+# 1 = sparse), 3 bytes padding, 8 bytes cached cardinality.
+HLL_MAGIC = b"HYLL"
+HLL_HEADER_LEN = 16
+HLL_ENCODINGS = (0, 1)
+
+# nexrade stores one byte per register; 16384 registers.
+HLL_NEXRADE_REGISTERS = 16384
+
+_FLUSH_NON_TTY_MSG = (
+    "ERROR: --flush-dest needs an interactive terminal to confirm. "
+    "Re-run with --yes to confirm non-interactively."
+)
+
+# Redis and nexrade use different HLL cardinality estimators, so a migrated
+# HyperLogLog never reports exactly the source's number. 1% is roughly the
+# standard error of a 16384-register HyperLogLog, so anything inside it is
+# estimator noise rather than data loss.
+HLL_COUNT_TOLERANCE = 0.01
+
+# Filled in by copy_string(); reported once per database.
+hll_stats: Counter = Counter()
+
+
+def looks_like_redis_hll(val: bytes | None) -> bool:
+    """True for a Redis HyperLogLog blob (dense or sparse)."""
+    return (
+        val is not None
+        and len(val) >= HLL_HEADER_LEN
+        and val[:4] == HLL_MAGIC
+        and val[4] in HLL_ENCODINGS
+    )
+
+
+def fetch_hll_registers(src: redis.Redis, key: bytes) -> bytes | None:
+    """Return the HLL register array for `key`, or None if unavailable.
+
+    Asks the *source* server to unpack its own HyperLogLog rather than
+    re-implementing Redis's sparse run-length encoding here. PFDEBUG GETREG
+    is Redis 7+; HLL.DEBUG GETREG covers 4/5/6.
+    """
+    for cmd in (("PFDEBUG", "GETREG", key), ("HLL.DEBUG", "GETREG", key)):
+        try:
+            regs = src.execute_command(*cmd)
+        except (redis.ResponseError, redis.RedisError):
+            continue
+        if isinstance(regs, (list, tuple)) and len(regs) == HLL_NEXRADE_REGISTERS:
+            return bytes(bytearray(regs))
+    return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -163,8 +226,19 @@ def discover_dbs(source: redis.Redis) -> int:
 def copy_string(pipe: Any, key: bytes, src: redis.Redis) -> None:
     # GET works for plain strings and Redis bitmaps (string type).
     val = src.get(key)
-    if val is not None:
-        pipe.set(key, val)
+    if val is None:
+        return
+    if looks_like_redis_hll(val):
+        # A verbatim copy would look fine to TYPE and to a byte comparison but
+        # PFCOUNT/PFADD on the destination would reject it (Redis' sparse HLL
+        # is 27 bytes; nexrade wants 16384 registers). Convert instead.
+        registers = fetch_hll_registers(src, key)
+        if registers is not None:
+            pipe.set(key, registers)
+            hll_stats["converted"] += 1
+            return
+        hll_stats["unconverted"] += 1
+    pipe.set(key, val)
 
 
 def copy_list(pipe: Any, key: bytes, src: redis.Redis) -> None:
@@ -244,10 +318,21 @@ def migrate_db(
 ) -> tuple[int, int, Counter]:
     if args.flush_dest and not args.dry_run and dest is not None:
         if not args.yes:
-            resp = input(
+            # On a pipe/cron stdin, input() either blocks forever or raises
+            # EOFError depending on the platform. Refuse either way instead of
+            # hanging or dumping a traceback.
+            prompt = (
                 f"About to FLUSHDB destination db {db_index} at "
                 f"{args.dest_host}:{args.dest_port}. Type 'yes' to continue: "
             )
+            if not sys.stdin.isatty():
+                print(_FLUSH_NON_TTY_MSG, file=sys.stderr)
+                sys.exit(2)
+            try:
+                resp = input(prompt)
+            except EOFError:
+                print(_FLUSH_NON_TTY_MSG, file=sys.stderr)
+                sys.exit(2)
             if resp.strip().lower() != "yes":
                 print("Aborted.")
                 sys.exit(1)
@@ -256,6 +341,7 @@ def migrate_db(
     copied = 0
     skipped = 0
     by_type: Counter = Counter()
+    hll_stats.clear()
     pipe = None if args.dry_run else dest.pipeline(transaction=False)  # type: ignore[union-attr]
     buffered = 0
     t0 = time.time()
@@ -365,7 +451,27 @@ def verify_db(
         # Value sample by type (cheap equality for small keys).
         try:
             if src_type == b"string":
-                if source.get(key) != dest.get(key):
+                src_val = source.get(key)
+                if looks_like_redis_hll(src_val):
+                    # Converted on copy: the bytes differ by design, so
+                    # compare what an HLL consumer actually observes. The
+                    # counts are estimates and Redis and nexrade use
+                    # different estimators, so allow the HLL standard error.
+                    try:
+                        s_count = source.pfcount(key)
+                        d_count = dest.pfcount(key)
+                    except redis.ResponseError as e:
+                        print(f"  VERIFY pfcount error key={key!r}: {e}")
+                        mismatches += 1
+                    else:
+                        slack = max(1, s_count * HLL_COUNT_TOLERANCE)
+                        if abs(s_count - d_count) > slack:
+                            print(
+                                f"  VERIFY PFCOUNT mismatch key={key!r}: "
+                                f"src={s_count} dest={d_count}"
+                            )
+                            mismatches += 1
+                elif source.get(key) != dest.get(key):
                     print(f"  VERIFY value mismatch (string) key={key!r}")
                     mismatches += 1
             elif src_type == b"list":
@@ -411,6 +517,16 @@ def verify_db(
 def main() -> None:
     args = parse_args()
 
+    # The progress output below uses box-drawing characters and "→". On a
+    # Windows console whose code page is not UTF-8 (cp1252 by default) the
+    # first such print raises UnicodeEncodeError and kills the run *after* the
+    # connections are open. Reconfigure rather than downgrade the output.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):  # pragma: no cover - old streams
+            pass
+
     source = connect(
         args.source_host, args.source_port, args.source_password, 0
     )
@@ -455,6 +571,15 @@ def main() -> None:
         if by_type:
             summary = ", ".join(f"{k}={v}" for k, v in sorted(by_type.items()))
             print(f"  types: {summary}")
+        if hll_stats["converted"] or hll_stats["unconverted"]:
+            print(f"  hyperloglogs: {hll_stats['converted']} converted to nexrade registers")
+            if hll_stats["unconverted"]:
+                print(
+                    f"  WARNING: {hll_stats['unconverted']} HyperLogLog keys were copied "
+                    "verbatim; PFCOUNT/PFADD will reject them on the destination. "
+                    "Rebuild those keys with PFADD.",
+                    file=sys.stderr,
+                )
 
         if args.verify and not args.dry_run and dest is not None:
             print(f"  verifying (sample ≤ {args.verify_sample})…")
