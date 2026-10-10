@@ -1,8 +1,10 @@
 //! Lua evaluation engine.
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use mlua::{Lua, LuaOptions, StdLib, Value as LuaValue};
+use mlua::{HookTriggers, Lua, LuaOptions, StdLib, Value as LuaValue};
 
 use nexrade_core::command::dispatch_with_user;
 use nexrade_core::db::Db;
@@ -57,7 +59,7 @@ impl LuaEngine {
         // that are complex to satisfy. For most scripts this is acceptable.
         let script = script.to_string();
         let user = user.to_string();
-        let _time_limit = self.time_limit;
+        let time_limit = self.time_limit;
 
         tokio::task::spawn_blocking(move || {
             let lua = Lua::new_with(
@@ -124,7 +126,38 @@ impl LuaEngine {
             redis_table.set("call", call_fn).map_err(mlua_err)?;
             redis_table.set("pcall", pcall_fn).map_err(mlua_err)?;
 
-            let result: LuaValue = lua.load(&script).eval().map_err(mlua_err)?;
+            // Enforce `time_limit_ms`. Without this hook a script like
+            // `while true do end` runs forever, holding a blocking-pool
+            // thread that never returns; enough concurrent EVALs starve the
+            // same pool BGSAVE / BGREWRITEAOF need, silently killing RDB
+            // snapshotting for the process lifetime. The hook is checked
+            // every 10k VM instructions — far below any script's useful
+            // work, and negligible next to the blocking call it replaces.
+            let timed_out = Arc::new(AtomicBool::new(false));
+            {
+                let timed_out = Arc::clone(&timed_out);
+                let deadline = Instant::now() + time_limit;
+                lua.set_hook(
+                    HookTriggers::new().every_nth_instruction(10_000),
+                    move |_, _| {
+                        if Instant::now() >= deadline {
+                            timed_out.store(true, Ordering::Relaxed);
+                            // Returning Err from the hook unwinds the script.
+                            Err(mlua::Error::runtime("script exceeded time limit"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
+            }
+
+            let result: mlua::Result<LuaValue> = lua.load(&script).eval();
+            if timed_out.load(Ordering::Relaxed) {
+                return Err(NexradeError::Prefixed(
+                    "BUSY script exceeded the configured time limit".to_string(),
+                ));
+            }
+            let result = result.map_err(mlua_err)?;
             Ok::<Resp, NexradeError>(lua_to_resp(result))
         })
         .await
@@ -402,6 +435,58 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(r, Resp::BulkString(Some(ref b)) if b.as_ref() == b"v"));
+    }
+
+    #[tokio::test]
+    async fn eval_aborts_script_that_exceeds_the_time_limit() {
+        // A tight non-yielding loop is the whole point: without an enforced
+        // limit this test hangs forever instead of failing.
+        let e = LuaEngine::new(Duration::from_millis(50)).unwrap();
+        let db = Db::default();
+        let t0 = std::time::Instant::now();
+        let r = e
+            .eval("while true do end", vec![], vec![], db, 0, "default")
+            .await;
+        let elapsed = t0.elapsed();
+        match r {
+            Err(NexradeError::Prefixed(msg)) => assert!(
+                msg.starts_with("BUSY"),
+                "expected a BUSY timeout error, got: {msg}"
+            ),
+            other => panic!("expected the script to be aborted, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "script ran for {elapsed:?} — the limit was not enforced promptly"
+        );
+    }
+
+    #[tokio::test]
+    async fn eval_runs_normal_scripts_unaffected_by_the_hook() {
+        let e = LuaEngine::new(Duration::from_secs(5)).unwrap();
+        let db = Db::default();
+        let r = e
+            .eval("return 1 + 1", vec![], vec![], db, 0, "default")
+            .await
+            .unwrap();
+        assert!(matches!(r, Resp::Integer(2)), "expected 2, got {r:?}");
+    }
+
+    #[tokio::test]
+    async fn eval_still_reports_ordinary_script_errors() {
+        let e = LuaEngine::new(Duration::from_secs(5)).unwrap();
+        let db = Db::default();
+        let r = e
+            .eval("error('boom')", vec![], vec![], db.clone(), 0, "default")
+            .await;
+        assert!(r.is_err(), "expected an error from the script");
+        // A script error must not leave the store locked or poisoned.
+        assert_eq!(
+            e.eval("return 7", vec![], vec![], db, 0, "default")
+                .await
+                .unwrap(),
+            Resp::Integer(7)
+        );
     }
 
     #[tokio::test]

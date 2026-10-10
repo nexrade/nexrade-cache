@@ -102,9 +102,7 @@ impl FunctionRegistry {
             )));
         }
         if funcs.is_empty() {
-            return Err(NexradeError::Generic(
-                "ERR No functions registered".to_string(),
-            ));
+            return Err(NexradeError::Generic("No functions registered".to_string()));
         }
 
         // Actually run the source once (isolated Lua state) to validate it
@@ -563,13 +561,13 @@ fn parse_dump(text: &str) -> Result<Vec<FunctionLibrary>> {
         }
         if !line.starts_with('@') {
             return Err(NexradeError::Generic(
-                "ERR payload version or checksum are wrong".to_string(),
+                "payload version or checksum are wrong".to_string(),
             ));
         }
         let parts: Vec<&str> = line.splitn(3, '|').collect();
         if parts.len() != 3 {
             return Err(NexradeError::Generic(
-                "ERR payload version or checksum are wrong".to_string(),
+                "payload version or checksum are wrong".to_string(),
             ));
         }
         let name = parts[0].trim_start_matches('@').to_string();
