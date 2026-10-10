@@ -261,10 +261,20 @@ pub async fn cmd_bitpos(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
         (0, bytes.len().saturating_sub(1), false)
     };
 
+    // Every range below is inclusive, so an empty value would still produce a
+    // one-iteration `0..=0` range and index `bytes[0]` on a zero-length
+    // slice. Redis returns -1 here (`SET k ""; BITPOS k 1`).
+    if bytes.is_empty() {
+        return Ok(Resp::int(-1));
+    }
+
     if use_bit_unit {
         let total_bits = bytes.len() * 8;
-        let s = start_byte.min(total_bits);
+        let s = start_byte.min(total_bits.saturating_sub(1));
         let e = end_byte.min(total_bits.saturating_sub(1));
+        if s > e {
+            return Ok(Resp::int(-1));
+        }
         for bit_idx in s..=e {
             let byte_i = bit_idx / 8;
             let bit_i = 7 - (bit_idx % 8);
@@ -276,7 +286,11 @@ pub async fn cmd_bitpos(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
         return Ok(Resp::int(-1));
     }
 
-    let end_byte = end_byte.min(bytes.len().saturating_sub(1));
+    let start_byte = start_byte.min(bytes.len() - 1);
+    let end_byte = end_byte.min(bytes.len() - 1);
+    if start_byte > end_byte {
+        return Ok(Resp::int(-1));
+    }
     for (off, &byte) in bytes[start_byte..=end_byte].iter().enumerate() {
         let byte_idx = start_byte + off;
         for bit_i in (0..8u8).rev() {
@@ -566,7 +580,7 @@ pub async fn cmd_bitfield_ro(db: &Db, args: &[Resp], db_index: usize) -> Result<
             "GET" => i += 3,
             "SET" | "INCRBY" | "OVERFLOW" => {
                 return Err(NexradeError::Generic(
-                    "ERR BITFIELD_RO only supports the GET subcommand".to_string(),
+                    "BITFIELD_RO only supports the GET subcommand".to_string(),
                 ));
             }
             _ => {
@@ -608,8 +622,27 @@ fn parse_type_offset(args: &[Resp], start: usize) -> Result<(usize, bool, usize)
         .and_then(|a| a.as_str())
         .ok_or_else(|| NexradeError::WrongArity("bitfield".to_string()))?;
     let offset: usize = offset_str.parse().map_err(|_| NexradeError::BitError)?;
+    // The offset is used directly as an allocation size by the SET/INCRBY
+    // arms (`(offset + bits).div_ceil(8)` bytes), so it must be bounded just
+    // as tightly as SETBIT's — `bit.rs` bounds that one at 2^32-1 for exactly
+    // this reason. Unbounded, `BITFIELD k SET u8 17592186044416 1` asked the
+    // allocator for 2 TiB, the allocation failed, and `handle_alloc_error`
+    // called `abort()` — which no `catch_unwind` can stop, so one 30-byte
+    // unauthenticated command killed the whole server process.
+    if offset > MAX_BIT_OFFSET {
+        return Err(NexradeError::BitError);
+    }
+    // `offset + bits` must also stay representable; with `offset <= 2^32-1`
+    // and `bits <= 64` this cannot overflow, but assert it rather than rely
+    // on the caller keeping both bounds in sync.
+    if offset.checked_add(bits).is_none() {
+        return Err(NexradeError::BitError);
+    }
     Ok((bits, signed, offset))
 }
+
+/// Largest bit offset any bitmap command accepts, matching SETBIT.
+const MAX_BIT_OFFSET: usize = 4_294_967_295;
 
 fn read_bitfield(bytes: &[u8], bit_offset: usize, bits: usize, signed: bool) -> i64 {
     let mut val: u64 = 0;
@@ -654,12 +687,25 @@ fn write_bitfield(
 fn overflow_add(cur: i64, incr: i64, bits: usize, signed: bool, mode: OverflowMode) -> Option<i64> {
     let result = cur.wrapping_add(incr);
     if signed {
-        let min = -(1i64 << (bits - 1));
-        let max = (1i64 << (bits - 1)) - 1;
+        // `1i64 << 63` is a shift overflow and `-(1i64 << 63)` an arithmetic
+        // one — both panic under `overflow-checks` and silently wrap to
+        // nonsense in release, so i64::MIN/MAX must be spelled out. The wrap
+        // arithmetic is done in u128 because a 64-bit field's span (2^64) does
+        // not fit in either i64 or u64.
+        let min = if bits == 64 {
+            i64::MIN
+        } else {
+            -(1i64 << (bits - 1))
+        };
+        let max = if bits == 64 {
+            i64::MAX
+        } else {
+            (1i64 << (bits - 1)) - 1
+        };
         match mode {
             OverflowMode::Wrap => {
-                let range = 1i64 << bits;
-                Some(((result - min).rem_euclid(range)) + min)
+                let span = 1i128 << bits;
+                Some((((result as i128) - (min as i128)).rem_euclid(span) + (min as i128)) as i64)
             }
             OverflowMode::Sat => Some(result.clamp(min, max)),
             OverflowMode::Fail => {
@@ -678,8 +724,8 @@ fn overflow_add(cur: i64, incr: i64, bits: usize, signed: bool, mode: OverflowMo
         };
         match mode {
             OverflowMode::Wrap => {
-                let range = if bits == 64 { u64::MAX } else { 1u64 << bits };
-                Some((result as u64).wrapping_rem(range) as i64)
+                let span = 1u128 << bits;
+                Some(((result as u128).rem_euclid(span)) as i64)
             }
             OverflowMode::Sat => Some(result.clamp(0, max)),
             OverflowMode::Fail => {

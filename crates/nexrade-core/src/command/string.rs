@@ -605,10 +605,18 @@ pub async fn cmd_incrbyfloat(db: &Db, args: &[Resp], db_index: usize) -> Result<
     // Format like Redis (strip trailing zeros)
     let s = format_float(new_val);
     let resp = Resp::bulk_str(s.clone());
+    // INCRBYFLOAT is an in-place update, so it must keep the key's TTL —
+    // `Entry::new` carries no expiry, and `insert` replaces the whole entry.
+    // Without this, `SET k 10 EX 1000` + `INCRBYFLOAT k 5` silently turned a
+    // volatile key into a permanent one (TTL went to -1).
+    let prev_expiry = store_db.get(&key).and_then(|e| e.expiry.clone());
     store_db.insert(
-        key,
+        key.clone(),
         Entry::new(DataType::String(Bytes::from(s.into_bytes()))),
     );
+    if let Some(expiry) = prev_expiry {
+        store_db.set_expiry(&key, Some(expiry));
+    }
     Ok(resp)
 }
 
@@ -656,6 +664,18 @@ pub async fn cmd_append(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
                 owned.extend_from_slice(&val);
                 let len = owned.len() as i64;
                 let d = (owned.len() as isize) - 8;
+                e.value = DataType::String(Bytes::from(owned));
+                (Ok(Resp::int(len)), d)
+            }
+            // A bitmap is an ordinary string as far as APPEND is concerned
+            // (Redis has no separate bitmap type), so append to its bytes
+            // and promote the entry back to `String`.
+            DataType::Bitmap(v) => {
+                let old_len = v.len();
+                let mut owned = v.clone();
+                owned.extend_from_slice(&val);
+                let len = owned.len() as i64;
+                let d = (owned.len() as isize) - (old_len as isize);
                 e.value = DataType::String(Bytes::from(owned));
                 (Ok(Resp::int(len)), d)
             }
@@ -746,13 +766,40 @@ pub async fn cmd_setrange(db: &Db, args: &[Resp], db_index: usize) -> Result<Res
         },
     };
 
-    let end = offset + patch.len();
+    // An empty patch writes nothing, so it must not extend the string —
+    // otherwise `SETRANGE k 536870911 ""` allocated 512 MB to store a zero
+    // length value. Redis reports the current length and leaves a missing
+    // key missing in this case.
+    if patch.is_empty() {
+        return Ok(Resp::int(bytes.len() as i64));
+    }
+
+    // The bound above only covers `offset`; the patch extends the string past
+    // it, so bound the *result*. Redis applies the same limit to
+    // `offset + len` and answers "string exceeds maximum allowed size".
+    let end = match offset.checked_add(patch.len()) {
+        Some(end) if end <= MAX_SETRANGE_OFFSET as usize => end,
+        _ => {
+            return Err(NexradeError::Generic(
+                "string exceeds maximum allowed size (512MB)".to_string(),
+            ));
+        }
+    };
     if end > bytes.len() {
         bytes.resize(end, 0);
     }
     bytes[offset..end].copy_from_slice(&patch);
     let len = bytes.len() as i64;
-    store_db.insert(key, Entry::new(DataType::String(Bytes::from(bytes))));
+    // Same TTL-preservation requirement as INCRBYFLOAT above: SETRANGE
+    // updates the value in place and must not drop the expiry.
+    let prev_expiry = store_db.get(&key).and_then(|e| e.expiry.clone());
+    store_db.insert(
+        key.clone(),
+        Entry::new(DataType::String(Bytes::from(bytes))),
+    );
+    if let Some(expiry) = prev_expiry {
+        store_db.set_expiry(&key, Some(expiry));
+    }
     Ok(Resp::int(len))
 }
 
@@ -795,7 +842,7 @@ pub async fn cmd_lcs(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
                 let n = get_i64(args, i + 1, "LCS")?;
                 if n < 0 {
                     return Err(NexradeError::Generic(
-                        "ERR value is not an integer or out of range".to_string(),
+                        "value is not an integer or out of range".to_string(),
                     ));
                 }
                 min_match_len = n as usize;

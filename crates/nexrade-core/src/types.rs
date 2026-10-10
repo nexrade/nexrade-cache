@@ -179,8 +179,16 @@ impl Clone for DataType {
 impl DataType {
     /// Render this value's string-representable bytes, if it has one.
     /// `String` returns a refcount-bumped `Bytes` (O(1)); `Int` formats the
-    /// current atomic value via `itoa`. Every other variant returns `None` —
-    /// callers should treat that as `WrongType`.
+    /// current atomic value via `itoa`; `Bitmap` clones its backing buffer.
+    /// Every other variant returns `None` — callers should treat that as
+    /// `WrongType`.
+    ///
+    /// `Bitmap` must be included: Redis has no separate bitmap type, so a key
+    /// created by `SETBIT`/`BITOP`/`BITFIELD` is an ordinary string. Excluding
+    /// it made `TYPE k` report `string` while `GET`, `STRLEN`, `APPEND` and
+    /// every other string command answered `WRONGTYPE` on that same key.
+    /// Mutating string commands all write back through `insert(String)`, so
+    /// promoting a `Bitmap` here costs one clone on read and nothing on write.
     pub fn as_string_bytes(&self) -> Option<Bytes> {
         match self {
             DataType::String(v) => Some(v.clone()),
@@ -188,6 +196,7 @@ impl DataType {
                 let mut buf = itoa::Buffer::new();
                 Some(Bytes::copy_from_slice(buf.format(cell.load()).as_bytes()))
             }
+            DataType::Bitmap(v) => Some(Bytes::from(v.clone())),
             _ => None,
         }
     }

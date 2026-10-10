@@ -337,7 +337,7 @@ pub async fn cmd_smove(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
     let dst = get_bytes_vec(args, 2, "SMOVE")?;
     let member = get_bytes_vec(args, 3, "SMOVE")?;
 
-    let result = db.store.db(db_index).smove_atomic(&src, dst, member);
+    let result = db.store.db(db_index).smove_atomic(&src, dst, member)?;
     Ok(Resp::int(result))
 }
 
@@ -354,6 +354,10 @@ pub async fn cmd_srandmember(db: &Db, args: &[Resp], db_index: usize) -> Result<
 
     let store_db = db.store.db(db_index).read_for(&key);
     match store_db.get_ro(&key) {
+        // With a count, a missing key is an *empty array*, not a nil — RESP
+        // distinguishes `*0` from `$-1`, and clients that read
+        // `SRANDMEMBER k 3` in a loop key off that difference.
+        None if count.is_some() => Ok(Resp::array(vec![])),
         None => Ok(Resp::null()),
         Some(e) => match &e.value {
             DataType::Set(s) => {
@@ -371,8 +375,10 @@ pub async fn cmd_srandmember(db: &Db, args: &[Resp], db_index: usize) -> Result<
                         .unwrap_or(Resp::null())),
                     Some(n) => {
                         let result: Vec<Resp> = if n < 0 {
-                            // Negative count: `|n|` members *with* repetition.
-                            let count = n.unsigned_abs() as usize;
+                            // Negative count: `|n|` members *with* repetition,
+                            // capped — see `MAX_RANDOM_SAMPLE`.
+                            let count =
+                                (n.unsigned_abs() as usize).min(crate::command::MAX_RANDOM_SAMPLE);
                             (0..count)
                                 .map(|_| {
                                     s.get_at(pseudo_rand_idx(len))
@@ -424,6 +430,9 @@ pub async fn cmd_spop(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     let mut emptied = false;
     let mut payload_delta: isize = 0;
     let result = match store_db.get_mut(&key) {
+        // Same RESP contract as SRANDMEMBER: with a count, a missing key is an
+        // empty array rather than a nil.
+        None if count.is_some() => Ok(Resp::array(vec![])),
         None => Ok(Resp::null()),
         Some(e) => match &mut e.value {
             DataType::Set(s) => {

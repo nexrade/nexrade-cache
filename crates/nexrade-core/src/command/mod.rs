@@ -157,6 +157,20 @@ pub(crate) struct ScanPage<T> {
 /// Select one page of a SCAN-family iteration **without ordering the whole
 /// collection**.
 ///
+/// Upper bound on the page size a single `HSCAN`/`SSCAN`/`ZSCAN` will build,
+/// regardless of the `COUNT` the client asked for.
+pub(crate) const MAX_SCAN_PAGE: usize = 10_000;
+
+/// Upper bound on a negative `count` for `SRANDMEMBER`/`HRANDFIELD`/
+/// `ZRANDMEMBER`, which return `|count|` samples *with repetition*.
+///
+/// Redis applies no cap here, but `Range<usize>` is a `TrustedLen` iterator,
+/// so `(0..count).collect()` pre-allocates all of it up front —
+/// `SRANDMEMBER s -1000000000` on a one-element set requested 32 GB from a
+/// ~20-byte command. Sampling far more than this from a single key has no
+/// practical use, so cap it.
+pub(crate) const MAX_RANDOM_SAMPLE: usize = 100_000;
+
 /// Yields the `limit` smallest elements strictly after `cursor` in
 /// `(token, bytes)` order — exactly the elements that materialising,
 /// `scan_sort_by_token`-ing, and slicing the collection produced, in the same
@@ -208,6 +222,18 @@ where
                 .then_with(|| self.bytes.cmp(&other.bytes))
         }
     }
+
+    // `limit` arrives straight from the client's `COUNT` argument and is used
+    // verbatim as a `BinaryHeap` pre-allocation size. Only `n <= 0` was
+    // rejected at the call sites, so `HSCAN h 0 COUNT 9223372036854775807`
+    // asked for a 2^63-element heap and panicked with "capacity overflow".
+    // `store.rs::scan_page` already applies the same kind of `.min(1024)`
+    // clamp for plain SCAN; this is the container-scan counterpart.
+    //
+    // COUNT is a *hint* in the SCAN family — returning a smaller page than
+    // requested is explicitly allowed, and the client just iterates again —
+    // so capping it is safe and costs nothing.
+    let limit = limit.min(MAX_SCAN_PAGE);
 
     if limit == 0 {
         return ScanPage {
@@ -330,6 +356,36 @@ pub fn get_i64(args: &[Resp], idx: usize, cmd: &str) -> Result<i64> {
 pub fn get_f64(args: &[Resp], idx: usize, cmd: &str) -> Result<f64> {
     let s = get_str(args, idx, cmd)?;
     s.parse::<f64>().map_err(|_| NexradeError::NotFloat)
+}
+
+/// Convert a blocking-command timeout argument into a `Duration`.
+///
+/// The client sends this as a float, and Rust's `parse::<f64>` happily accepts
+/// `-1`, `inf`, `-inf` and `NaN` — all of which `Duration::from_secs_f64`
+/// documents as panicking. A single `BLPOP key -1` therefore killed the
+/// connection task with a panic in the middle of the dispatch loop.
+///
+/// `0` keeps its Redis meaning of "block forever", and an absurdly large but
+/// finite value (e.g. `1e30`) saturates to the same, since that is plainly
+/// what the client meant.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn blocking_duration(timeout_secs: f64, cmd: &str) -> Result<std::time::Duration> {
+    // Must come before the comparisons below: every comparison against NaN is
+    // false, so `NaN` would otherwise fall through to `from_secs_f64`.
+    if !timeout_secs.is_finite() {
+        return Err(NexradeError::Generic(format!(
+            "timeout is not a finite number for '{cmd}'"
+        )));
+    }
+    if timeout_secs < 0.0 {
+        return Err(NexradeError::Generic(format!(
+            "timeout is negative for '{cmd}'"
+        )));
+    }
+    if timeout_secs == 0.0 || timeout_secs >= u64::MAX as f64 {
+        return Ok(std::time::Duration::from_secs(u64::MAX));
+    }
+    Ok(std::time::Duration::from_secs_f64(timeout_secs))
 }
 
 /// Returns true if the command mutates data (used for dirty tracking and AOF).
@@ -900,7 +956,7 @@ async fn dispatch_inner(
         // nexrade-cache process; for redis-py, set `sentinel=None` or
         // pin to the standalone client.
         "SENTINEL" => Err(NexradeError::Generic(
-            "ERR SENTINEL is not supported by nexrade-cache (standalone server). \
+            "SENTINEL is not supported by nexrade-cache (standalone server). \
              See docs/redis-sentinel-compat.md for failover guidance."
                 .to_string(),
         )),

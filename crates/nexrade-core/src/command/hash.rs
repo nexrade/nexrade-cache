@@ -339,13 +339,23 @@ pub async fn cmd_hincrbyfloat(db: &Db, args: &[Resp], db_index: usize) -> Result
 
     let mut store_db = db.store.db(db_index).write_for(&key);
     let (s, payload_delta) = {
-        let hash = get_or_create_hash(&mut store_db, &key)?;
-        let current: f64 = match hash.get(&field) {
+        // Read first, create second. `get_or_create_hash` ran unconditionally
+        // before the overflow check, so `HINCRBYFLOAT nosuchkey f 1e309`
+        // returned "increment would produce NaN or Infinity" and left behind
+        // an empty hash — a key the client never wrote, visible to DBSIZE,
+        // SCAN and the eviction policy.
+        let current: f64 = match store_db.get(&key) {
             None => 0.0,
-            Some(v) => std::str::from_utf8(&v)
-                .map_err(|_| NexradeError::NotFloat)?
-                .parse()
-                .map_err(|_| NexradeError::NotFloat)?,
+            Some(e) => match &e.value {
+                DataType::Hash(h) => match h.get(&field) {
+                    None => 0.0,
+                    Some(v) => std::str::from_utf8(&v)
+                        .map_err(|_| NexradeError::NotFloat)?
+                        .parse()
+                        .map_err(|_| NexradeError::NotFloat)?,
+                },
+                _ => return Err(NexradeError::WrongType),
+            },
         };
         let new_val = current + delta;
         if new_val.is_nan() || new_val.is_infinite() {
@@ -354,6 +364,7 @@ pub async fn cmd_hincrbyfloat(db: &Db, args: &[Resp], db_index: usize) -> Result
             ));
         }
         let s = format_float(new_val);
+        let hash = get_or_create_hash(&mut store_db, &key)?;
         let (_is_new, d) = hash.insert(field, s.as_bytes().to_vec());
         (s, d)
     };
@@ -461,7 +472,9 @@ pub async fn cmd_hrandfield(db: &Db, args: &[Resp], db_index: usize) -> Result<R
                     }
                     Some(n) => {
                         let result: Vec<Resp> = if n < 0 {
-                            let count = n.unsigned_abs() as usize;
+                            // Capped — see `MAX_RANDOM_SAMPLE`.
+                            let count =
+                                (n.unsigned_abs() as usize).min(crate::command::MAX_RANDOM_SAMPLE);
                             (0..count)
                                 .map(|_| {
                                     let idx = pseudo_rand_idx(fields.len());
