@@ -1026,6 +1026,24 @@ impl Connection {
     // ── Pub/Sub ───────────────────────────────────────────────────────────────
 
     async fn do_subscribe(&mut self, args: &[Resp], is_pattern: bool) {
+        let kind = if is_pattern {
+            "psubscribe"
+        } else {
+            "subscribe"
+        };
+        // With no channel there is nothing to subscribe to. Redis answers
+        // with an arity error; without this the loop below is a no-op and
+        // the client waits forever for a reply that never arrives.
+        if args.len() < 2 {
+            self.write_buf.clear();
+            Resp::error(format!(
+                "ERR wrong number of arguments for '{kind}' command"
+            ))
+            .write_to_for_version(&mut self.write_buf, self.resp_version);
+            self.write_buf.finalize();
+            let _ = self.stream.write_all_buf(&mut self.write_buf).await;
+            return;
+        }
         for arg in args.iter().skip(1) {
             let channel_bytes: Bytes = match arg {
                 Resp::BulkString(Some(b)) => b.clone(),
@@ -1064,11 +1082,6 @@ impl Connection {
             }
 
             let sub_count = target.len() as i64;
-            let kind = if is_pattern {
-                "psubscribe"
-            } else {
-                "subscribe"
-            };
             let payload = vec![
                 Resp::bulk_str(kind),
                 Resp::bulk(channel_bytes),
