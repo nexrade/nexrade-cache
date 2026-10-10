@@ -53,11 +53,17 @@ fn parse_id_bound(s: &str, is_start: bool, allow_dollar: bool) -> Result<StreamI
     if !is_start && s == "+" {
         return Ok(StreamId::MAX);
     }
-    StreamId::parse(s).ok_or_else(|| {
-        NexradeError::Generic(
-            "ERR Invalid stream ID specified as stream command argument".to_string(),
-        )
-    })
+    // Redis accepts a bare millisecond component as `ms-0`, so `XREAD STREAMS
+    // s 5` and `XADD s 5 ...` are both valid spellings. `StreamId::parse`
+    // requires the `-seq` half and rejected them.
+    match StreamId::parse(s) {
+        Some(id) => Ok(id),
+        None => s.parse::<u64>().map(|ms| StreamId(ms, 0)).map_err(|_| {
+            NexradeError::Generic(
+                "Invalid stream ID specified as stream command argument".to_string(),
+            )
+        }),
+    }
 }
 
 /// Largest parsed id in the stream for XADD validation.
@@ -108,21 +114,89 @@ macro_rules! get_stream_mut {
 
 // ── XADD ─────────────────────────────────────────────────────────────────────
 
+/// Skip an optional `~` (approximate) / `=` (exact) trimming hint that may
+/// follow `MAXLEN` or `MINID`.
+fn skip_trim_hint(args: &[Resp], i: &mut usize) {
+    if let Some(t) = args.get(*i).and_then(|a| a.as_str()) {
+        if t == "~" || t == "=" {
+            *i += 1;
+        }
+    }
+}
+
 pub async fn cmd_xadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     if args.len() < 5 {
         return Err(NexradeError::WrongArity("xadd".to_string()));
     }
     let key = get_bytes_vec(args, 1, "XADD")?;
-    let id_str = get_str(args, 2, "XADD")?;
+
+    // The trimming modifiers sit *between* the key and the entry id. They used
+    // to fall straight into the field/value loop below, so
+    // `XADD s * MAXLEN 1000 f v` stored a field literally named "MAXLEN" whose
+    // value was "1000" and silently dropped the caller's real payload — and an
+    // odd-count trailing modifier (`XADD s * NOMKSTREAM f v`) dropped the last
+    // field/value pair on the floor while still replying `+<id>`.
+    let mut i = 2;
+    let mut nomkstream = false;
+    let mut maxlen: Option<usize> = None;
+    let mut minid: Option<StreamId> = None;
+
+    loop {
+        let Some(tok) = args.get(i).and_then(|a| a.as_str()) else {
+            return Err(NexradeError::WrongArity("xadd".to_string()));
+        };
+        match tok.to_uppercase().as_str() {
+            "NOMKSTREAM" => {
+                nomkstream = true;
+                i += 1;
+            }
+            // `MAXLEN [~|=] threshold`. The hint is accepted and ignored:
+            // trimming exactly is always a legal answer to a `~` request, it
+            // just trims more eagerly than strictly required.
+            "MAXLEN" => {
+                i += 1;
+                skip_trim_hint(args, &mut i);
+                let n = get_i64(args, i, "XADD")?;
+                if n < 0 {
+                    return Err(NexradeError::Generic(
+                        "The MAXLEN argument must be >= 0.".to_string(),
+                    ));
+                }
+                maxlen = Some(n as usize);
+                i += 1;
+            }
+            "MINID" => {
+                i += 1;
+                skip_trim_hint(args, &mut i);
+                let raw = get_str(args, i, "XADD")?;
+                minid = Some(StreamId::parse(raw).ok_or_else(|| {
+                    NexradeError::Generic(
+                        "Invalid stream ID specified as stream command argument".to_string(),
+                    )
+                })?);
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+
+    let id_str = get_str(args, i, "XADD")?;
+    i += 1;
 
     let mut fields = Vec::new();
-    let mut i = 3;
-    while i + 1 < args.len() {
+    while i < args.len() {
+        if i + 1 >= args.len() {
+            // A dangling final field name used to be dropped without error.
+            return Err(NexradeError::SyntaxError);
+        }
         fields.push((
             get_bytes_vec(args, i, "XADD")?,
             get_bytes_vec(args, i + 1, "XADD")?,
         ));
         i += 2;
+    }
+    if fields.is_empty() {
+        return Err(NexradeError::WrongArity("xadd".to_string()));
     }
 
     // Pre-read stream to compute the auto-id under the lock-free path.
@@ -133,6 +207,12 @@ pub async fn cmd_xadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
             _ => None,
         })
     };
+
+    // `NOMKSTREAM` must not create the stream, so this check has to run
+    // *before* `get_stream_mut!` inserts the empty shell.
+    if nomkstream && db.store.db(db_index).read_for(&key).get_ro(&key).is_none() {
+        return Ok(Resp::null());
+    }
 
     let id = if id_str == "*" {
         // Auto-id: ms = now, seq = 0 (or higher if another entry already
@@ -162,7 +242,38 @@ pub async fn cmd_xadd(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> {
     stream.entries.push(entry);
     stream.last_id = id.clone();
     stream.entries_added = stream.entries_added.saturating_add(1);
-    store_db.adjust_live_bytes(entry_delta);
+    let mut delta = entry_delta;
+
+    // Apply the trimming modifiers under the same lock that appended, so the
+    // net live-bytes delta is exact. Entries are appended in ascending id
+    // order, so `drain(..n)` and `take_while(id < min)` both drop the oldest.
+    if let Some(max) = maxlen {
+        if stream.entries.len() > max {
+            let to_remove = stream.entries.len() - max;
+            let dropped: usize = stream.entries[..to_remove]
+                .iter()
+                .map(StreamEntry::payload_bytes)
+                .sum();
+            stream.entries.drain(..to_remove);
+            delta -= dropped as isize;
+        }
+    }
+    if let Some(min) = minid {
+        let to_remove = stream
+            .entries
+            .iter()
+            .take_while(|e| StreamId::parse(&e.id).is_some_and(|id| id < min))
+            .count();
+        if to_remove > 0 {
+            let dropped: usize = stream.entries[..to_remove]
+                .iter()
+                .map(StreamEntry::payload_bytes)
+                .sum();
+            stream.entries.drain(..to_remove);
+            delta -= dropped as isize;
+        }
+    }
+    store_db.adjust_live_bytes(delta);
 
     // Wake any XREAD/XREADGROUP BLOCK callers waiting on this shard. The
     // re-check inside their wait loop filters by key, so cross-stream
@@ -187,9 +298,7 @@ pub async fn cmd_xsetid(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
     let key = get_bytes_vec(args, 1, "XSETID")?;
     let new_id_str = get_str(args, 2, "XSETID")?;
     let new_id = StreamId::parse(new_id_str).ok_or_else(|| {
-        NexradeError::Generic(
-            "ERR Invalid stream ID specified as stream command argument".to_string(),
-        )
+        NexradeError::Generic("Invalid stream ID specified as stream command argument".to_string())
     })?;
 
     let mut entries_added: Option<u64> = None;
@@ -201,7 +310,7 @@ pub async fn cmd_xsetid(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
                 let n = get_i64(args, i + 1, "XSETID")?;
                 if n < 0 {
                     return Err(NexradeError::Generic(
-                        "ERR ENTRIESADDED must be a non-negative integer".to_string(),
+                        "ENTRIESADDED must be a non-negative integer".to_string(),
                     ));
                 }
                 entries_added = Some(n as u64);
@@ -227,7 +336,7 @@ pub async fn cmd_xsetid(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
     if let Some(cur) = last_parsed_id(stream) {
         if new_id < cur {
             return Err(NexradeError::Generic(
-                "ERR The ID specified in XSETID is smaller than the current top entry".to_string(),
+                "The ID specified in XSETID is smaller than the current top entry".to_string(),
             ));
         }
     }
@@ -238,56 +347,56 @@ pub async fn cmd_xsetid(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
     Ok(Resp::ok())
 }
 
+fn invalid_stream_id() -> NexradeError {
+    NexradeError::Generic("Invalid stream ID specified as stream command argument".to_string())
+}
+
 /// Resolve an explicit `XADD` id spec into a concrete numeric `StreamId`.
-/// Spec forms accepted: `ms-seq`, `ms-*` (auto-seq), `*-seq` (auto-ms).
+/// Spec forms accepted: `ms-seq`, `ms-*` (auto-seq), `*-seq` (auto-ms), and a
+/// bare `ms` (Redis reads that as `ms-0`).
 fn resolve_xadd_id(spec: &str, last: Option<StreamId>) -> Result<StreamId> {
-    let (ms_part, seq_part) = spec.split_once('-').ok_or_else(|| {
-        NexradeError::Generic(
-            "ERR Invalid stream ID specified as stream command argument".to_string(),
-        )
-    })?;
-
     let ms_now = now_ms();
-    let ms: u64 = if ms_part == "*" {
-        // Auto-ms: if last entry is from the current ms, must match it;
-        // otherwise use now.
-        match last {
-            Some(StreamId(lm, _)) if lm >= ms_now => lm,
-            _ => ms_now,
+
+    let id = match spec.split_once('-') {
+        Some((ms_part, seq_part)) => {
+            let ms: u64 = if ms_part == "*" {
+                // Auto-ms: if last entry is from the current ms, must match it;
+                // otherwise use now.
+                match last {
+                    Some(StreamId(lm, _)) if lm >= ms_now => lm,
+                    _ => ms_now,
+                }
+            } else {
+                ms_part.parse().map_err(|_| invalid_stream_id())?
+            };
+
+            let seq: u64 = if seq_part == "*" {
+                match last {
+                    Some(StreamId(lm, ls)) if lm == ms => ls + 1,
+                    _ => 0,
+                }
+            } else {
+                seq_part.parse().map_err(|_| invalid_stream_id())?
+            };
+            StreamId(ms, seq)
         }
-    } else {
-        ms_part.parse().map_err(|_| {
-            NexradeError::Generic(
-                "ERR Invalid stream ID specified as stream command argument".to_string(),
-            )
-        })?
+        // A bare millisecond component means `ms-0`. Rejecting it meant every
+        // client that built ids by string-concatenating the timestamp —
+        // `XREAD STREAMS s $(date +%s%3N)` — got an error instead of a range.
+        None => StreamId(spec.parse().map_err(|_| invalid_stream_id())?, 0),
     };
 
-    let seq: u64 = if seq_part == "*" {
-        match last {
-            Some(StreamId(lm, ls)) if lm == ms => ls + 1,
-            _ => 0,
-        }
-    } else {
-        seq_part.parse().map_err(|_| {
-            NexradeError::Generic(
-                "ERR Invalid stream ID specified as stream command argument".to_string(),
-            )
-        })?
-    };
-
-    let id = StreamId(ms, seq);
     if let Some(prev) = last {
         if id <= prev {
             return Err(NexradeError::Generic(
-                "ERR The ID specified in XADD is equal or smaller than the target stream top item"
+                "The ID specified in XADD is equal or smaller than the target stream top item"
                     .to_string(),
             ));
         }
-    } else if ms == 0 && seq == 0 {
+    } else if id == StreamId(0, 0) {
         // Redis disallows `0-0` as the very first entry in a stream.
         return Err(NexradeError::Generic(
-            "ERR The ID specified in XADD must be greater than 0-0".to_string(),
+            "The ID specified in XADD must be greater than 0-0".to_string(),
         ));
     }
     Ok(id)
@@ -323,7 +432,7 @@ pub async fn cmd_xrange(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp>
         let n = get_i64(args, 5, "XRANGE")?;
         if n < 0 {
             return Err(NexradeError::Generic(
-                "ERR value is not an integer or out of range".to_string(),
+                "value is not an integer or out of range".to_string(),
             ));
         }
         Some(n as usize)
@@ -369,7 +478,7 @@ pub async fn cmd_xrevrange(db: &Db, args: &[Resp], db_index: usize) -> Result<Re
         let n = get_i64(args, 5, "XREVRANGE")?;
         if n < 0 {
             return Err(NexradeError::Generic(
-                "ERR value is not an integer or out of range".to_string(),
+                "value is not an integer or out of range".to_string(),
             ));
         }
         Some(n as usize)
@@ -421,7 +530,7 @@ pub async fn cmd_xread(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
                 let n = get_i64(args, i + 1, "XREAD")?;
                 if n < 0 {
                     return Err(NexradeError::Generic(
-                        "ERR value is not an integer or out of range".to_string(),
+                        "value is not an integer or out of range".to_string(),
                     ));
                 }
                 count = Some(n as usize);
@@ -430,9 +539,7 @@ pub async fn cmd_xread(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
             "BLOCK" => {
                 let ms = get_i64(args, i + 1, "XREAD")?;
                 if ms < 0 {
-                    return Err(NexradeError::Generic(
-                        "ERR value is out of range".to_string(),
-                    ));
+                    return Err(NexradeError::Generic("value is out of range".to_string()));
                 }
                 // 0 means "block forever" — represent as u64::MAX sentinel.
                 block_ms = Some(if ms == 0 { u64::MAX } else { ms as u64 });
@@ -559,7 +666,33 @@ pub async fn cmd_xtrim(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
     }
     let key = get_bytes_vec(args, 1, "XTRIM")?;
     let strategy = get_str(args, 2, "XTRIM")?.to_uppercase();
-    let threshold = get_i64(args, 3, "XTRIM")? as usize;
+
+    // `XTRIM key <MAXLEN|MINID> [~|=] threshold`
+    let mut i = 3;
+    skip_trim_hint(args, &mut i);
+    let token = get_str(args, i, "XTRIM")?;
+    let maxlen = if strategy == "MAXLEN" {
+        let n = token.parse::<i64>().map_err(|_| NexradeError::NotInteger)?;
+        if n < 0 {
+            return Err(NexradeError::Generic(
+                "The MAXLEN argument must be >= 0.".to_string(),
+            ));
+        }
+        Some(n as usize)
+    } else if strategy == "MINID" {
+        None
+    } else {
+        return Err(NexradeError::SyntaxError);
+    };
+    let minid = if maxlen.is_none() {
+        Some(StreamId::parse(token).ok_or_else(|| {
+            NexradeError::Generic(
+                "Invalid stream ID specified as stream command argument".to_string(),
+            )
+        })?)
+    } else {
+        None
+    };
 
     let mut store_db = db.store.db(db_index).write_for(&key);
     let mut payload_delta: isize = 0;
@@ -568,8 +701,16 @@ pub async fn cmd_xtrim(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
         Some(e) => match &mut e.value {
             DataType::Stream(s) => {
                 let old_len = s.entries.len();
-                if strategy == "MAXLEN" && s.entries.len() > threshold {
-                    let to_remove = s.entries.len() - threshold;
+                let to_remove = match (maxlen, minid) {
+                    (Some(max), _) => s.entries.len().saturating_sub(max),
+                    (None, Some(min)) => s
+                        .entries
+                        .iter()
+                        .take_while(|e| StreamId::parse(&e.id).is_some_and(|id| id < min))
+                        .count(),
+                    (None, None) => 0,
+                };
+                if to_remove > 0 {
                     let dropped: usize = s.entries[..to_remove]
                         .iter()
                         .map(StreamEntry::payload_bytes)
@@ -670,7 +811,7 @@ async fn xgroup_create(db: &Db, args: &[Resp], db_index: usize) -> Result<Resp> 
             store_db.insert(key.clone(), Entry::new(DataType::Stream(StreamData::new())));
         } else {
             return Err(NexradeError::Generic(
-                "ERR The XGROUP subcommand requires the key to exist".to_string(),
+                "The XGROUP subcommand requires the key to exist".to_string(),
             ));
         }
     }
@@ -853,9 +994,7 @@ pub async fn cmd_xreadgroup(db: &Db, args: &[Resp], db_index: usize) -> Result<R
             "BLOCK" => {
                 let ms = get_i64(args, i + 1, "XREADGROUP")?;
                 if ms < 0 {
-                    return Err(NexradeError::Generic(
-                        "ERR value is out of range".to_string(),
-                    ));
+                    return Err(NexradeError::Generic("value is out of range".to_string()));
                 }
                 block_ms = Some(if ms == 0 { u64::MAX } else { ms as u64 });
                 i += 2;
@@ -1011,19 +1150,24 @@ pub async fn cmd_xreadgroup(db: &Db, args: &[Resp], db_index: usize) -> Result<R
                 let notified = db.stream_chan.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                #[cfg(not(target_arch = "wasm32"))]
-                let _permit = match db.persistence.enter_mutation() {
-                    Some(p) => p,
-                    None => {
-                        return Err(NexradeError::Generic(
-                            "MISCONF persistence is quiescing; writes are temporarily disabled"
-                                .to_string(),
-                        ))
+                // Permit scoped to the read/publish attempt only, so it is released
+                // before `notified.await`. Holding it across the park keeps
+                // `active_mutations` above zero indefinitely and wedges
+                // every `quiesce()` caller (BGSAVE, BGREWRITEAOF, shutdown).
+                {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _permit =
+                        match db.persistence.enter_mutation() {
+                            Some(p) => p,
+                            None => return Err(NexradeError::Generic(
+                                "MISCONF persistence is quiescing; writes are temporarily disabled"
+                                    .to_string(),
+                            )),
+                        };
+                    let snap = read_once(&key_specs)?;
+                    if has_entries(&snap) {
+                        return Ok::<Resp, NexradeError>(snap);
                     }
-                };
-                let snap = read_once(&key_specs)?;
-                if has_entries(&snap) {
-                    return Ok::<Resp, NexradeError>(snap);
                 }
                 notified.await;
             }
@@ -1550,7 +1694,7 @@ pub async fn cmd_xautoclaim(db: &Db, args: &[Resp], db_index: usize) -> Result<R
     } else {
         StreamId::parse(start_str).ok_or_else(|| {
             NexradeError::Generic(
-                "ERR Invalid stream ID specified as stream command argument".to_string(),
+                "Invalid stream ID specified as stream command argument".to_string(),
             )
         })?
     };
