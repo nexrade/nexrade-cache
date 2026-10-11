@@ -22,8 +22,9 @@ The application is **always pointed at the primary**. Use the
 connected replicas before returning to the caller.
 
 Run:
-  nexrade-cache --port 6380 --replicaof-zone B :6380  # on zone B
-  nexrade-cache --port 6380 --replicaof-zone C :6380  # on zone C
+  nexrade-cache --port 6380                      # on the primary (zone A)
+  nexrade-cache --port 6380                      # on zone B and zone C
+  redis-cli -p 6380 REPLICAOF 10.0.0.10 6380     # on each replica
   python3 examples/12-cache-patterns/multi_az_replicas.py
 """
 
