@@ -511,7 +511,8 @@ async fn join_ops_server(name: &str, handle: Option<tokio::task::JoinHandle<()>>
     }
 }
 
-/// Default tokio worker threads. See `Cli::worker_threads` for why 2.
+/// Default tokio worker threads. See `Cli::worker_threads` for the
+/// measurements behind the number.
 const DEFAULT_WORKER_THREADS: usize = 4;
 
 fn main() -> Result<()> {
