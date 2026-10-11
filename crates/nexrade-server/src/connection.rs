@@ -553,14 +553,25 @@ impl Connection {
                     self.db.stats.record_command();
                     // Serialize the command for replication propagation before args
                     // are consumed.
-                    let repl_bytes: Option<bytes::Bytes> = if is_write_command(&cmd_name)
-                        && self.db.replication.propagate_tx.is_some()
-                        && self.db.replication.propagate_subscriber_count() > 0
-                    {
-                        Some(Resp::Array(Some(args.clone())).serialize())
-                    } else {
-                        None
-                    };
+                    //
+                    // `is_write_command` is a ~100-arm string `matches!`, and it
+                    // used to be the *first* condition — so every command on a
+                    // standalone server paid for a scan whose answer is always
+                    // discarded, because there is no replica to propagate to.
+                    // Both replication checks are atomic loads, so putting them
+                    // first makes the whole expression one load and a branch in
+                    // the common case. `dispatch_tracked` still computes
+                    // `is_write_command` for its own pause/AOF gating; this
+                    // only avoids the second call on the connection side.
+                    let repl_bytes: Option<bytes::Bytes> =
+                        if self.db.replication.propagate_tx.is_some()
+                            && self.db.replication.propagate_subscriber_count() > 0
+                            && is_write_command(&cmd_name)
+                        {
+                            Some(Resp::Array(Some(args.clone())).serialize())
+                        } else {
+                            None
+                        };
 
                     let resp = dispatch_tracked(
                         &self.db,
