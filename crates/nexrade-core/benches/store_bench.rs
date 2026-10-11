@@ -472,7 +472,12 @@ fn bench_hasher_ab(c: &mut Criterion) {
         hits
     }
 
-    let shapes: [(&str, fn(u64) -> Vec<u8>); 3] = [
+    /// Builds the `n`th key of one key shape. Each shape is a different
+    /// realistic key width so the A/B covers short numeric keys, common
+    /// colon-delimited names, and maximum-length keys.
+    type KeyMaker = fn(u64) -> Vec<u8>;
+
+    let shapes: [(&str, KeyMaker); 3] = [
         ("u64_le", key_u64_le),
         ("user_n", key_user),
         ("64byte", key_64byte),
