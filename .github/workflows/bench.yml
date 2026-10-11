@@ -26,6 +26,10 @@ on:
         default: "false"
         type: choice
         options: ["true", "false"]
+      worker_threads:
+        description: "nexrade tokio worker threads (blank = server default)"
+        required: false
+        type: string
 
 # Cancel stale benchmark runs — results from an outdated commit are useless
 concurrency:
@@ -39,6 +43,11 @@ env:
   BENCH_CLIENTS: 50
   # Reduced from 100000 — still statistically meaningful, finishes ~3× faster
   BENCH_REQUESTS: 30000
+  # Overrides nexrade's tokio worker-thread count for this run. Blank means the
+  # server default is used. The runner has 4 vCPUs shared between the server and
+  # the single-threaded redis-benchmark client, so the worker count is a real
+  # variable here rather than a tuning knob that only matters in production.
+  BENCH_WORKER_THREADS: ${{ inputs.worker_threads }}
 
 jobs:
   bench:
@@ -89,11 +98,20 @@ jobs:
           # benchmark is apples-to-apples with Redis (which has no
           # `--save ''` here). Without this, nexrade pays auto-snapshot
           # cost that Redis does not, and the ratio is artificially low.
+          #
+          # `--worker-threads` is only passed when the run overrides it, so
+          # the default path exercises the server's own default.
+          WORKER_FLAG=""
+          if [ -n "$BENCH_WORKER_THREADS" ]; then
+            WORKER_FLAG="--worker-threads $BENCH_WORKER_THREADS"
+            echo "Using $WORKER_FLAG"
+          fi
           ./target/release/nexrade-cache \
             --port $NEXRADE_PORT \
             --metrics-port 9399 \
             --rdb-path "" \
-            --aof-path "" &
+            --aof-path "" \
+            $WORKER_FLAG &
           echo "NEXRADE_PID=$!" >> $GITHUB_ENV
           sleep 1
           ./target/release/nexrade-cli -p $NEXRADE_PORT PING
@@ -165,6 +183,10 @@ jobs:
           lines.append("## 📊 Benchmark Comparison: nexrade-cache vs Redis\n")
           lines.append(f"> **Clients:** {os.environ['BENCH_CLIENTS']}  "
                        f"**Requests:** {os.environ['BENCH_REQUESTS']}\n")
+          wt = os.environ.get("BENCH_WORKER_THREADS", "").strip()
+          if wt:
+              lines.append(f"> **nexrade worker threads:** {wt}  "
+                           f"**Runner vCPUs:** {os.cpu_count()}\n")
           lines.append("| Command | Redis (req/s) | nexrade-cache (req/s) | Ratio |")
           lines.append("|---------|-------------:|-----------------------:|------:|")
 
