@@ -60,6 +60,29 @@ jobs:
         with:
           shared-key: bench-run
 
+      # `Swatinem/rust-cache` archives `target/`, which includes
+      # `target/criterion/`. It restores that tree's `benchmark.json`,
+      # `estimates.json`, and `tukey.json` — but NOT `base/sample.json`.
+      #
+      # Criterion then finds a `base/` directory it cannot fully read and
+      # prints, once per benchmark:
+      #
+      #   Criterion.rs ERROR: error: Failed to access file
+      #   ".../base/sample.json": No such file or directory (os error 2)
+      #
+      # It does NOT fail the run, and the timings below are still correct.
+      # What is lost is the `change:` block — criterion silently skips the
+      # before/after comparison, so every regression check in this workflow
+      # was a no-op. Reproduced locally by deleting one `base/sample.json`
+      # and re-running: the error appears and the `change:` block does not.
+      #
+      # Dropping the restored tree makes each run start cold and
+      # self-consistent: absolute numbers are honest, and no comparison is
+      # claimed. To compare two commits, run both on one machine, or restore
+      # a full `target/criterion` tree out-of-band.
+      - name: Discard partial criterion baselines from the build cache
+        run: rm -rf target/criterion
+
       # The harness sets its own warm-up/measurement defaults (3s/10s) and a
       # 5% noise_threshold — see the module docs in store_bench.rs. We
       # deliberately do NOT override them here.
@@ -102,18 +125,25 @@ jobs:
         run: |
           echo "## Criterion benchmark results" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+          # `time:`/`thrpt:` are the measurements. The filter drops
+          # criterion's progress chatter and its ERROR lines so a summary
+          # never implies a comparison that did not happen.
           grep -E "^[a-zA-Z]|time:|thrpt:" bench-output.txt \
+            | grep -vE "Benchmarking|Warming up|Collecting|^Gnuplot|ERROR" \
             | sed 's/^[ \t]*//' >> $GITHUB_STEP_SUMMARY || true
           echo '```' >> $GITHUB_STEP_SUMMARY
           cat >> $GITHUB_STEP_SUMMARY <<'NOTE'
 
           > **These numbers are indicative, not authoritative.**
           >
-          > GitHub runners are shared and unpinned. Criterion's
-          > `Performance has regressed (p < 0.05)` answers "did the samples
-          > differ?", not "is the code slower?" — on a noisy host that comes
-          > back positive for unchanged code. Runs of an identical binary
-          > have reported both `+7.6% regressed` and `−5.3% improved`.
+          > Each run starts from a clean `target/criterion` (see the step
+          > above), so these are **absolute timings only — there is no
+          > `change:` block and no before/after comparison.** Comparing
+          > across runs would be meaningless anyway: GitHub runners are
+          > shared and unpinned, so a delta between two runs measures the
+          > host, not the code. Identical binaries have reported both
+          > `+7.6% regressed` and `−5.3% improved` against the same
+          > baseline.
           >
           > **Do not open a performance issue from this page alone.**
           > Reproduce locally with a measured noise floor:
