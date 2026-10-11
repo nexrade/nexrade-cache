@@ -1,13 +1,17 @@
 //! Redis CLUSTER primitives — CRC16 slot hashing and helper utilities
-//! for `CLUSTER KEYSLOT` / `CLUSTER NODES` / `CLUSTER INFO` and the
-//! `MOVED`/`CROSSSLOT` redirection replies.
+//! for `CLUSTER KEYSLOT` / `CLUSTER NODES` / `CLUSTER INFO`.
 //!
 //! The hash slot math is **standard** Redis (`CRC16-CCITT XMODEM` over
 //! either the whole key or just the substring between `{...}` if the
-//! key contains a hash tag). We do not yet run a real multi-node
-//! cluster — this server is single-shard. `CLUSTER NODES` reports a
-//! single self line covering slots 0..=16383, so clients (redis-py
-//! `Cluster`, `redis-cli --cluster`) can probe without erroring.
+//! key contains a hash tag), so `CLUSTER KEYSLOT` answers the same as
+//! Redis for every input.
+//!
+//! What this module does **not** do is move data. We do not run a
+//! multi-node cluster — this server is single-shard. `CLUSTER NODES`
+//! reports a single self line covering slots 0..=16383, so clients
+//! (redis-py `RedisCluster`, `redis-cli --cluster`) can probe without
+//! erroring, and no `MOVED` or `ASK` redirection is ever emitted. See
+//! `docs/cluster-compat.md`.
 
 pub const CLUSTER_SLOTS: u16 = 16384;
 pub const NODE_ID_LEN: usize = 40;
@@ -93,10 +97,17 @@ pub fn keyslot(key: &[u8]) -> u16 {
 ///
 /// Returns `Ok(())` when all keys share a slot. Returns
 /// `Err(CROSSSLOT ...)` matching the Redis Cluster error string when
-/// at least one key falls outside. Used by the standalone server to
-/// reject multi-key commands with a Redis-compatible error so redis-py
-/// `RedisCluster` and other slot-aware tooling get a clean answer
-/// instead of silently cross-sharding results.
+/// at least one key falls outside.
+///
+/// **Not called by any command path.** Standalone nexrade-cache covers all
+/// 16384 slots from one process, so every multi-key batch (`MSET`, `MGET`,
+/// `DEL`) succeeds regardless of key slots — which is what Redis does when
+/// `cluster-enabled no`. Enforcing CROSSSLOT here would break ordinary
+/// standalone usage for no compatibility gain.
+///
+/// The slot number a key reports is *not* where its data lives: shards are
+/// selected by `fnv1a` over the raw key bytes in `store.rs::shard_idx`, which
+/// never consults the hash tag. `{a}` and `{b}` co-locate in slot space only.
 pub fn check_same_slot(keys: &[&[u8]]) -> Result<(), String> {
     if keys.len() < 2 {
         return Ok(());
@@ -108,7 +119,10 @@ pub fn check_same_slot(keys: &[&[u8]]) -> Result<(), String> {
     for k in &keys[1..] {
         if keyslot(k) != base_slot {
             return Err(format!(
-                "CROSSSLOT Keys in request don't hash to the same slot.                  Key '{}' hashes to slot {}, expected slot {}.                  nexrade-cache is a standalone server; either use single-key                  commands or share a {{hash_tag}} across the keys.",
+                "CROSSSLOT Keys in request don't hash to the same slot. \
+                 Key '{}' hashes to slot {}, expected slot {}. \
+                 nexrade-cache is a standalone server; either use single-key \
+                 commands or share a {{hash_tag}} across the keys.",
                 String::from_utf8_lossy(k),
                 keyslot(k),
                 base_slot,

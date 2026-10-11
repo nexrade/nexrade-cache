@@ -255,10 +255,11 @@ pub struct Db {
     /// Stable 40-char hex node id for this server. Used by `CLUSTER MYID`
     /// and `CLUSTER NODES`. Generated at startup from a UUIDv4.
     pub cluster_node_id: String,
-    /// Whether the cluster slot routing is active. When false, no
-    /// MOVED/CROSSSLOT replies are emitted — the server behaves as a
-    /// standalone. Set via `cluster_enabled` config; defaults false so
-    /// the default user experience is unaffected.
+    /// Whether the cluster slot routing is active. Always false: it is
+    /// initialised to `false` at construction and has no setter, so no
+    /// `MOVED` or `CROSSSLOT` reply is ever emitted. The flag exists only
+    /// so `CLUSTER INFO` can report `cluster_enabled:0` with the same
+    /// shape Redis uses. See `docs/cluster-compat.md`.
     pub cluster_enabled: Arc<AtomicBool>,
     /// Lock-free mirror of `config.max_memory`. 0 means "no limit" so
     /// the dispatch path can skip the eviction check entirely without

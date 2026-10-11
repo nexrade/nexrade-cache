@@ -2600,24 +2600,29 @@ pub async fn cmd_cluster(db: &Db, args: &[Resp]) -> Result<Resp> {
             Ok(Resp::int(0))
         }
         "FAILOVER-CHECK-RAYS" => Err(NexradeError::Generic(
-            "FAILOVER-CHECK-RAYS is not available in standalone              (no quorum to check against)"
+            "FAILOVER-CHECK-RAYS is not available in standalone (no quorum to check against)"
                 .to_string(),
         )),
         "HELP" => Ok(cluster_help()),
         // 0.9.0: explicit hard-error for multi-node subcommands. The
         // probe-only subcommands above (INFO / MYID / KEYSLOT / NODES /
-        // SLOTS / COUNTKEYSINSLOT / GETKEYSINSLOT / HELP) still work so
-        // tools like `redis-cli --cluster check` can inspect the server,
-        // but anything that would mutate gossip state is rejected
-        // because nexrade-cache is a standalone server (see
+        // SLOTS / COUNTKEYSINSLOT / GETKEYSINSLOT / LINKS /
+        // COUNT-FAILURE-REPORTS / HELP) still work so tools like
+        // `redis-cli --cluster check` can inspect the server, but anything
+        // that would mutate gossip state is rejected because
+        // nexrade-cache is a standalone server (see
         // docs/cluster-compat.md).
-        "MEET" | "FORGET" | "REPLICATE" | "RESET" | "SETSLOT"
-        | "SAVECONFIG" | "FAILOVER" | "ADDSLOTS" | "ADDSLOTSRANGE"
-        | "DELSLOTS" | "DELSLOTSRANGE" | "BUMPEPOCH" => Err(
-            NexradeError::Generic(format!(
-                "ERR CLUSTER {sub} is not supported by nexrade-cache                  (standalone server). See docs/cluster-compat.md for guidance.",
-            )),
-        ),
+        //
+        // `Prefixed`, not `Generic`: the literal below carries its own
+        // `ERR ` and `Generic` would prepend a second one, putting
+        // "ERR ERR CLUSTER MEET ..." on the wire.
+        "MEET" | "FORGET" | "REPLICATE" | "RESET" | "SETSLOT" | "SAVECONFIG" | "FAILOVER"
+        | "ADDSLOTS" | "ADDSLOTSRANGE" | "DELSLOTS" | "DELSLOTSRANGE" | "BUMPEPOCH" => {
+            Err(NexradeError::Prefixed(format!(
+                "ERR CLUSTER {sub} is not supported by nexrade-cache (standalone server). \
+                 See docs/cluster-compat.md for guidance.",
+            )))
+        }
         // Anything else: still pretend we do not know it (Redis does
         // the same — unknown subcommands return OK so probes do not
         // error on newer protocol features).
@@ -2699,6 +2704,8 @@ fn cluster_help() -> Resp {
         Resp::bulk_str("COUNTKEYSINSLOT <slot>"),
         Resp::bulk_str("GETKEYSINSLOT <slot> <count>"),
         Resp::bulk_str("SLOTS"),
+        Resp::bulk_str("LINKS"),
+        Resp::bulk_str("COUNT-FAILURE-REPORTS <node-id>"),
         Resp::bulk_str("HELP"),
     ])
 }
