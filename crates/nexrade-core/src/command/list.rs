@@ -1,6 +1,5 @@
 //! List command handlers.
 
-#[cfg(not(target_arch = "wasm32"))]
 use bytes::Bytes;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::time::timeout;
