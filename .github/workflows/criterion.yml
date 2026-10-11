@@ -136,21 +136,27 @@ jobs:
 
           > **These numbers are indicative, not authoritative.**
           >
-          > Each run starts from a clean `target/criterion` (see the step
-          > above), so these are **absolute timings only — there is no
-          > `change:` block and no before/after comparison.** Comparing
-          > across runs would be meaningless anyway: GitHub runners are
-          > shared and unpinned, so a delta between two runs measures the
-          > host, not the code. Identical binaries have reported both
-          > `+7.6% regressed` and `−5.3% improved` against the same
-          > baseline.
+          > They are **absolute timings only — there is no `change:` block
+          > and no before/after comparison.** Each run starts from a cleared
+          > `target/criterion`, because the build cache otherwise restores
+          > a partial baseline tree that criterion silently discards.
+          >
+          > Comparing across runs would be meaningless regardless: these are
+          > shared, unpinned runners, so a delta between two runs measures
+          > the host, not the code. `scripts/bench_ab.py` records the same
+          > problem — seven runs of one **unchanged** binary spanned 6.8%,
+          > and one longer sequence reported `+21.9% regressed`.
           >
           > **Do not open a performance issue from this page alone.**
-          > Reproduce locally with a measured noise floor:
+          > Measure a noise floor on your own host first, then compare:
           >
           > ```
           > python3 scripts/bench_ab.py --noise-floor --pairs 8
           > python3 scripts/bench_ab.py --baseline main --pairs 8
           > ```
+          >
+          > If your change is large enough to matter, use
+          > `--sizing N` to work out how many pairs are needed to resolve a
+          > 5% effect before spending the time.
           >
           NOTE
