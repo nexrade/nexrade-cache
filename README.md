@@ -28,6 +28,12 @@ redis-cli ping
 
 Redis is great. But it ships without built-in observability, requires OpenSSL for TLS, and can't run in the browser or at the edge. nexrade-cache fixes all of that **for workloads whose command surface fits within its compatibility matrix**.
 
+Two Redis deployment features are deliberately **not** implemented, and both
+have documents explaining what to run instead:
+[`docs/cluster-compat.md`](docs/cluster-compat.md) and
+[`docs/redis-sentinel-compat.md`](docs/redis-sentinel-compat.md). Primary/replica
+replication *is* implemented — see [Replication](#replication).
+
 | | nexrade-cache | Redis OSS |
 |---|:---:|:---:|
 | RESP2 + RESP3 protocol (`HELLO`) | ✅ | ✅ |
