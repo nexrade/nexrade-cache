@@ -118,7 +118,6 @@ pub struct Connection {
     /// `"default"` for unauthenticated connections, used for ACL checks.
     authenticated_user: String,
     parser: RespParser,
-    read_buf: BytesMut,
     write_buf: SegBuf,
     transaction: Transaction,
     subscriptions: Vec<Vec<u8>>,
@@ -189,10 +188,9 @@ impl Connection {
             authenticated: !requires_auth,
             authenticated_user: "default".to_string(),
             parser: RespParser::new(),
-            // 0.7.2: 16 KiB start capacity for pipeline batches under
-            // redis-benchmark -P 50 (a 50× SET batch is ~1–2 KiB of
-            // request / reply framing; headroom avoids mid-batch growth).
-            read_buf: BytesMut::with_capacity(16 * 1024),
+            // 0.7.2: the parser's own 16 KiB buffer starts at the same size, so a
+            // pipeline batch under `redis-benchmark -P 50` is absorbed without
+            // reallocation. Socket reads land directly in it.
             write_buf: SegBuf::with_capacity(16 * 1024),
             transaction: Transaction::new(),
             subscriptions: Vec::new(),
@@ -284,7 +282,7 @@ impl Connection {
                     }
                     continue 'outer;
                 }
-                read_result = read_with_timeout(&mut self.stream, &mut self.read_buf, idle_timeout) => {
+                read_result = read_with_timeout(&mut self.stream, self.parser.read_buf_mut(), idle_timeout) => {
                     match read_result {
                         ReadOutcome::Data(n) => n,
                         ReadOutcome::Closed => {
@@ -304,8 +302,9 @@ impl Connection {
             };
 
             trace!("read {} bytes from {}", n, self.addr);
-            self.parser.feed(&self.read_buf[self.read_buf.len() - n..]);
-            self.read_buf.clear();
+            // Bytes were read straight into `self.parser` (see
+            // `read_with_timeout`'s `read_buf_mut`), so there is nothing to
+            // feed and nothing to clear.
 
             // ── Pipeline: parse all available commands, accumulate responses ──
             // Write the entire batch in a single write_all at the end.
@@ -810,8 +809,10 @@ impl Connection {
         let is_pubsub = !self.subscriptions.is_empty() || !self.pattern_subscriptions.is_empty();
         let is_multi = self.transaction.active;
 
-        let qbuf = self.read_buf.len();
-        let qbuf_free = self.read_buf.capacity().saturating_sub(self.read_buf.len());
+        // `qbuf` is "bytes read but not yet consumed by a command". Since reads now
+        // land directly in the parser, that is exactly its unparsed remainder.
+        let qbuf = self.parser.buffered_len();
+        let qbuf_free = self.parser.buffered_capacity().saturating_sub(qbuf);
         let mut g = meta.write();
         g.last_cmd.clear();
         g.last_cmd.push_str(&self.last_cmd);
@@ -1175,13 +1176,11 @@ impl Connection {
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     }
                 }
-                read = self.stream.read_buf(&mut self.read_buf) => {
+                read = self.stream.read_buf(self.parser.read_buf_mut()) => {
                     match read {
                         Ok(0) => return, // client closed
                         Ok(_) => {
                             // Drain any client input; honour QUIT by exiting.
-                            self.parser.feed(&self.read_buf);
-                            self.read_buf.clear();
                             while let Ok(Some(resp)) = self.parser.parse_one() {
                                 if let Resp::Array(Some(a)) = resp {
                                     let cmd = a.first().and_then(|x| x.as_str()).unwrap_or("").to_ascii_uppercase();
@@ -1238,13 +1237,10 @@ impl Connection {
                     }
                 }
 
-                result = self.stream.read_buf(&mut self.read_buf) => {
+                result = self.stream.read_buf(self.parser.read_buf_mut()) => {
                     match result {
                         Ok(0) | Err(_) => return,
-                        Ok(n) => {
-                            self.parser.feed(&self.read_buf[self.read_buf.len() - n..]);
-                            self.read_buf.clear();
-                        }
+                        Ok(_) => {}
                     }
 
                     loop {
@@ -1408,17 +1404,14 @@ impl Connection {
                     }
                 }
                 // Detect replica disconnection via a read that returns 0.
-                result = self.stream.read_buf(&mut self.read_buf) => {
+                result = self.stream.read_buf(self.parser.read_buf_mut()) => {
                     match result {
                         Ok(0) | Err(_) => {
                             debug!("replica {} disconnected", self.addr);
                             break;
                         }
-                        Ok(_) => {
+                        Ok(n) => {
                             // Replicas may send REPLCONF ACK — parse and handle.
-                            let n = self.read_buf.len();
-                            self.parser.feed(&self.read_buf[..]);
-                            self.read_buf.clear();
                             trace!("replica {} sent {} bytes", self.addr, n);
                             loop {
                                 match self.parser.parse_one() {

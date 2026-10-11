@@ -563,6 +563,10 @@ pub struct RespParser {
     buf: BytesMut,
 }
 
+/// Spare capacity `read_buf_mut` makes sure exists before a socket read, so
+/// `read_buf` always has room to land bytes without reallocating mid-read.
+const READ_BUF_RESERVE: usize = 16 * 1024;
+
 impl RespParser {
     pub fn new() -> Self {
         // 0.7.2: 16 KiB matches the connection read_buf so a typical
@@ -576,6 +580,27 @@ impl RespParser {
         self.buf.extend_from_slice(data);
     }
 
+    /// Mutable access to the parser's own input buffer, for callers that
+    /// read directly off the socket.
+    ///
+    /// `AsyncRead::read_buf` appends into a `BytesMut`'s spare capacity, so
+    /// handing it this buffer lets bytes land where `parse_one` will look for
+    /// them. That removes the copy that `feed()` forced: the old
+    /// read-into-`read_buf` → `feed()` → `clear()` sequence memcpy'd every
+    /// byte the server read a second time, on every request.
+    ///
+    /// Bytes already in the buffer (an incomplete command from a previous
+    /// read) are kept — `parse_one` advances past them — so a request split
+    /// across TCP segments still parses correctly.
+    pub fn read_buf_mut(&mut self) -> &mut BytesMut {
+        // `read_buf` needs spare capacity to write into. After reserving, the
+        // unparsed prefix stays at the front and new bytes land after it.
+        if self.buf.capacity() == self.buf.len() {
+            self.buf.reserve(READ_BUF_RESERVE);
+        }
+        &mut self.buf
+    }
+
     /// Number of fed-but-unparsed bytes still buffered.
     ///
     /// Lets a caller that needs a command's *raw* framing (AOF replay)
@@ -583,6 +608,12 @@ impl RespParser {
     /// `parse_one`, rather than re-encoding the parsed value.
     pub fn buffered_len(&self) -> usize {
         self.buf.len()
+    }
+
+    /// Total capacity of the input buffer — the `qbuf` denominator `CLIENT
+    /// INFO` reports alongside `buffered_len()`.
+    pub fn buffered_capacity(&self) -> usize {
+        self.buf.capacity()
     }
 
     /// Try to parse one complete RESP value from the buffer.
