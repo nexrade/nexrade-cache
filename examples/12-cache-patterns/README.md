@@ -33,7 +33,14 @@ NEXRADE_PRIMARY=10.0.0.10:6380 python3 multi_az_replicas.py
 
 ## See also
 
-- `docs/backup-restore.md` — snapshot / AOF / corruption recovery
-- `docs/multi-az-deploy.md` — primary + replicas across AZs
-- `docs/redis-sentinel-compat.md` — Sentinel is explicitly unsupported
-- `docs/dump-restore.md` — `DUMP` / `RESTORE` (`NEXD` payload)
+These topics are documented in the repository rather than in a separate
+`docs/` tree:
+
+- Snapshot / AOF / corruption recovery — README **Persistence**, and
+  `scripts/operator_drill.py` for the runnable recovery drill
+- Primary + replicas across AZs — README **Replication**, topology and
+  `WAIT` usage in `multi_az_replicas.py` above
+- `DUMP` / `RESTORE` (`NEXD` payload) — README **Persistence**; the format
+  is nexrade-native, not Redis RDB
+- Sentinel and CLUSTER — see `docs/redis-sentinel-compat.md` and
+  `docs/cluster-compat.md`

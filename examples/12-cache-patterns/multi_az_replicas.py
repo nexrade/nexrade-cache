@@ -79,7 +79,9 @@ def build_async_client() -> AsyncRedis:
 
 # Sync: write + WAIT 2 (both replicas). The app blocks until the write
 # has been acknowledged by 2 replicas (zone B + zone C) or the timeout
-# elapses — see `docs/backup-restore.md` for the WAIT semantics.
+# elapses. WAIT counts replicas that have acknowledged the write back to
+# the primary — it is not a durability barrier against node loss, so size
+# `numreplicas` against the replicas you can afford to lose.
 def sync_write_then_wait(r: redis.Redis, key: str, value: str) -> int:
     pipe = r.pipeline(transaction=False)
     pipe.set(key, value)

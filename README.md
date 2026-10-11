@@ -613,9 +613,8 @@ ZADD +4.0%.
 > both sit at ~220–235 k rps, and at `-P 1` you are measuring the socket. The
 > percentages below are real but small, and they do **not** all survive a
 > random keyspace: with `-r 50000`, `ZADD` turns into **−8.8%** (Redis speeds
-> up to 256 k while nexrade-cache stays flat at 234 k). See
-> [`docs/perf-methodology.md`](docs/perf-methodology.md#measured-against-redis-7015-160-release-validation)
-> for the full grid, including where Redis wins.
+> up to 256 k while nexrade-cache stays flat at 234 k). Both tables below are
+> the full grid, including where Redis wins.
 
 | Command | nexrade-cache | Redis 7.0.15 | Delta |
 |---------|:---:|:---:|:---:|

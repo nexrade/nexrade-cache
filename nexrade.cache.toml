@@ -5,8 +5,18 @@
 # on crash or restart is acceptable (the app repopulates on miss).
 #
 # For a general-purpose / durability-leaning setup (RDB + AOF, no memory
-# cap), see nexrade.example.toml instead. See also docs/roadmap.md and
-# docs/compat-matrix.md before adopting either profile in production.
+# cap), see nexrade.example.toml instead.
+#
+# Before adopting either profile in production, compare the two on the
+# trade-offs each one actually changes:
+#   - nexrade.cache.toml        no persistence (loss on crash is a cache miss);
+#                              a memory cap with LRU eviction.
+#   - nexrade.example.toml      RDB and/or AOF retention; no memory cap.
+#   - nexrade.production.toml   the standalone profile: one authoritative
+#                              recovery source, auth + TLS enforced, ops
+#                              surface on loopback.
+# Run `nexrade-cache --config <file> --preflight` to check a profile without
+# binding listeners.
 #
 # Start with:
 #   nexrade-cache --config nexrade.cache.toml

@@ -2,7 +2,7 @@
 #
 # Use this when nexrade-cache is a standalone durable cache backing a
 # service (single primary, optional replica). It is the configuration
-# behind `docs/backup-restore.md` and `scripts/operator_drill.py`.
+# exercised by `scripts/operator_drill.py`.
 #
 # Distinct from `nexrade.cache.toml` (pure cache, no persistence, no
 # replica tracking) and `nexrade.example.toml` (general-purpose, all

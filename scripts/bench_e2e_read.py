@@ -22,9 +22,8 @@ It is not a Redis comparison — use `scripts/bench_pipeline_set.py` for that.
 Here both arms are nexrade-cache; the point is A-vs-B on one codebase.
 
 It does not build anything. Point it at two binaries you built yourself,
-**at the same filesystem path if you care about small deltas** — see
-`docs/perf-methodology.md`; a path-length difference alone once produced an
-apparent significant −8.6%.
+**at the same filesystem path if you care about small deltas**; a
+path-length difference alone once produced an apparent significant −8.6%.
 
 ## Usage
 

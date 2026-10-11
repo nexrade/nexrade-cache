@@ -7,7 +7,7 @@
 to answer "how does this compare to Redis" for a release, and quoting it as if
 it were general is how the README ended up claiming nexrade "beats Redis on
 every common single-key command" when a random keyspace tells a different
-story (see docs/perf-methodology.md).
+story.
 
 This runs the full grid: every redis-benchmark command family, across
 pipelining depths and keyspace shapes, both servers alternating, with a
@@ -207,7 +207,7 @@ def main() -> int:
                 if not mr:
                     continue
                 # CV, not max-min: max-min is hostage to one bad round and
-                # grows with round count (see docs/perf-methodology.md).
+                # grows with round count.
                 fr = st.stdev(r) / st.mean(r) * 100
                 fn = st.stdev(n) / st.mean(n) * 100
                 floor = max(fr, fn)

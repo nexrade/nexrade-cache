@@ -4,8 +4,8 @@ migrate_from_redis.py — copy data from a Redis-protocol server into nexrade-ca
 
 Why not DUMP/RESTORE for Redis → nexrade?
   nexrade DUMP/RESTORE use a custom NEXD payload (bincode of Entry), not Redis
-  RDB. See docs/dump-restore.md. This script re-reads each key with
-  type-appropriate commands and replays writes on the destination so any
+  RDB — see the Persistence section of README.md. This script re-reads each key
+  with type-appropriate commands and replays writes on the destination so any
   RESP server can be a source.
 
 Copies:
@@ -601,8 +601,10 @@ def main() -> None:
         )
 
     if args.dry_run:
-        print("(dry run — nothing was written to the destination)")
-        print("See docs/dump-restore.md for DUMP/RESTORE vs migrate guidance.")
+        print(
+            "(dry run — nothing was written to the destination). For moving a "
+            "single nexrade key between servers, use DUMP/RESTORE instead."
+        )
 
 
 if __name__ == "__main__":
