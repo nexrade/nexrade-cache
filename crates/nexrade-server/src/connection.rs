@@ -155,6 +155,14 @@ pub struct Connection {
     /// `RwLock::read()` + `HashMap` lookup on every repeat. `None` until
     /// the first command is recorded, or whenever `metrics` is `None`.
     cached_handles: Option<(String, nexrade_metrics::CommandMetricHandles)>,
+    /// Cached `(CMD_NAME, lowercased_event)` pair for the latency monitor.
+    ///
+    /// `record()` is fed the *lowercased* command name (Redis convention), so
+    /// every command used to pay one `String` allocation to lowercase a name
+    /// that is almost always the same as the previous command's. Cached here
+    /// exactly like `cached_handles` above: hit for a repeat, rebuilt on
+    /// change.
+    cached_event: Option<(String, String)>,
     /// Last command dispatched by this connection, captured per-command
     /// but flushed to the per-connection `ClientMeta` only once per
     /// pipeline batch. Used by `CLIENT LIST`/`INFO` to populate `cmd=`.
@@ -205,6 +213,7 @@ impl Connection {
             functions,
             metrics,
             cached_handles: None,
+            cached_event: None,
             resp_version: 2,
             last_cmd: String::with_capacity(16),
             last_write_instant: Instant::now(),
@@ -633,8 +642,17 @@ impl Connection {
                 let us = elapsed.as_micros() as u64;
                 if us > 0 {
                     // Event name is the lowercased command (Redis convention).
-                    let event = cmd_name.to_ascii_lowercase();
-                    self.db.latency.record(&event, us);
+                    // Rebuilt only when the command name changes; a workload
+                    // repeating one command allocates nothing after the first.
+                    let event = match self.cached_event.as_ref() {
+                        Some((name, lower)) if name == &cmd_name => lower,
+                        _ => {
+                            let lower = cmd_name.to_ascii_lowercase();
+                            self.cached_event = Some((cmd_name.clone(), lower));
+                            &self.cached_event.as_ref().unwrap().1
+                        }
+                    };
+                    self.db.latency.record(event, us);
                 }
                 if us >= self.db.slowlog.threshold_us() {
                     let sl = &self.db.slowlog;

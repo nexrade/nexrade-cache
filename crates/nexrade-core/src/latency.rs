@@ -125,16 +125,25 @@ impl LatencyMonitor {
             duration_us,
         };
         let mut g = self.inner.lock();
-        if !g.events.contains_key(event) {
-            if g.events.len() >= MAX_EVENTS {
-                // Evict oldest event name.
-                if let Some(old) = g.order.pop_front() {
-                    g.events.remove(&old);
-                }
-            }
-            g.order.push_back(event.to_string());
-            g.events.insert(event.to_string(), EventState::new());
+        // Fast path first: an event that already has state (every command
+        // after its first sample) needs exactly one hash lookup under the
+        // lock. `contains_key` + `get_mut` below is only reached when the
+        // event is genuinely new.
+        if let Some(state) = g.events.get_mut(event) {
+            state.push(sample);
+            return;
         }
+        // Cold path: first sample for this event name.
+        if g.events.len() >= MAX_EVENTS {
+            // Evict oldest event name.
+            if let Some(old) = g.order.pop_front() {
+                g.events.remove(&old);
+            }
+        }
+        // One allocation, not two — `order` and `events` both need it.
+        let owned = event.to_string();
+        g.order.push_back(owned.clone());
+        g.events.insert(owned, EventState::new());
         if let Some(state) = g.events.get_mut(event) {
             state.push(sample);
         }
