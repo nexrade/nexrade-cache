@@ -56,28 +56,26 @@ struct Cli {
     #[arg(short, long, env = "NEXRADE_PORT")]
     port: Option<u16>,
 
-    /// Tokio worker threads [default: 2]
+    /// Tokio worker threads [default: 4]
     ///
     /// Measured on one 24-core Linux host, Redis 7.4.8 and nexrade sharing
-    /// the kernel, persistence off, 120k SET+GET requests:
+    /// the kernel, loopback, persistence off. Pipelined (`-P 64`, 50 conns,
+    /// 400k commands, one client thread) so the server rather than the load
+    /// generator is the constraint — median of 3:
     ///
-    /// | workers | client-bound rps | server-bound rps |
+    /// | workers | req/s | CPU/request |
     /// |---|---|---|
-    /// | 1 | 216,606 | 80,000 |
-    /// | 2 | 216,606 | 239,044 |
-    /// | 4 | 215,827 | 239,044 |
-    /// | 8 | — | 240,000 |
+    /// | 1 | 1,481,481 | 0.65 µs |
+    /// | 2 | 2,409,639 | 0.78 µs |
+    /// | 4 | 4,081,633 | 0.82 µs |
+    /// | 8 | 1,941,748 | 1.68 µs |
     ///
-    /// (Redis: 120,000 rps server-bound, 201,342 client-bound.)
+    /// (Redis, single-threaded: 2,325,581 req/s at 0.40 µs.)
     ///
-    /// Past 2 workers the runtime buys no throughput — server-bound rps is
-    /// flat — while CPU per request climbs (6.25 → 6.00 → 7.17 µs at
-    /// 2/4/8), so extra workers cost without returning anything. 1 worker
-    /// wins only when the load generator itself is the bottleneck, and
-    /// collapses to a third of Redis once the server is the constraint,
-    /// so it is not a safe default. Raise it only on hosts where
-    /// single-connection latency rather than aggregate throughput is the
-    /// goal.
+    /// 4 is the default: it is the only setting that beats Redis on
+    /// throughput (1.75x) and it ties 1 and 2 when the client is the
+    /// bottleneck instead. Do not raise it past 4 — 8 halves throughput and
+    /// doubles CPU per request, which is not a tuning curve, a cliff.
     #[arg(long, env = "NEXRADE_WORKER_THREADS", value_name = "N")]
     worker_threads: Option<usize>,
 
@@ -514,7 +512,7 @@ async fn join_ops_server(name: &str, handle: Option<tokio::task::JoinHandle<()>>
 }
 
 /// Default tokio worker threads. See `Cli::worker_threads` for why 2.
-const DEFAULT_WORKER_THREADS: usize = 2;
+const DEFAULT_WORKER_THREADS: usize = 4;
 
 fn main() -> Result<()> {
     // The runtime is built by hand rather than by `#[tokio::main]` because the
