@@ -178,7 +178,7 @@ pub fn uninstall_service() -> Result<()> {
 /// take extra parameters. `run_as_service` sets this immediately before
 /// handing control to the dispatcher, so `service_main` always finds it
 /// populated by the time the SCM invokes it.
-static SERVICE_CONFIG: OnceLock<ServerConfig> = OnceLock::new();
+static SERVICE_CONFIG: OnceLock<(ServerConfig, usize)> = OnceLock::new();
 
 /// Entry point when the process is launched by the SCM (`--service` flag).
 /// Hands control to the Windows service dispatcher which will call
@@ -187,9 +187,9 @@ static SERVICE_CONFIG: OnceLock<ServerConfig> = OnceLock::new();
 /// `config` is the `ServerConfig` already resolved from `--config`/CLI flags
 /// by the caller (same resolution path as a normal foreground run), so the
 /// service honors the same config file on every SCM-triggered start.
-pub fn run_as_service(config: ServerConfig) -> Result<()> {
+pub fn run_as_service(config: ServerConfig, worker_threads: usize) -> Result<()> {
     SERVICE_CONFIG
-        .set(config)
+        .set((config, worker_threads))
         .map_err(|_| anyhow::anyhow!("run_as_service called more than once"))?;
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
         .context("service dispatcher failed — is this process started by the SCM?")?;
@@ -204,16 +204,16 @@ fn service_main(_arguments: Vec<OsString>) {
     // Populated by `run_as_service` just before the dispatcher call that
     // leads here; absent only if the SCM somehow invoked this entry point
     // without going through `run_as_service` first.
-    let Some(config) = SERVICE_CONFIG.get() else {
+    let Some((config, worker_threads)) = SERVICE_CONFIG.get() else {
         eprintln!("service error: no config set before service dispatch");
         return;
     };
-    if let Err(e) = run_service(config.clone()) {
+    if let Err(e) = run_service(config.clone(), *worker_threads) {
         eprintln!("service error: {e:#}");
     }
 }
 
-fn run_service(config: ServerConfig) -> Result<()> {
+fn run_service(config: ServerConfig, worker_threads: usize) -> Result<()> {
     // Channel used to signal the service to stop.
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 
@@ -259,6 +259,8 @@ fn run_service(config: ServerConfig) -> Result<()> {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .thread_name("nexrade-worker")
             .enable_all()
             .build()
             .expect("tokio runtime");

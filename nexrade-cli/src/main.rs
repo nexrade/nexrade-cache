@@ -56,6 +56,15 @@ struct Cli {
     #[arg(short, long, env = "NEXRADE_PORT")]
     port: Option<u16>,
 
+    /// Tokio worker threads [default: 4]
+    ///
+    /// 4 is the measured default: redis-benchmark single-key write
+    /// pipelines (LPUSH/SET) regress hard when every core contends on one
+    /// shard, and 4 beat Redis on pipelined LPUSH. Raise it on hosts where
+    /// reads dominate and the extra cores are genuinely available.
+    #[arg(long, env = "NEXRADE_WORKER_THREADS", value_name = "N")]
+    worker_threads: Option<usize>,
+
     /// Number of databases
     #[arg(long, env = "NEXRADE_DATABASES")]
     databases: Option<usize>,
@@ -491,10 +500,25 @@ async fn join_ops_server(name: &str, handle: Option<tokio::task::JoinHandle<()>>
 // Cap workers: redis-benchmark single-key write pipelines (LPUSH/SET) regress
 // hard when every core contends on one shard. 4 matches prior measured tables
 // and beats Redis on pipelined LPUSH after Compact front-headroom.
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+/// Default tokio worker threads. See `Cli::worker_threads` for why 4.
+const DEFAULT_WORKER_THREADS: usize = 4;
 
+fn main() -> Result<()> {
+    // The runtime is built by hand rather than by `#[tokio::main]` because the
+    // worker count has to be configurable at runtime — the attribute macro
+    // bakes the number in at compile time, which is why this was hard-coded to
+    // 4 until now.
+    let cli = Cli::parse();
+    let worker_threads = cli.worker_threads.unwrap_or(DEFAULT_WORKER_THREADS).max(1);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .thread_name("nexrade-worker")
+        .enable_all()
+        .build()?
+        .block_on(run(cli))
+}
+
+async fn run(cli: Cli) -> Result<()> {
     // Setup logging (env vars only here; init_tracing() happens below on
     // every path, including the Windows-service one, so log output is
     // consistent regardless of how the process was launched).
@@ -524,11 +548,19 @@ async fn main() -> Result<()> {
             // dispatcher — this call blocks until the service is stopped.
             init_tracing();
             let config = config_from_cli(&cli)?;
-            return windows_svc::run_as_service(config);
+            return windows_svc::run_as_service(
+                config,
+                cli.worker_threads.unwrap_or(DEFAULT_WORKER_THREADS).max(1),
+            );
         }
     }
 
     init_tracing();
+
+    tracing::info!(
+        "tokio runtime: {} worker thread(s)",
+        cli.worker_threads.unwrap_or(DEFAULT_WORKER_THREADS).max(1)
+    );
 
     // Enable ANSI escape codes on Windows
     #[cfg(windows)]
@@ -1338,6 +1370,7 @@ enabled = true
             max_clients: None,
             maxmemory: None,
             maxmemory_policy: None,
+            worker_threads: None,
             timeout: None,
             rdb_path: None,
             aof_path: None,
@@ -1401,6 +1434,7 @@ port = 9099
             max_clients: None,
             maxmemory: None,
             maxmemory_policy: None,
+            worker_threads: None,
             timeout: None,
             rdb_path: None,
             aof_path: None,
@@ -1468,6 +1502,7 @@ enabled = false
             max_clients: None,
             maxmemory: None,
             maxmemory_policy: None,
+            worker_threads: None,
             timeout: None,
             rdb_path: Some("".to_string()),
             aof_path: Some("".to_string()),
