@@ -123,5 +123,4 @@ jobs:
           > python3 scripts/bench_ab.py --baseline main --pairs 8
           > ```
           >
-          > See `docs/perf-methodology.md` § Criterion microbenchmarks.
           NOTE

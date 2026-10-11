@@ -120,10 +120,16 @@ jobs:
 
       - name: Warm-up both servers
         run: |
+          # `-q` is the quiet flag; `--quiet` is not a valid redis-benchmark
+          # option and made both of these exit immediately with a usage
+          # error, silently swallowed by `2>/dev/null || true` — so the
+          # benchmark has been measuring cold servers. Each invocation is
+          # now checked instead of ignored, so a future flag typo fails the
+          # run rather than quietly disabling the warm-up.
           redis-benchmark -h 127.0.0.1 -p $REDIS_PORT \
-            -c 10 -n 5000 -t SET,GET -q --quiet 2>/dev/null || true
+            -c 10 -n 5000 -t SET,GET -q
           redis-benchmark -h 127.0.0.1 -p $NEXRADE_PORT \
-            -c 10 -n 5000 -t SET,GET -q --quiet 2>/dev/null || true
+            -c 10 -n 5000 -t SET,GET -q
 
       # ── Benchmark ───────────────────────────────────────────────────────────
 

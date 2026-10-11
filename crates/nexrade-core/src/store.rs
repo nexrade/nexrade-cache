@@ -14,17 +14,32 @@ use crate::types::{AtomicIntCell, DataType};
 
 /// Hash-map builder for the per-shard key maps (1.5.0).
 ///
-/// The std default is SipHash-1-3. It is DoS-resistant but slow, and profiling
-/// the read path found the map probe to be **~91%** of a `GET`'s cost — the
-/// shard `RwLock` everyone assumed was the bottleneck is only 5–30% (see
-/// `docs/experiment-1.5.0-rcu-read-path.md`). Measured on 100 000-key maps with
-/// randomised access:
+/// The std default is SipHash-1-3. It is DoS-resistant but slow, and it
+/// dominated the per-shard key map probe on the read path.
 ///
-/// | Key shape | SipHash | foldhash |
-/// |---|---|---|
-/// | `u64` LE bytes | 67.3 ns | 33.6 ns |
-/// | `user:<n>` | 60.0 ns | 27.2 ns |
-/// | 64-byte | 178.7 ns | 82.1 ns |
+/// Reproduce with:
+///
+/// ```text
+/// cargo bench -p nexrade-core --bench store_bench -- hasher_ab
+/// ```
+///
+/// 100 000-key maps, scattered probe order, `u64` values so the number is the
+/// probe alone and not entry size. Median of 100 samples, Windows 11 / x86_64:
+///
+/// | Key shape | SipHash | foldhash | ratio |
+/// |---|---|---|---|
+/// | `u64` LE bytes | 100.2 ns | 50.3 ns | 1.99x |
+/// | `user:<n>` | 114.9 ns | 63.3 ns | 1.82x |
+/// | 64-byte | 176.8 ns | 105.2 ns | 1.68x |
+///
+/// Absolute values are platform-dependent — the same A/B on a Linux server
+/// measured roughly 30% lower for both hashers — but the ratio has been stable
+/// across both, which is the part the choice rests on.
+///
+/// An earlier version of this comment cited
+/// `docs/experiment-1.5.0-rcu-read-path.md` for these figures. That file has
+/// never existed in this repository, so the claim was unverifiable; the
+/// `hasher_ab` benchmark above exists to make it checkable in future.
 ///
 /// `foldhash::fast::RandomState` is seeded per-process, so keys hash
 /// differently in every run and an attacker cannot precompute a colliding key
@@ -1732,7 +1747,7 @@ impl ShardedDatabase {
     /// earlier shard's lock, needlessly stalling any *other* op that only
     /// wanted one of those earlier shards. Under concurrent pipelined MSETs
     /// touching overlapping shard sets, that turns into cross-batch
-    /// serialization (see `docs/mset-investigation.md`).
+    /// serialization.
     ///
     /// This instead does a non-blocking `try_write()` sweep: attempt every
     /// shard in order, and if any attempt fails, drop everything acquired

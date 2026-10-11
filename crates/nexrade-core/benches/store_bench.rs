@@ -27,7 +27,6 @@
 //!   observed spread from ~15% to ~5%.
 //!
 //! Neither makes a single run authoritative. See
-//! [`docs/perf-methodology.md`](../../../docs/perf-methodology.md) for the
 //! comparison procedure — in short: build both binaries at the *same*
 //! filesystem path, and establish this session's noise floor by repeating
 //! the same build before trusting any delta.
@@ -236,9 +235,9 @@ fn bench_concurrent_writes(c: &mut Criterion) {
 // It is left as-is deliberately: as a *relative* A/B measure both arms pay
 // the identical overhead, and restructuring it would invalidate comparison
 // against every historical result. But it is why this benchmark is among
-// the noisier ones in the 1.4.0 floor table (CV 4.6% at threads/8), and why
-// `docs/experiment-1.5.0-rcu-read-path.md` used a separate harness rather
-// than trusting this number.
+// the noisier ones in the 1.4.0 floor table (CV 4.6% at threads/8), so
+// treat single-digit percentage deltas here as inside the noise band
+// rather than as signal.
 
 fn bench_concurrent_reads(c: &mut Criterion) {
     const KEYS: u64 = 100_000;
@@ -414,6 +413,85 @@ fn bench_concurrent_incr(c: &mut Criterion) {
     g.finish();
 }
 
+// ── 10. KeyHasher A/B — SipHash (std default) vs foldhash ────────────────────
+//
+// `KeyHasher` in `store.rs` is `foldhash::fast::RandomState` rather than the
+// std default of SipHash-1-3, on the claim that hashing was the dominant cost
+// on the read path. That claim was previously sourced to a document that does
+// not exist in this repository, so it could not be checked or re-run by
+// anyone. This benchmark is that check: it measures the two hashers against
+// each other on the three key shapes the claim named, so the decision is
+// reproducible and a future regression is visible.
+//
+// Method notes:
+//   * Keys are built outside the timed closure — `make_key` allocates, and
+//     timing the allocator instead of the hasher would make the numbers
+//     meaningless.
+//   * Probe order is scattered by an odd multiplier rather than sequential, so
+//     the hardware prefetcher does not hide the cost (`bench_get` above
+//     documents the sequential/randomised gap).
+//   * The value is a `u64` so this isolates the *map probe* — the hash and
+//     bucket walk — rather than entry-size effects.
+
+fn bench_hasher_ab(c: &mut Criterion) {
+    use nexrade_core::store::KeyHasher;
+    use std::collections::hash_map::RandomState;
+    use std::collections::HashMap;
+
+    const KEYS: usize = 100_000;
+    // Large odd constant: walks the keyspace in a scattered but deterministic
+    // order, so runs are comparable while defeating prefetch.
+    const STRIDE: usize = 2_654_435_761;
+
+    fn key_u64_le(n: u64) -> Vec<u8> {
+        n.to_le_bytes().to_vec()
+    }
+    fn key_user(n: u64) -> Vec<u8> {
+        format!("user:{n}").into_bytes()
+    }
+    fn key_64byte(n: u64) -> Vec<u8> {
+        let mut k = Vec::with_capacity(64);
+        k.extend_from_slice(&n.to_le_bytes());
+        while k.len() < 64 {
+            let x = ((k.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ n) as u8;
+            k.push(x.wrapping_add(k.len() as u8));
+        }
+        k
+    }
+
+    fn probe<S: std::hash::BuildHasher + Default>(keys: &[Vec<u8>]) -> u64 {
+        let mut m: HashMap<&[u8], u64, S> = HashMap::with_hasher(S::default());
+        for (i, k) in keys.iter().enumerate() {
+            m.insert(k.as_slice(), i as u64);
+        }
+        let mut hits = 0u64;
+        for i in 0..keys.len() {
+            let idx = i.wrapping_mul(STRIDE) % keys.len();
+            hits += *m.get(keys[idx].as_slice()).unwrap_or(&0);
+        }
+        hits
+    }
+
+    let shapes: [(&str, fn(u64) -> Vec<u8>); 3] = [
+        ("u64_le", key_u64_le),
+        ("user_n", key_user),
+        ("64byte", key_64byte),
+    ];
+
+    let mut g = c.benchmark_group("hasher_ab");
+    g.throughput(Throughput::Elements(KEYS as u64));
+    for (shape_name, make) in shapes {
+        let keys: Vec<Vec<u8>> = (0..KEYS as u64).map(make).collect();
+        g.bench_function(format!("{shape_name}/siphash"), |b| {
+            b.iter(|| black_box(probe::<RandomState>(&keys)))
+        });
+        g.bench_function(format!("{shape_name}/foldhash"), |b| {
+            b.iter(|| black_box(probe::<KeyHasher>(&keys)))
+        });
+    }
+    g.finish();
+}
+
 criterion_group!(
     name = benches;
     config = bench_config();
@@ -426,5 +504,6 @@ criterion_group!(
         bench_rename,
         bench_shard_scaling,
         bench_concurrent_incr,
+        bench_hasher_ab,
 );
 criterion_main!(benches);
