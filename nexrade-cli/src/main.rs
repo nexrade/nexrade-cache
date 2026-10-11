@@ -56,12 +56,28 @@ struct Cli {
     #[arg(short, long, env = "NEXRADE_PORT")]
     port: Option<u16>,
 
-    /// Tokio worker threads [default: 4]
+    /// Tokio worker threads [default: 2]
     ///
-    /// 4 is the measured default: redis-benchmark single-key write
-    /// pipelines (LPUSH/SET) regress hard when every core contends on one
-    /// shard, and 4 beat Redis on pipelined LPUSH. Raise it on hosts where
-    /// reads dominate and the extra cores are genuinely available.
+    /// Measured on one 24-core Linux host, Redis 7.4.8 and nexrade sharing
+    /// the kernel, persistence off, 120k SET+GET requests:
+    ///
+    /// | workers | client-bound rps | server-bound rps |
+    /// |---|---|---|
+    /// | 1 | 216,606 | 80,000 |
+    /// | 2 | 216,606 | 239,044 |
+    /// | 4 | 215,827 | 239,044 |
+    /// | 8 | — | 240,000 |
+    ///
+    /// (Redis: 120,000 rps server-bound, 201,342 client-bound.)
+    ///
+    /// Past 2 workers the runtime buys no throughput — server-bound rps is
+    /// flat — while CPU per request climbs (6.25 → 6.00 → 7.17 µs at
+    /// 2/4/8), so extra workers cost without returning anything. 1 worker
+    /// wins only when the load generator itself is the bottleneck, and
+    /// collapses to a third of Redis once the server is the constraint,
+    /// so it is not a safe default. Raise it only on hosts where
+    /// single-connection latency rather than aggregate throughput is the
+    /// goal.
     #[arg(long, env = "NEXRADE_WORKER_THREADS", value_name = "N")]
     worker_threads: Option<usize>,
 
@@ -497,11 +513,8 @@ async fn join_ops_server(name: &str, handle: Option<tokio::task::JoinHandle<()>>
     }
 }
 
-// Cap workers: redis-benchmark single-key write pipelines (LPUSH/SET) regress
-// hard when every core contends on one shard. 4 matches prior measured tables
-// and beats Redis on pipelined LPUSH after Compact front-headroom.
-/// Default tokio worker threads. See `Cli::worker_threads` for why 4.
-const DEFAULT_WORKER_THREADS: usize = 4;
+/// Default tokio worker threads. See `Cli::worker_threads` for why 2.
+const DEFAULT_WORKER_THREADS: usize = 2;
 
 fn main() -> Result<()> {
     // The runtime is built by hand rather than by `#[tokio::main]` because the
