@@ -777,8 +777,17 @@ async fn run_background_tasks(
                         };
                         let mutation_quiesce = db.persistence.quiesce().await;
                         let dirty_at_capture = db.stats.dirty_keys.load(Ordering::Relaxed);
+                        let capture_started = std::time::Instant::now();
                         let dbs = db.store.snapshot_dbs();
+                        let capture_ms = capture_started.elapsed().as_millis();
                         drop(mutation_quiesce);
+                        if capture_ms > 1000 {
+                            warn!(
+                                "BGSAVE capture held the write gate for {}ms ({} dbs)",
+                                capture_ms,
+                                dbs.len()
+                            );
+                        }
                         let stats = db.stats.clone();
                         tokio::spawn(async move {
                             let _save_job = save_job;

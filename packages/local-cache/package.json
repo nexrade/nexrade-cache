@@ -1,6 +1,6 @@
 {
   "name": "@nexrade/local-cache",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "description": "A fast, Redis-compatible local cache for browsers, PWAs, and edge applications",
   "license": "MIT OR Apache-2.0",
   "repository": {

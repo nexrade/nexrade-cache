@@ -1355,18 +1355,19 @@ impl ShardedDatabase {
     }
 
     /// Clone all shard data into a single merged `Database` (for RDB snapshots).
+    ///
+    /// Only `entries` is populated. `expiry_index` and `key_versions` are
+    /// deliberately left empty: both are `#[serde(skip)]`, `Snapshot::save`
+    /// (bincode) and `AofWriter::rewrite` never read them, and a restored
+    /// store rebuilds them on insert. Copying them here used to dominate the
+    /// capture window on large datasets — and the capture runs under the
+    /// persistence quiesce, gating every write for its whole duration.
     pub fn snapshot(&self) -> Database {
         let mut db = Database::new();
         for shard in &self.shards {
             let guard = shard.read();
             for (k, v) in &guard.entries {
-                if let Some(ref e) = v.expiry {
-                    db.expiry_index.insert((e.expires_at_ms, k.clone()));
-                }
                 db.entries.insert(k.clone(), v.clone());
-            }
-            for (k, ver) in &guard.key_versions {
-                db.key_versions.insert(k.clone(), *ver);
             }
         }
         db
