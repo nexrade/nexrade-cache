@@ -1288,9 +1288,10 @@ pub async fn cmd_bgsave(_db: &Db) -> Result<Resp> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn cmd_bgrewriteaof(db: &Db) -> Result<Resp> {
+    use std::io::{Read as _, Seek as _, Write as _};
     use std::sync::atomic::Ordering::AcqRel;
 
-    // Serialize rewrite so we don't race with normal mutations.
+    // Serialize rewrites so we don't race with another BGREWRITEAOF.
     if db.stats.aof_rewrite_in_progress.swap(true, AcqRel) {
         return Ok(Resp::SimpleString(
             "Background append only file rewriting already in progress".to_string(),
@@ -1306,86 +1307,111 @@ pub async fn cmd_bgrewriteaof(db: &Db) -> Result<Resp> {
         return Ok(Resp::error("ERR AOF not enabled"));
     };
 
-    // Take exclusive access for the complete rewrite + writer handoff. The
-    // owned guard is moved into the background task, so no write can slip
-    // between snapshot generation, rename, and replacement-writer install.
-    let quiesce = db.persistence.quiesce().await;
-
-    // Flush/sync and detach the existing writer so concurrent appends wait
-    // on the gate and are included in the next write after handoff.
-    let old_writer = {
-        let mut guard = db.aof_writer.lock();
-        guard.take()
-    };
-    if let Some(mut w) = old_writer {
-        if let Err(e) = w.fsync() {
-            tracing::error!("pre-rewrite AOF fsync failed: {}", e);
-            db.fail_aof("pre-rewrite fsync", &e);
-            db.stats
-                .aof_rewrite_in_progress
-                .store(false, Ordering::Release);
-            return Err(NexradeError::Generic(
-                "AOF fsync failed before rewrite; rewrite aborted".to_string(),
-            ));
+    // Phase A — brief quiesce: flush the live writer, capture the dataset,
+    // and record the old file's length. Admission reopens when this block
+    // ends; writes keep appending to the old file and are merged back by the
+    // handoff below, so the write-block window stays at milliseconds.
+    let (dbs, acl_lines, base_len) = {
+        let _quiesce = db.persistence.quiesce().await;
+        if let Some(w) = db.aof_writer.lock().as_mut() {
+            let _ = w.flush();
         }
-    }
+        let base_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        (db.store.snapshot_dbs(), db.acl.list(), base_len)
+    };
 
-    let dbs = db.store.snapshot_dbs();
-    let acl_lines = db.acl.list();
-    let db_clone = db.clone();
+    let db2 = db.clone();
     let stats = db.stats.clone();
+    let scratch = std::path::Path::new(&path).with_extension("aof-rewrite");
     tokio::spawn(async move {
-        let _quiesce = quiesce;
-        let path2 = path.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            crate::persistence::AofWriter::rewrite(&path, &dbs, &acl_lines)
+        // Phase B — write the compacted AOF to the scratch file. This long
+        // file I/O runs with no admission held: client writes keep flowing
+        // to the old file throughout.
+        let scratch_for_task = scratch.clone();
+        let rewrite = tokio::task::spawn_blocking(move || {
+            crate::persistence::AofWriter::rewrite(&scratch_for_task, &dbs, &acl_lines)
         })
         .await;
-        match result {
+
+        // Phase C — brief handoff quiesce: admission is closed while the
+        // delta (old-file bytes appended past the capture point) is merged
+        // onto the compacted file and the result is published atomically.
+        let _quiesce = db2.persistence.quiesce().await;
+
+        match rewrite {
             Ok(Ok(())) => {
-                tracing::info!("BGREWRITEAOF completed");
-                stats.aof_rewrite_last_status.store(0, Ordering::Relaxed);
-                stats
-                    .last_rewrite_time
-                    .store(unix_secs(), Ordering::Relaxed);
-                // Re-open the AOF writer on the rewritten file.
-                match crate::persistence::AofWriter::open(&path2) {
-                    Ok(writer) => *db_clone.aof_writer.lock() = Some(writer),
+                // Bring the compacted file up to the handoff state: copy the
+                // old AOF's tail — every command appended past the capture
+                // point — onto the scratch file.
+                let merged = (|| -> std::io::Result<()> {
+                    let l_full = std::fs::metadata(&path)?.len();
+                    if l_full > base_len {
+                        let mut src = std::fs::File::open(&path)?;
+                        src.seek(std::io::SeekFrom::Start(base_len))?;
+                        let mut delta = Vec::with_capacity((l_full - base_len) as usize);
+                        src.read_to_end(&mut delta)?;
+                        drop(src);
+                        let mut dst = std::fs::OpenOptions::new().append(true).open(&scratch)?;
+                        dst.write_all(&delta)?;
+                        dst.sync_all()?;
+                    }
+                    Ok(())
+                })();
+                match merged {
+                    Ok(()) => {
+                        // Open the writer on the scratch file BEFORE
+                        // publishing it: if either step below fails, the old
+                        // writer and the old file are still fully
+                        // operational and the rewrite simply failed — there
+                        // is no broken state to recover from.
+                        match crate::persistence::AofWriter::open(&scratch) {
+                            Ok(writer) => match std::fs::rename(&scratch, &path) {
+                                Ok(()) => {
+                                    // Replaces the old writer; its Drop
+                                    // closes the handle on the orphaned old
+                                    // inode.
+                                    *db2.aof_writer.lock() = Some(writer);
+                                    tracing::info!("BGREWRITEAOF completed");
+                                    stats.aof_rewrite_last_status.store(0, Ordering::Relaxed);
+                                    stats
+                                        .last_rewrite_time
+                                        .store(unix_secs(), Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    drop(writer);
+                                    tracing::error!("BGREWRITEAOF publish failed: {}", e);
+                                    stats.aof_rewrite_last_status.store(1, Ordering::Relaxed);
+                                }
+                            },
+                            Err(e) => {
+                                tracing::error!("BGREWRITEAOF failed to open merged AOF: {}", e);
+                                stats.aof_rewrite_last_status.store(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
                     Err(e) => {
-                        tracing::error!("failed to reopen AOF after rewrite: {}", e);
-                        db_clone.fail_aof("post-rewrite writer open", &e);
+                        tracing::error!("BGREWRITEAOF delta merge failed: {}", e);
+                        stats.aof_rewrite_last_status.store(1, Ordering::Relaxed);
                     }
                 }
             }
             Ok(Err(e)) => {
+                // The live writer was never detached, so the old AOF is
+                // untouched and still authoritative — nothing to restore.
                 tracing::error!("BGREWRITEAOF failed: {}", e);
                 stats.aof_rewrite_last_status.store(1, Ordering::Relaxed);
-                match crate::persistence::AofWriter::open(&path2) {
-                    Ok(writer) => *db_clone.aof_writer.lock() = Some(writer),
-                    Err(reopen) => {
-                        tracing::error!(
-                            "failed to restore AOF writer after rewrite failure: {}",
-                            reopen
-                        );
-                        db_clone.fail_aof("rewrite failure recovery", &reopen);
-                    }
-                }
             }
             Err(e) => {
                 tracing::error!("BGREWRITEAOF task panicked: {}", e);
                 stats.aof_rewrite_last_status.store(1, Ordering::Relaxed);
-                match crate::persistence::AofWriter::open(&path2) {
-                    Ok(writer) => *db_clone.aof_writer.lock() = Some(writer),
-                    Err(reopen) => {
-                        tracing::error!(
-                            "failed to restore AOF writer after rewrite panic: {}",
-                            reopen
-                        );
-                        db_clone.fail_aof("rewrite panic recovery", &reopen);
-                    }
-                }
             }
         }
+
+        // On success the rename consumed the scratch file (this is a no-op);
+        // on any failure the live writer and old file were never touched, so
+        // just drop the abandoned scratch file.
+        let _ = std::fs::remove_file(&scratch);
+
         stats
             .aof_rewrite_in_progress
             .store(false, Ordering::Release);
