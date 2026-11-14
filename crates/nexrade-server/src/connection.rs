@@ -1364,11 +1364,21 @@ impl Connection {
         // Step 2 — Serialize the current store as an RDB bulk string.
         let dbs = self.db.store.snapshot_dbs();
         let snapshot = Snapshot::new(dbs);
-        let rdb_bytes = match bincode::serde::encode_to_vec(&snapshot, bincode::config::standard())
+        // The encode allocates a contiguous buffer the size of the dataset;
+        // run it on the blocking pool so a replica bootstrap doesn't stall
+        // the async runtime for the seconds it takes to serialize.
+        let rdb_bytes = match tokio::task::spawn_blocking(move || {
+            bincode::serde::encode_to_vec(&snapshot, bincode::config::standard())
+        })
+        .await
         {
-            Ok(b) => b,
-            Err(e) => {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
                 error!("PSYNC: failed to serialize snapshot: {}", e);
+                return;
+            }
+            Err(e) => {
+                error!("PSYNC: snapshot encode task panicked: {}", e);
                 return;
             }
         };

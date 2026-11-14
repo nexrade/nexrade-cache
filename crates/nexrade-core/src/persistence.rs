@@ -75,6 +75,31 @@ pub struct Snapshot {
     pub databases: Vec<(usize, Database)>,
 }
 
+/// Tee writer: forwards every byte written to `inner` while feeding the same
+/// bytes to a CRC32C hasher. Lets `Snapshot::save` compute the checksum as
+/// the encode streams through instead of buffering the whole payload first —
+/// on a multi-GB dataset the buffered variant allocated a contiguous copy of
+/// the entire snapshot on every save, and the Windows heap never hands those
+/// pages back, so process RSS ratcheted to ~5× the dataset size and stayed.
+#[cfg(not(target_arch = "wasm32"))]
+struct HashingWriter<'a, W: std::io::Write> {
+    inner: &'a mut W,
+    hasher: Hasher,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<W: std::io::Write> std::io::Write for HashingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 impl Snapshot {
     pub const VERSION: u32 = 4;
@@ -110,14 +135,21 @@ impl Snapshot {
                 .write(true)
                 .create_new(true)
                 .open(&tmp_path)?;
-            let mut writer = BufWriter::new(file);
-            let encoded = bincode::serde::encode_to_vec(self, bincode::config::standard())
-                .map_err(|e| crate::error::NexradeError::Generic(e.to_string()))?;
-            let mut hasher = Hasher::new();
-            hasher.update(&encoded);
-            let crc = hasher.finalize();
+            let mut writer = BufWriter::with_capacity(1 << 20, file);
             writer.write_all(&Self::MAGIC)?;
-            writer.write_all(&encoded)?;
+            // Stream the encode straight into the buffered file while
+            // hashing on the way through. The previous `encode_to_vec` step
+            // materialized the entire snapshot as one contiguous buffer on
+            // every save — on a multi-GB dataset that transient pushed RSS to
+            // ~5× the dataset size, and the Windows heap never returned those
+            // pages, so RSS ratcheted upward save after save.
+            let mut hashing = HashingWriter {
+                inner: &mut writer,
+                hasher: Hasher::new(),
+            };
+            bincode::serde::encode_into_std_write(self, &mut hashing, bincode::config::standard())
+                .map_err(|e| crate::error::NexradeError::Generic(e.to_string()))?;
+            let crc = hashing.hasher.finalize();
             writer.write_all(&crc.to_le_bytes())?;
             writer.flush()?;
             // fsync the temp file's data to disk *before* the rename below.
