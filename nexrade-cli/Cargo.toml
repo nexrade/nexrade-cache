@@ -72,10 +72,17 @@ toml = { workspace = true }
 config = { workspace = true }
 
 # Match Redis's allocator on Linux/macOS: jemalloc reduces fragmentation and
-# speeds up the alloc-heavy LRANGE / pipeline-buffer paths. Windows and
-# WASM keep the system allocator.
+# speeds up the alloc-heavy LRANGE / pipeline-buffer paths. On Windows,
+# mimalloc replaces the system heap for the same reason: the BGSAVE snapshot
+# clone + encode cycle allocates and frees multi-GB transients every save,
+# which the Windows system heap decommits lazily — RSS ratcheted to ~5× the
+# dataset size and stayed. mimalloc returns large freed spans to the OS
+# promptly, keeping RSS near the live dataset.
 [target.'cfg(all(not(windows), not(target_arch = "wasm32")))'.dependencies]
 tikv-jemallocator = "0.6"
+
+[target.'cfg(all(windows, not(target_arch = "wasm32")))'.dependencies]
+mimalloc = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"

@@ -24,6 +24,13 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// mimalloc on Windows: the system heap decommits lazily, so the multi-GB
+// BGSAVE snapshot transients ratcheted RSS to ~5× the dataset size. mimalloc
+// releases large freed spans back to the OS promptly.
+#[cfg(all(windows, not(target_arch = "wasm32")))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(windows)]
 mod windows_svc;
 
