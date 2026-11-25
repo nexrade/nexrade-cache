@@ -661,6 +661,10 @@ pub struct Stats {
     pub total_writes: AtomicU64,
     pub keyspace_hits: AtomicU64,
     pub keyspace_misses: AtomicU64,
+    /// Keys removed by active expiration (INFO `expired_keys`).
+    pub expired_keys: AtomicU64,
+    /// Keys removed by maxmemory eviction (INFO `evicted_keys`).
+    pub evicted_keys: AtomicU64,
     #[cfg(not(target_arch = "wasm32"))]
     pub start_time: std::sync::OnceLock<Instant>,
     /// Number of write operations since last RDB save (like Redis's dirty counter).
@@ -764,7 +768,9 @@ impl Stats {
 #[derive(Debug, Clone, PartialEq, Default)]
 #[repr(u8)]
 pub enum MaxMemoryPolicy {
-    /// Return an error on writes when limit is reached (default).
+    /// Reject writes that would use memory while the limit is reached
+    /// (default). Redis-compatible: the dispatcher returns an `OOM`
+    /// error, except for commands that only free memory (DEL, EXPIRE, …).
     #[default]
     NoEviction = 0,
     /// Evict any random key across all databases.
@@ -794,6 +800,19 @@ impl std::str::FromStr for MaxMemoryPolicy {
 }
 
 impl MaxMemoryPolicy {
+    /// Decode the `u8` stored in the dispatcher's atomic mirror.
+    /// Unknown values fall back to the safe default (`noeviction`).
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::AllKeysRandom,
+            2 => Self::AllKeysLru,
+            3 => Self::VolatileRandom,
+            4 => Self::VolatileLru,
+            5 => Self::VolatileTtl,
+            _ => Self::NoEviction,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::NoEviction => "noeviction",

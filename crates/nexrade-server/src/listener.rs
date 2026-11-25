@@ -740,6 +740,9 @@ async fn run_background_tasks(
                 None => continue,
             };
             let expired = db.store.active_expire_cycle();
+            db.stats
+                .expired_keys
+                .fetch_add(expired.len() as u64, Ordering::Relaxed);
             if !expired.is_empty() && db.notify_flags.load().0 != 0 {
                 use nexrade_core::notify::NotifyFlags;
                 let flags = db.notify_flags.load();

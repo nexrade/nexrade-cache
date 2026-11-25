@@ -184,6 +184,14 @@ pub async fn cmd_info(db: &Db, args: &[Resp]) -> Result<Resp> {
             "instantaneous_ops_per_sec:{}\r\n",
             db.stats.ops_per_sec.load(Ordering::Relaxed)
         ));
+        info.push_str(&format!(
+            "expired_keys:{}\r\n",
+            db.stats.expired_keys.load(Ordering::Relaxed)
+        ));
+        info.push_str(&format!(
+            "evicted_keys:{}\r\n",
+            db.stats.evicted_keys.load(Ordering::Relaxed)
+        ));
         info.push_str("\r\n");
     }
 
@@ -221,10 +229,26 @@ pub async fn cmd_info(db: &Db, args: &[Resp]) -> Result<Resp> {
             1.0
         };
         info.push_str(&format!("mem_fragmentation_ratio:{:.2}\r\n", frag_ratio));
+        // `mem_fragmentation_bytes` matches Redis (RSS - used). We have no
+        // jemalloc allocator stats, so the `allocator_*` pair reuses the
+        // same RSS/live numbers as `MEMORY STATS`; `lazyfree` is always 0
+        // because removals are synchronous here.
+        let frag_bytes = rss.saturating_sub(mem);
+        info.push_str(&format!("mem_fragmentation_bytes:{}\r\n", frag_bytes));
+        info.push_str(&format!("allocator_frag_ratio:{:.2}\r\n", frag_ratio));
+        info.push_str(&format!("allocator_frag_bytes:{}\r\n", frag_bytes));
+        info.push_str("lazyfree_pending_objects:0\r\n");
+        info.push_str(&format!(
+            "total_system_memory:{}\r\n",
+            crate::resource::total_system_memory()
+        ));
         // Peak = current for now (we don't track a high-water mark yet).
         info.push_str(&format!("used_memory_peak:{}\r\n", mem));
         let maxmem = db.max_memory_limit.load(Ordering::Relaxed);
         info.push_str(&format!("maxmemory:{}\r\n", maxmem));
+        let policy =
+            crate::db::MaxMemoryPolicy::from_u8(db.maxmemory_policy.load(Ordering::Relaxed));
+        info.push_str(&format!("maxmemory_policy:{}\r\n", policy.as_str()));
         info.push_str("\r\n");
     }
 

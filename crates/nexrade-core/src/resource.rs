@@ -11,6 +11,13 @@ pub fn resident_set_size() -> usize {
     imp::resident_set_size()
 }
 
+/// Total physical memory installed, in bytes. `0` means "unknown" on
+/// unsupported platforms — callers (INFO `total_system_memory`) treat it
+/// the same way as an unreadable RSS.
+pub fn total_system_memory() -> usize {
+    imp::total_system_memory()
+}
+
 /// Process CPU time (user, system) in seconds.
 /// Returns `(0.0, 0.0)` when the platform reader is unavailable.
 pub fn process_cpu_seconds() -> (f64, f64) {
@@ -28,6 +35,24 @@ mod imp {
         };
         for line in status.lines() {
             if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb: usize = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                return kb.saturating_mul(1024);
+            }
+        }
+        0
+    }
+
+    pub fn total_system_memory() -> usize {
+        let meminfo = match std::fs::read_to_string("/proc/meminfo") {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        for line in meminfo.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
                 let kb: usize = rest
                     .split_whitespace()
                     .next()
@@ -81,6 +106,18 @@ mod imp {
         }
     }
 
+    pub fn total_system_memory() -> usize {
+        unsafe {
+            let pages = libc::sysconf(libc::_SC_PHYS_PAGES);
+            let page_size = libc::sysconf(libc::_SC_PAGESIZE);
+            if pages > 0 && page_size > 0 {
+                (pages as usize).saturating_mul(page_size as usize)
+            } else {
+                0
+            }
+        }
+    }
+
     pub fn process_cpu_seconds() -> (f64, f64) {
         unsafe {
             let mut usage: libc::rusage = std::mem::zeroed();
@@ -103,7 +140,20 @@ mod imp {
     use windows_sys::Win32::System::ProcessStatus::{
         GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    pub fn total_system_memory() -> usize {
+        unsafe {
+            let mut status: MEMORYSTATUSEX = std::mem::zeroed();
+            status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+            if GlobalMemoryStatusEx(&mut status) != 0 {
+                status.ullTotalPhys as usize
+            } else {
+                0
+            }
+        }
+    }
 
     pub fn resident_set_size() -> usize {
         unsafe {
@@ -140,6 +190,9 @@ mod imp {
     pub fn resident_set_size() -> usize {
         0
     }
+    pub fn total_system_memory() -> usize {
+        0
+    }
     pub fn process_cpu_seconds() -> (f64, f64) {
         (0.0, 0.0)
     }
@@ -161,5 +214,14 @@ mod tests {
         assert!(rss > 0, "expected nonzero RSS on this platform");
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         let _ = rss;
+    }
+
+    #[test]
+    fn total_system_memory_is_nonzero_on_supported_platforms() {
+        let total = total_system_memory();
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        assert!(total > 0, "expected nonzero system memory");
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        let _ = total;
     }
 }

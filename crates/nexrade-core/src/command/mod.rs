@@ -425,6 +425,38 @@ pub fn is_write_command(cmd: &str) -> bool {
     )
 }
 
+/// Commands exempt from the `noeviction` OOM gate: they only remove
+/// data or shorten TTLs, so they cannot grow the dataset. Mirrors
+/// Redis's `allow_oom` command flag (DEL and friends).
+pub fn is_allow_oom_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "DEL"
+            | "UNLINK"
+            | "EXPIRE"
+            | "PEXPIRE"
+            | "EXPIREAT"
+            | "PEXPIREAT"
+            | "PERSIST"
+            | "FLUSHDB"
+            | "FLUSHALL"
+            | "GETDEL"
+            | "LPOP"
+            | "RPOP"
+            | "LTRIM"
+            | "LREM"
+            | "HDEL"
+            | "SREM"
+            | "ZREM"
+            | "ZREMRANGEBYRANK"
+            | "ZREMRANGEBYSCORE"
+            | "ZPOPMIN"
+            | "ZPOPMAX"
+            | "XDEL"
+            | "XTRIM"
+    )
+}
+
 /// Blocking commands can wait indefinitely before they mutate. They
 /// should acquire the mutation permit only at the actual mutation,
 /// not while parked.
@@ -455,7 +487,9 @@ fn is_blocking_write_command(cmd: &str) -> bool {
 /// have to ask "is this `dispatch()` call safe?" the answer is "no,
 /// unless it's documented as system-internal in this comment."
 pub async fn dispatch(db: &Db, args: Vec<Resp>, db_index: usize) -> Resp {
-    dispatch_inner_callable(db, args, db_index, None, "default").await
+    // Internal replay/embedded path: AOF and replication must be able to
+    // reconstruct a dataset that is already larger than maxmemory.
+    dispatch_inner_callable(db, args, db_index, None, "default", true).await
 }
 
 /// Dispatch with an optional peer address (used by the connection handler)
@@ -467,7 +501,7 @@ pub async fn dispatch_with_addr(
     db_index: usize,
     peer_addr: Option<std::net::SocketAddr>,
 ) -> Resp {
-    dispatch_inner_callable(db, args, db_index, peer_addr, "default").await
+    dispatch_inner_callable(db, args, db_index, peer_addr, "default", false).await
 }
 
 /// Dispatch for a specific authenticated user. `client_id` is 0 for
@@ -481,7 +515,7 @@ pub async fn dispatch_with_user(
     peer_addr: Option<std::net::SocketAddr>,
     user: &str,
 ) -> Resp {
-    dispatch_inner_callable(db, args, db_index, peer_addr, user).await
+    dispatch_inner_callable(db, args, db_index, peer_addr, user, false).await
 }
 
 /// Internal entry used by the public helpers above — parses `cmd`
@@ -499,19 +533,21 @@ async fn dispatch_inner_callable(
         std::net::SocketAddr,
     >,
     user: &str,
+    oom_exempt: bool,
 ) -> Resp {
     let mut cmd_buf = String::with_capacity(8);
     let cmd = match parse_cmd_name_into(&args, &mut cmd_buf) {
         Ok(s) => s,
         Err(e) => return Resp::Error(e.to_string()),
     };
-    dispatch_tracked(db, args, db_index, peer_addr, user, 0, cmd).await
+    dispatch_tracked_impl(db, args, db_index, peer_addr, user, 0, cmd, oom_exempt).await
 }
 
 /// Dispatch for a specific authenticated user + client id + pre-parsed
 /// uppercase cmd name. The connection handler reuses a per-connection
 /// `String` to avoid the per-command `String` allocation that
 /// `parse_cmd_name` would otherwise incur on the hot path.
+/// Client commands are subject to the `noeviction` OOM gate.
 pub async fn dispatch_tracked(
     db: &Db,
     args: Vec<Resp>,
@@ -526,6 +562,25 @@ pub async fn dispatch_tracked(
     user: &str,
     client_id: u64,
     cmd: &str,
+) -> Resp {
+    dispatch_tracked_impl(db, args, db_index, peer_addr, user, client_id, cmd, false).await
+}
+
+/// Implementation behind [`dispatch_tracked`]. `oom_exempt` is only set
+/// by `dispatch()` for internal replay/embedded calls, which must be
+/// able to load a dataset already above the configured cap.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_tracked_impl(
+    db: &Db,
+    args: Vec<Resp>,
+    db_index: usize,
+    #[cfg_attr(target_arch = "wasm32", allow(unused_variables))] peer_addr: Option<
+        std::net::SocketAddr,
+    >,
+    user: &str,
+    client_id: u64,
+    cmd: &str,
+    oom_exempt: bool,
 ) -> Resp {
     let is_write = is_write_command(cmd);
     let is_flush = matches!(cmd, "FLUSHALL" | "FLUSHDB");
@@ -546,6 +601,24 @@ pub async fn dispatch_tracked(
             "MISCONF AOF persistence is in an error state; writes are disabled until operator recovery"
                 .to_string(),
         );
+    }
+
+    // Redis `noeviction` semantic: once live bytes exceed maxmemory,
+    // refuse commands that could use more memory. The check is before
+    // the mutation (as in Redis), so reads and `allow_oom` commands
+    // such as DEL/LTRIM still work and can bring usage back down.
+    // A limit of 0 means maxmemory is disabled; internal replay is exempt.
+    if is_write && !oom_exempt && !is_allow_oom_command(cmd) {
+        let limit = db.max_memory_limit.load(Ordering::Relaxed);
+        if limit > 0
+            && db.maxmemory_policy.load(Ordering::Relaxed)
+                == crate::db::MaxMemoryPolicy::NoEviction as u8
+            && db.store.estimated_memory_bytes() > limit
+        {
+            return Resp::Error(
+                "OOM command not allowed when used memory > 'maxmemory'".to_string(),
+            );
+        }
     }
 
     // A persistence operation closes admission while it captures a coherent
@@ -619,30 +692,30 @@ pub async fn dispatch_tracked(
     let maxmem = if is_write {
         let limit = db.max_memory_limit.load(Ordering::Relaxed);
         if limit > 0 {
-            let policy_u8 = db.maxmemory_policy.load(Ordering::Relaxed);
-            // Decode u8 → MaxMemoryPolicy. NoEviction (0) is a no-op
-            // in `evict_if_needed`; we still call it because the
-            // dispatcher expects a uniform control flow.
-            let policy = match policy_u8 {
-                1 => crate::db::MaxMemoryPolicy::AllKeysRandom,
-                2 => crate::db::MaxMemoryPolicy::AllKeysLru,
-                3 => crate::db::MaxMemoryPolicy::VolatileRandom,
-                4 => crate::db::MaxMemoryPolicy::VolatileLru,
-                5 => crate::db::MaxMemoryPolicy::VolatileTtl,
-                _ => crate::db::MaxMemoryPolicy::NoEviction,
-            };
-            // Pre-write eviction — fire keyspace `evicted` events when enabled.
-            let pre = db.store.evict_if_needed(&policy, limit);
-            if !pre.is_empty() && db.notify_flags.load().0 != 0 {
-                use crate::notify::NotifyFlags;
-                let flags = db.notify_flags.load();
-                if flags.contains(NotifyFlags::K_EVICTED) {
-                    for k in &pre {
-                        db.notify_keyspace_event(db_index, "evicted", k);
+            let policy =
+                crate::db::MaxMemoryPolicy::from_u8(db.maxmemory_policy.load(Ordering::Relaxed));
+            // `noeviction` never evicts: the OOM gate above already
+            // rejected growth commands, and freeing commands don't need
+            // a sweep. Skip the known no-op instead of calling it.
+            if policy == crate::db::MaxMemoryPolicy::NoEviction {
+                None
+            } else {
+                // Pre-write eviction — fire keyspace `evicted` events when enabled.
+                let pre = db.store.evict_if_needed(&policy, limit);
+                db.stats
+                    .evicted_keys
+                    .fetch_add(pre.len() as u64, Ordering::Relaxed);
+                if !pre.is_empty() && db.notify_flags.load().0 != 0 {
+                    use crate::notify::NotifyFlags;
+                    let flags = db.notify_flags.load();
+                    if flags.contains(NotifyFlags::K_EVICTED) {
+                        for k in &pre {
+                            db.notify_keyspace_event(db_index, "evicted", k);
+                        }
                     }
                 }
+                Some((policy, limit))
             }
-            Some((policy, limit))
         } else {
             None
         }
@@ -667,6 +740,9 @@ pub async fn dispatch_tracked(
     if succeeded {
         if let Some((policy, limit)) = maxmem {
             let evicted = db.store.evict_if_needed(&policy, limit);
+            db.stats
+                .evicted_keys
+                .fetch_add(evicted.len() as u64, Ordering::Relaxed);
             if !evicted.is_empty() && db.notify_flags.load().0 != 0 {
                 use crate::notify::NotifyFlags;
                 let flags = db.notify_flags.load();
